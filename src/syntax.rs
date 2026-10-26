@@ -1,0 +1,991 @@
+//! tree-sitter parsing and highlighting.
+//!
+//! Parsing happens on the blocking thread pool: the main loop hands over the
+//! text, keeps drawing with the previous tree, and adopts the new tree when the
+//! job reports back.  Because [`tree_sitter::Tree`] is `Send` but not `Sync`,
+//! trees travel through a [`TreeSlot`] (a mutex-guarded hand-off) rather than
+//! being shared.
+
+use std::sync::{Arc, Mutex};
+
+use tree_sitter::{Language, Node, Parser, Tree};
+
+use crate::buffer::Buffer;
+use crate::event::{AsyncEvent, EventTx};
+use crate::selection::Span;
+
+/// Hand-off box for a parsed tree.
+#[derive(Clone, Default)]
+pub struct TreeSlot(Arc<Mutex<Option<Tree>>>);
+
+impl std::fmt::Debug for TreeSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TreeSlot")
+            .field(
+                "filled",
+                &self.0.lock().map(|g| g.is_some()).unwrap_or(false),
+            )
+            .finish()
+    }
+}
+
+impl TreeSlot {
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
+    /// Called by the parsing task.
+    pub fn store(&self, tree: Tree) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(tree);
+        }
+    }
+
+    /// Called by the main loop to adopt the tree.
+    pub fn take(&self) -> Option<Tree> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+/// What the last parse attempt produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParseStatus {
+    /// Nothing to do: the tree matches the buffer.
+    #[default]
+    Current,
+    /// A job is in flight.
+    Pending,
+    /// No grammar for this language.
+    Unsupported,
+    /// Parsing failed.
+    Failed,
+}
+
+/// Tree-sitter state belonging to one buffer.
+#[derive(Debug, Default)]
+pub struct SyntaxState {
+    pub tree: Option<Tree>,
+    /// Buffer version the tree was parsed from.
+    pub tree_version: u64,
+    pub status: ParseStatus,
+    /// Set when the tree contains syntax errors.
+    pub has_errors: bool,
+}
+
+impl SyntaxState {
+    pub fn invalidate(&mut self) {
+        self.tree_version = 0;
+        self.status = ParseStatus::Pending;
+    }
+
+    pub fn root(&self) -> Option<Node<'_>> {
+        self.tree.as_ref().map(Tree::root_node)
+    }
+
+    /// True when the tree reflects `version`.
+    pub fn is_current(&self, version: u64) -> bool {
+        self.tree.is_some() && self.tree_version == version
+    }
+
+    /// Clear everything (language changed).
+    pub fn clear(&mut self) {
+        self.tree = None;
+        self.tree_version = 0;
+        self.status = ParseStatus::Pending;
+        self.has_errors = false;
+    }
+}
+
+/// Parse a buffer on the current thread and store the result.
+///
+/// The app parses on the blocking pool; this is for tests and for the odd
+/// synchronous query.
+pub fn parse_in_place(buffer: &mut Buffer) -> bool {
+    let Some(language) = buffer.language.grammar() else {
+        buffer.syntax.tree = None;
+        buffer.syntax.tree_version = buffer.version;
+        buffer.syntax.status = ParseStatus::Unsupported;
+        return false;
+    };
+    let text = buffer.text();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        buffer.syntax.status = ParseStatus::Failed;
+        return false;
+    }
+    match parser.parse(&text, None) {
+        Some(tree) => {
+            let has_errors = tree.root_node().has_error();
+            buffer.syntax.tree = Some(tree);
+            buffer.syntax.tree_version = buffer.version;
+            buffer.syntax.status = ParseStatus::Current;
+            buffer.syntax.has_errors = has_errors;
+            true
+        }
+        None => {
+            buffer.syntax.status = ParseStatus::Failed;
+            false
+        }
+    }
+}
+
+/// Run a parse on the blocking pool and report through `tx`.
+pub fn spawn_parse(
+    tx: EventTx,
+    buffer: crate::buffer::BufferId,
+    version: u64,
+    language: Language,
+    text: String,
+    slot: TreeSlot,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut parser = Parser::new();
+        if parser.set_language(&language).is_err() {
+            tx.send_async(AsyncEvent::Failed {
+                what: format!("parse #{}", buffer.0),
+                error: "grammar not available".into(),
+            });
+            return;
+        }
+        match parser.parse(&text, None) {
+            Some(tree) => {
+                slot.store(tree);
+                tx.send_async(AsyncEvent::Parsed {
+                    buffer,
+                    version,
+                    slot,
+                });
+            }
+            None => {
+                tx.send_async(AsyncEvent::Failed {
+                    what: format!("parse #{}", buffer.0),
+                    error: "parser could not parse this text".into(),
+                });
+            }
+        }
+    });
+}
+
+/// Syntax highlight groups.  Kept small on purpose: styles come from the theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Hl {
+    #[default]
+    None,
+    Keyword,
+    String,
+    Comment,
+    Number,
+    Constant,
+    Function,
+    Type,
+    Property,
+    Operator,
+    Punctuation,
+    Tag,
+    Preproc,
+    Error,
+}
+
+/// A highlighted byte range.
+#[derive(Debug, Clone, Copy)]
+pub struct Highlight {
+    pub span: Span,
+    pub hl: Hl,
+}
+
+/// Collect highlight runs for `[range]` of a tree that matches the buffer.
+///
+/// Only leaf tokens are emitted, so runs never overlap and the renderer can
+/// paint them in order.
+pub fn highlights(buffer: &Buffer, range: Span, lang_id: &str) -> Vec<Highlight> {
+    let mut out = Vec::new();
+    let Some(root) = buffer.syntax.root() else {
+        return out;
+    };
+    let range = range.clamp(buffer.len_bytes());
+    let mut cursor = root.walk();
+    descend(buffer, &mut cursor, range, lang_id, &mut out);
+    out
+}
+
+fn descend(
+    buffer: &Buffer,
+    cursor: &mut tree_sitter::TreeCursor<'_>,
+    range: Span,
+    lang_id: &str,
+    out: &mut Vec<Highlight>,
+) {
+    let node = cursor.node();
+    let node_range = Span::new(node.start_byte(), node.end_byte());
+
+    // Whole subtree outside the visible window: stop walking.
+    if node_range.end <= range.start || node_range.start >= range.end {
+        return;
+    }
+
+    // A comment is one token even when the grammar exposes its `//` marker as a
+    // child, so style the whole node and do not descend into it.  Without this
+    // the marker is painted as punctuation and the comment text unstyled.
+    if node.child_count() == 0 || node.kind().contains("comment") {
+        let hl = highlight_of(buffer, node, lang_id, cursor.field_name());
+        if hl != Hl::None {
+            let start = node_range.start.max(range.start);
+            let end = node_range.end.min(range.end);
+            if start < end {
+                out.push(Highlight {
+                    span: Span::new(start, end),
+                    hl,
+                });
+            }
+        }
+        return;
+    }
+
+    if cursor.goto_first_child() {
+        loop {
+            descend(buffer, cursor, range, lang_id, out);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        cursor.goto_parent();
+    }
+}
+
+/// Highlight group implied by the parent's field name for this node.
+fn role_highlight(node: Node<'_>, field: Option<&str>) -> Option<Hl> {
+    let parent_kind = node.parent().map(|parent| parent.kind().to_lowercase())?;
+    match field? {
+        // (call_expression function: (identifier)) and friends.
+        "function" | "callee" => Some(Hl::Function),
+        "name" | "definition" => {
+            if parent_kind.contains("function") || parent_kind.contains("method") {
+                Some(Hl::Function)
+            } else if [
+                "struct",
+                "class",
+                "enum",
+                "trait",
+                "interface",
+                "union",
+                "type",
+            ]
+            .iter()
+            .any(|word| parent_kind.contains(word))
+            {
+                Some(Hl::Type)
+            } else {
+                None
+            }
+        }
+        "type" | "return_type" | "argument_type" => Some(Hl::Type),
+        "parameter" | "parameters" | "field" | "property" | "attribute" => Some(Hl::Property),
+        _ => None,
+    }
+}
+
+/// Decide the highlight group of a leaf token.
+fn highlight_of(buffer: &Buffer, node: Node<'_>, lang_id: &str, field: Option<&str>) -> Hl {
+    let kind = node.kind();
+
+    // The role the parent gave this token is a better clue than the token's own
+    // kind: an `identifier` is a function name, a parameter or a plain variable,
+    // and only the parent knows which.
+    if let Some(hl) = role_highlight(node, field) {
+        return hl;
+    }
+
+    if kind == "ERROR" || kind == "MISSING" || kind.contains("error") || kind.contains("missing") {
+        return Hl::Error;
+    }
+    if kind.contains("comment") {
+        return Hl::Comment;
+    }
+    if kind.contains("preproc") || kind.contains("directive") || kind.contains("include_directive")
+    {
+        return Hl::Preproc;
+    }
+    if kind.contains("string")
+        || kind.contains("char_literal")
+        || (kind == "text" && lang_id == "yaml")
+    {
+        return Hl::String;
+    }
+    if kind.contains("number") || kind.contains("integer") || kind.contains("float") {
+        return Hl::Number;
+    }
+    if kind.contains("boolean") || kind.contains("null") || kind.contains("none_literal") {
+        return Hl::Constant;
+    }
+    if kind.contains("tag_name") || kind == "element_name" {
+        return Hl::Tag;
+    }
+    if kind.contains("property_name") || kind.contains("attribute_name") {
+        return Hl::Property;
+    }
+    if kind.contains("type") {
+        return Hl::Type;
+    }
+    if kind.contains("escape_sequence") {
+        return Hl::Constant;
+    }
+
+    // Keywords, constants and builtin types are single-word token kinds.
+    if kind.chars().all(|c| c.is_alphabetic() || c == '_')
+        && let Some(group) = keyword_group(lang_id, kind)
+    {
+        return group;
+    }
+
+    if kind.contains("operator") {
+        return Hl::Operator;
+    }
+    if kind.chars().all(|c| !c.is_alphanumeric() && c != '_') && !kind.is_empty() {
+        return Hl::Punctuation;
+    }
+
+    if is_identifier_kind(kind) {
+        return identifier_role(buffer, node);
+    }
+
+    Hl::None
+}
+
+fn is_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "name"
+            | "variable_name"
+            | "field_identifier"
+            | "property_identifier"
+            | "shouty_constant_identifier"
+            | "constant_identifier"
+            | "upper_snake_case_string"
+            | "attribute"
+            | "field"
+    )
+}
+
+/// Give identifiers a role: constants, called functions, fields.
+fn identifier_role(buffer: &Buffer, node: Node<'_>) -> Hl {
+    let text = buffer.slice(Span::new(node.start_byte(), node.end_byte()));
+    if text.len() > 1
+        && text
+            .chars()
+            .all(|c| c.is_uppercase() || c.is_numeric() || c == '_')
+    {
+        return Hl::Constant;
+    }
+    let Some(parent) = node.parent() else {
+        return Hl::None;
+    };
+
+    // Locate this node among its siblings to learn its field name and position.
+    let mut position = None;
+    let mut cursor = parent.walk();
+    for (index, child) in parent.children(&mut cursor).enumerate() {
+        if child.id() == node.id() {
+            position = Some((index, parent.field_name_for_child(index as u32)));
+            break;
+        }
+    }
+    let (index, field) = position.unwrap_or((usize::MAX, None));
+    let parent_kind = parent.kind();
+
+    if (parent_kind.contains("call") || parent_kind.contains("invoke"))
+        && (matches!(field, Some("function") | Some("callee")) || index == 0)
+    {
+        return Hl::Function;
+    }
+    if parent_kind.contains("assignment") && index == 0 {
+        return Hl::Property;
+    }
+    if matches!(field, Some("property") | Some("field") | Some("attribute")) {
+        return Hl::Property;
+    }
+    if (parent_kind.contains("declaration") || parent_kind.contains("definition"))
+        && field == Some("name")
+    {
+        if parent_kind.contains("function")
+            || parent_kind.contains("method")
+            || parent_kind.contains("lambda")
+            || parent_kind.contains("procedure")
+        {
+            return Hl::Function;
+        }
+        if parent_kind.contains("class")
+            || parent_kind.contains("struct")
+            || parent_kind.contains("enum")
+            || parent_kind.contains("trait")
+            || parent_kind.contains("impl")
+            || parent_kind.contains("interface")
+            || parent_kind.contains("type")
+        {
+            return Hl::Type;
+        }
+    }
+    Hl::None
+}
+
+/// Keyword / type / constant tables per language, keyed by token kind.
+fn keyword_group(lang_id: &str, token: &str) -> Option<Hl> {
+    let set = match lang_id {
+        "rust" => RUST,
+        "python" => PYTHON,
+        "javascript" | "typescript" | "tsx" => JAVASCRIPT,
+        "go" => GO,
+        "c" => C,
+        "bash" => BASH,
+        "toml" | "yaml" => DATA,
+        _ => &[],
+    };
+    set.iter()
+        .find(|(word, _)| *word == token)
+        .map(|(_, group)| *group)
+}
+
+const RUST: &[(&str, Hl)] = &[
+    ("as", Hl::Keyword),
+    ("async", Hl::Keyword),
+    ("await", Hl::Keyword),
+    ("break", Hl::Keyword),
+    ("const", Hl::Keyword),
+    ("continue", Hl::Keyword),
+    ("crate", Hl::Keyword),
+    ("dyn", Hl::Keyword),
+    ("else", Hl::Keyword),
+    ("enum", Hl::Keyword),
+    ("extern", Hl::Keyword),
+    ("false", Hl::Constant),
+    ("fn", Hl::Keyword),
+    ("for", Hl::Keyword),
+    ("if", Hl::Keyword),
+    ("impl", Hl::Keyword),
+    ("in", Hl::Keyword),
+    ("let", Hl::Keyword),
+    ("loop", Hl::Keyword),
+    ("match", Hl::Keyword),
+    ("mod", Hl::Keyword),
+    ("move", Hl::Keyword),
+    ("mut", Hl::Keyword),
+    ("pub", Hl::Keyword),
+    ("ref", Hl::Keyword),
+    ("return", Hl::Keyword),
+    ("self", Hl::Constant),
+    ("Self", Hl::Type),
+    ("static", Hl::Keyword),
+    ("struct", Hl::Keyword),
+    ("super", Hl::Constant),
+    ("trait", Hl::Keyword),
+    ("true", Hl::Constant),
+    ("type", Hl::Keyword),
+    ("union", Hl::Keyword),
+    ("unsafe", Hl::Keyword),
+    ("use", Hl::Keyword),
+    ("where", Hl::Keyword),
+    ("while", Hl::Keyword),
+    ("u8", Hl::Type),
+    ("u16", Hl::Type),
+    ("u32", Hl::Type),
+    ("u64", Hl::Type),
+    ("u128", Hl::Type),
+    ("i8", Hl::Type),
+    ("i16", Hl::Type),
+    ("i32", Hl::Type),
+    ("i64", Hl::Type),
+    ("i128", Hl::Type),
+    ("f32", Hl::Type),
+    ("f64", Hl::Type),
+    ("usize", Hl::Type),
+    ("isize", Hl::Type),
+    ("bool", Hl::Type),
+    ("char", Hl::Type),
+    ("str", Hl::Type),
+    ("String", Hl::Type),
+    ("Vec", Hl::Type),
+    ("Option", Hl::Type),
+    ("Result", Hl::Type),
+    ("Box", Hl::Type),
+    ("Rc", Hl::Type),
+    ("Arc", Hl::Type),
+    ("Some", Hl::Constant),
+    ("None", Hl::Constant),
+    ("Ok", Hl::Constant),
+    ("Err", Hl::Constant),
+];
+
+const PYTHON: &[(&str, Hl)] = &[
+    ("and", Hl::Keyword),
+    ("as", Hl::Keyword),
+    ("assert", Hl::Keyword),
+    ("async", Hl::Keyword),
+    ("await", Hl::Keyword),
+    ("break", Hl::Keyword),
+    ("class", Hl::Keyword),
+    ("continue", Hl::Keyword),
+    ("def", Hl::Keyword),
+    ("del", Hl::Keyword),
+    ("elif", Hl::Keyword),
+    ("else", Hl::Keyword),
+    ("except", Hl::Keyword),
+    ("finally", Hl::Keyword),
+    ("for", Hl::Keyword),
+    ("from", Hl::Keyword),
+    ("global", Hl::Keyword),
+    ("if", Hl::Keyword),
+    ("import", Hl::Keyword),
+    ("in", Hl::Keyword),
+    ("is", Hl::Keyword),
+    ("lambda", Hl::Keyword),
+    ("None", Hl::Constant),
+    ("nonlocal", Hl::Keyword),
+    ("not", Hl::Keyword),
+    ("or", Hl::Keyword),
+    ("pass", Hl::Keyword),
+    ("raise", Hl::Keyword),
+    ("return", Hl::Keyword),
+    ("self", Hl::Constant),
+    ("True", Hl::Constant),
+    ("False", Hl::Constant),
+    ("try", Hl::Keyword),
+    ("while", Hl::Keyword),
+    ("with", Hl::Keyword),
+    ("yield", Hl::Keyword),
+    ("int", Hl::Type),
+    ("str", Hl::Type),
+    ("float", Hl::Type),
+    ("bool", Hl::Type),
+    ("bytes", Hl::Type),
+    ("list", Hl::Type),
+    ("dict", Hl::Type),
+    ("set", Hl::Type),
+    ("tuple", Hl::Type),
+];
+
+const JAVASCRIPT: &[(&str, Hl)] = &[
+    ("async", Hl::Keyword),
+    ("await", Hl::Keyword),
+    ("break", Hl::Keyword),
+    ("case", Hl::Keyword),
+    ("catch", Hl::Keyword),
+    ("class", Hl::Keyword),
+    ("const", Hl::Keyword),
+    ("continue", Hl::Keyword),
+    ("debugger", Hl::Keyword),
+    ("default", Hl::Keyword),
+    ("delete", Hl::Keyword),
+    ("do", Hl::Keyword),
+    ("else", Hl::Keyword),
+    ("enum", Hl::Keyword),
+    ("export", Hl::Keyword),
+    ("extends", Hl::Keyword),
+    ("false", Hl::Constant),
+    ("finally", Hl::Keyword),
+    ("for", Hl::Keyword),
+    ("function", Hl::Keyword),
+    ("if", Hl::Keyword),
+    ("implements", Hl::Keyword),
+    ("import", Hl::Keyword),
+    ("in", Hl::Keyword),
+    ("instanceof", Hl::Keyword),
+    ("interface", Hl::Keyword),
+    ("let", Hl::Keyword),
+    ("new", Hl::Keyword),
+    ("null", Hl::Constant),
+    ("of", Hl::Keyword),
+    ("package", Hl::Keyword),
+    ("private", Hl::Keyword),
+    ("protected", Hl::Keyword),
+    ("public", Hl::Keyword),
+    ("return", Hl::Keyword),
+    ("static", Hl::Keyword),
+    ("super", Hl::Constant),
+    ("switch", Hl::Keyword),
+    ("this", Hl::Constant),
+    ("throw", Hl::Keyword),
+    ("true", Hl::Constant),
+    ("try", Hl::Keyword),
+    ("type", Hl::Keyword),
+    ("typeof", Hl::Keyword),
+    ("undefined", Hl::Constant),
+    ("var", Hl::Keyword),
+    ("void", Hl::Keyword),
+    ("while", Hl::Keyword),
+    ("with", Hl::Keyword),
+    ("yield", Hl::Keyword),
+    ("string", Hl::Type),
+    ("number", Hl::Type),
+    ("boolean", Hl::Type),
+    ("any", Hl::Type),
+];
+
+const GO: &[(&str, Hl)] = &[
+    ("break", Hl::Keyword),
+    ("case", Hl::Keyword),
+    ("chan", Hl::Keyword),
+    ("const", Hl::Keyword),
+    ("continue", Hl::Keyword),
+    ("default", Hl::Keyword),
+    ("defer", Hl::Keyword),
+    ("else", Hl::Keyword),
+    ("fallthrough", Hl::Keyword),
+    ("for", Hl::Keyword),
+    ("func", Hl::Keyword),
+    ("go", Hl::Keyword),
+    ("if", Hl::Keyword),
+    ("import", Hl::Keyword),
+    ("interface", Hl::Keyword),
+    ("map", Hl::Keyword),
+    ("nil", Hl::Constant),
+    ("package", Hl::Keyword),
+    ("range", Hl::Keyword),
+    ("return", Hl::Keyword),
+    ("select", Hl::Keyword),
+    ("struct", Hl::Keyword),
+    ("switch", Hl::Keyword),
+    ("type", Hl::Keyword),
+    ("var", Hl::Keyword),
+    ("true", Hl::Constant),
+    ("false", Hl::Constant),
+    ("bool", Hl::Type),
+    ("byte", Hl::Type),
+    ("error", Hl::Type),
+    ("float32", Hl::Type),
+    ("float64", Hl::Type),
+    ("int", Hl::Type),
+    ("int8", Hl::Type),
+    ("int16", Hl::Type),
+    ("int32", Hl::Type),
+    ("int64", Hl::Type),
+    ("rune", Hl::Type),
+    ("string", Hl::Type),
+    ("uint", Hl::Type),
+    ("uint8", Hl::Type),
+    ("uint16", Hl::Type),
+    ("uint32", Hl::Type),
+    ("uint64", Hl::Type),
+    ("uintptr", Hl::Type),
+];
+
+const C: &[(&str, Hl)] = &[
+    ("auto", Hl::Keyword),
+    ("break", Hl::Keyword),
+    ("case", Hl::Keyword),
+    ("char", Hl::Type),
+    ("const", Hl::Keyword),
+    ("continue", Hl::Keyword),
+    ("default", Hl::Keyword),
+    ("do", Hl::Keyword),
+    ("double", Hl::Type),
+    ("else", Hl::Keyword),
+    ("enum", Hl::Keyword),
+    ("extern", Hl::Keyword),
+    ("float", Hl::Type),
+    ("for", Hl::Keyword),
+    ("goto", Hl::Keyword),
+    ("if", Hl::Keyword),
+    ("inline", Hl::Keyword),
+    ("int", Hl::Type),
+    ("long", Hl::Type),
+    ("register", Hl::Keyword),
+    ("restrict", Hl::Keyword),
+    ("return", Hl::Keyword),
+    ("short", Hl::Type),
+    ("signed", Hl::Type),
+    ("sizeof", Hl::Keyword),
+    ("static", Hl::Keyword),
+    ("struct", Hl::Keyword),
+    ("switch", Hl::Keyword),
+    ("typedef", Hl::Keyword),
+    ("union", Hl::Keyword),
+    ("unsigned", Hl::Type),
+    ("void", Hl::Type),
+    ("volatile", Hl::Keyword),
+    ("while", Hl::Keyword),
+    ("NULL", Hl::Constant),
+    ("true", Hl::Constant),
+    ("false", Hl::Constant),
+];
+
+const BASH: &[(&str, Hl)] = &[
+    ("if", Hl::Keyword),
+    ("then", Hl::Keyword),
+    ("else", Hl::Keyword),
+    ("elif", Hl::Keyword),
+    ("fi", Hl::Keyword),
+    ("for", Hl::Keyword),
+    ("while", Hl::Keyword),
+    ("until", Hl::Keyword),
+    ("do", Hl::Keyword),
+    ("done", Hl::Keyword),
+    ("case", Hl::Keyword),
+    ("esac", Hl::Keyword),
+    ("function", Hl::Keyword),
+    ("in", Hl::Keyword),
+    ("return", Hl::Keyword),
+    ("exit", Hl::Keyword),
+    ("local", Hl::Keyword),
+    ("export", Hl::Keyword),
+    ("source", Hl::Keyword),
+    ("break", Hl::Keyword),
+    ("continue", Hl::Keyword),
+    ("true", Hl::Constant),
+    ("false", Hl::Constant),
+];
+
+const DATA: &[(&str, Hl)] = &[
+    ("true", Hl::Constant),
+    ("false", Hl::Constant),
+    ("null", Hl::Constant),
+    ("yes", Hl::Constant),
+    ("no", Hl::Constant),
+    ("on", Hl::Constant),
+    ("off", Hl::Constant),
+];
+
+// ------------------------------------------------------------- text objects
+
+/// Tree-sitter backed text objects (`if` function, `ic` class, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TsObject {
+    Function,
+    Class,
+    Block,
+    Comment,
+    StringLiteral,
+}
+
+impl TsObject {
+    /// Key used after `i`/`a`: `if`, `ic`, `ib`, `iC`, `is`.
+    pub fn from_key(key: char) -> Option<Self> {
+        match key {
+            'f' => Some(TsObject::Function),
+            'c' => Some(TsObject::Class),
+            'b' => Some(TsObject::Block),
+            'C' => Some(TsObject::Comment),
+            's' => Some(TsObject::StringLiteral),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TsObject::Function => "function",
+            TsObject::Class => "class",
+            TsObject::Block => "block",
+            TsObject::Comment => "comment",
+            TsObject::StringLiteral => "string",
+        }
+    }
+
+    fn matches(self, kind: &str) -> bool {
+        match self {
+            TsObject::Function => {
+                kind.contains("function")
+                    || kind.contains("method")
+                    || kind.contains("lambda")
+                    || kind.contains("closure")
+                    || kind.contains("procedure")
+            }
+            TsObject::Class => {
+                kind.contains("class")
+                    || kind.contains("struct")
+                    || kind.contains("enum")
+                    || kind.contains("trait")
+                    || kind.contains("impl")
+                    || kind.contains("interface")
+                    || kind.contains("module")
+                    || kind.contains("type_declaration")
+            }
+            TsObject::Block => {
+                kind.ends_with("block")
+                    || kind.contains("statement_block")
+                    || kind.ends_with("_body")
+            }
+            TsObject::Comment => kind.contains("comment"),
+            TsObject::StringLiteral => kind.contains("string"),
+        }
+    }
+}
+
+/// Every tree-sitter text object around `byte`, innermost first.
+pub fn text_objects(buffer: &Buffer, byte: usize, object: TsObject) -> Vec<(Span, Span)> {
+    let mut out: Vec<(Span, Span)> = Vec::new();
+    let Some(root) = buffer.syntax.root() else {
+        return out;
+    };
+    let byte = buffer.clamp_byte(byte);
+    let Some(node) = node_at_offset(root, byte) else {
+        return out;
+    };
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if object.matches(node.kind()) {
+            let outer = Span::new(node.start_byte(), node.end_byte());
+            let inner = inner_span(node).unwrap_or(outer);
+            if !outer.is_empty() && out.last().is_none_or(|(last, _)| *last != outer) {
+                out.push((outer, inner));
+            }
+        }
+        current = node.parent();
+    }
+    out
+}
+
+/// Smallest named node containing `byte`.
+pub fn node_at_offset<'t>(root: Node<'t>, byte: usize) -> Option<Node<'t>> {
+    let mut cursor = root.walk();
+    let mut best = root;
+    loop {
+        let mut descended = false;
+        if cursor.goto_first_child() {
+            loop {
+                let node = cursor.node();
+                if node.start_byte() <= byte
+                    && node.end_byte() >= byte
+                    && node.end_byte() > node.start_byte()
+                {
+                    best = node;
+                    descended = true;
+                    break;
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        if !descended {
+            break;
+        }
+    }
+    Some(best)
+}
+
+/// The inside of a node: its body, or the text between its delimiters.
+fn inner_span(node: Node<'_>) -> Option<Span> {
+    for field in ["body", "content", "value", "compound_expression"] {
+        if let Some(child) = node.child_by_field_name(field) {
+            let span = Span::new(child.start_byte(), child.end_byte());
+            if !span.is_empty() {
+                return Some(span);
+            }
+        }
+    }
+    // Braced bodies: `fn f() { … }` → the `{ … }` child.
+    for child in node.children(&mut node.walk()) {
+        let kind = child.kind();
+        if kind.ends_with("block") || kind.contains("body") || kind.contains("arguments") {
+            let span = Span::new(child.start_byte(), child.end_byte());
+            if !span.is_empty() {
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
+/// Comment and string nodes overlapping `[range]` — the spell checker's input.
+pub fn comment_and_string_spans(buffer: &Buffer, range: Span) -> Vec<Span> {
+    let mut out = Vec::new();
+    let Some(root) = buffer.syntax.root() else {
+        return out;
+    };
+    let range = range.clamp(buffer.len_bytes());
+    collect_spans(root, range, &mut out);
+    out
+}
+
+fn collect_spans(node: Node<'_>, range: Span, out: &mut Vec<Span>) {
+    let node_range = Span::new(node.start_byte(), node.end_byte());
+    if node_range.end <= range.start || node_range.start >= range.end {
+        return;
+    }
+    let kind = node.kind();
+    if kind.contains("comment") || kind.contains("string") {
+        out.push(node_range);
+        return; // no need to descend
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_spans(child, range, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::{Buffer, BufferId};
+    use crate::config::EditorConfig;
+
+    fn rust(text: &str) -> Buffer {
+        let mut buffer = Buffer::new(
+            BufferId(1),
+            Some(std::path::PathBuf::from("sample.rs")),
+            text.to_string(),
+            &EditorConfig::default(),
+        );
+        assert!(buffer.reparse_now(), "the Rust grammar should parse");
+        buffer
+    }
+
+    fn groups(buffer: &Buffer) -> Vec<(Hl, String)> {
+        let end = buffer.len_bytes();
+        highlights(buffer, Span::new(0, end), buffer.language.id)
+            .into_iter()
+            .map(|highlight| {
+                (
+                    highlight.hl,
+                    buffer.slice(highlight.span).trim().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn comments_are_highlighted_as_one_run() {
+        // The grammar hands back `//` as a child of the comment, which used to
+        // leave the comment body unstyled.
+        let buffer = rust("fn main() {\n    // a note\n}\n");
+        let groups = groups(&buffer);
+        assert!(
+            groups
+                .iter()
+                .any(|(hl, text)| *hl == Hl::Comment && text.contains("a note")),
+            "no comment highlight in {groups:?}"
+        );
+    }
+
+    #[test]
+    fn strings_numbers_and_keywords_are_distinguished() {
+        let buffer = rust(
+            "struct Point { x: u32 }\nfn area(p: &Point) -> u32 { p.x * 2 }\nlet s = \"hi\";\n",
+        );
+        let groups = groups(&buffer);
+        assert!(
+            groups.iter().any(|(hl, _)| *hl == Hl::Keyword),
+            "{groups:?}"
+        );
+        // A function's own name is an ordinary identifier; only the parent's
+        // `name:` field says what it is.
+        assert!(
+            groups
+                .iter()
+                .any(|(hl, text)| *hl == Hl::Function && text == "area"),
+            "{groups:?}"
+        );
+        assert!(groups.iter().any(|(hl, _)| *hl == Hl::Type), "{groups:?}");
+        assert!(groups.iter().any(|(hl, _)| *hl == Hl::Number), "{groups:?}");
+        assert!(groups.iter().any(|(hl, _)| *hl == Hl::String), "{groups:?}");
+    }
+
+    #[test]
+    fn nothing_is_highlighted_outside_the_window() {
+        let buffer = rust("fn a() {}\nfn b() {}\n");
+        let end = buffer.len_bytes();
+        let second = highlights(&buffer, Span::new(11, end), buffer.language.id);
+        assert!(
+            second.iter().all(|highlight| highlight.span.start >= 11),
+            "{second:?}"
+        );
+    }
+}

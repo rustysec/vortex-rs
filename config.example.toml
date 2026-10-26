@@ -1,0 +1,196 @@
+# vortex configuration
+#
+# All keys are optional; anything you leave out keeps its default (shown here).
+# Keys are kebab-case. Copy this file to ~/.config/vortex/config.toml (or point
+# `vortex -c` at it), and reload while vortex runs with `:config source`.
+#
+# `vortex --check-config` validates it; `vortex --write-config` writes this
+# document there for you. A test keeps these defaults honest, so if the code
+# changes and this file does not, `cargo test` says so.
+
+# ---------------------------------------------------------------------------
+# text editing
+# ---------------------------------------------------------------------------
+[editor]
+tab-width = 4                 # width of a tab stop
+expand-tab = true             # insert spaces instead of tab characters
+line-number = "relative"      # "absolute" | "relative" | "none"
+cursorline = true             # highlight the row the cursor is on
+scroll-margin = 4             # rows kept visible above/below the cursor
+sidescroll-margin = 4         # columns kept visible left/right of the cursor
+mouse = true                  # click to focus a pane, drag to select
+auto-indent = true            # repeat the indentation of the current line on enter
+auto-match-pairs = true       # type `(` and `()` appears with the cursor inside
+wrap = false                  # soft wrap long lines
+clipboard = true              # copy yanks to the terminal clipboard (OSC-52)
+undo-limit = 1000             # undo steps kept per buffer
+undo-group-timeout = "500ms"  # idle time that closes an undo group
+large-file-threshold = 2000000 # bytes; bigger files skip background work
+
+# ---------------------------------------------------------------------------
+# status area
+# ---------------------------------------------------------------------------
+[status]
+position = "bottom"           # "top" | "bottom"
+height = 1                    # 1 - 6 rows
+show-mode = true              # "normal" / "insert" / "visual" / "command"
+show-pane-name = true         # label of the focused text pane
+show-diagnostics = true       # lsp / spell rollup: "2e 1w"
+show-position = true          # line:col
+show-language = true          # detected language
+show-percentage = true        # how far through the file
+message-timeout = "6s"        # how long status messages stay up
+
+# ---------------------------------------------------------------------------
+# panes and splitting
+# ---------------------------------------------------------------------------
+[layout]
+split-mode = "auto"           # "explicit" | "auto" | "golden"
+                              #   explicit: `split` stacks, `vsplit` places side by side
+                              #   auto:     side by side while the focused pane has
+                              #             more columns than rows, stacked otherwise
+                              #             (the other axis is used if there is no room)
+                              #   golden:   focused pane gets golden-ratio of its parent
+border = "rounded"            # "rounded" | "plain" | "square" | "none"
+show-labels = true            # buffer name in the pane border
+show-flags = true             # "+" modified / "ro" markers next to the label
+min-height = 3                # usable rows per pane
+min-width = 12                # usable columns per pane
+golden-ratio = 0.618          # fraction of the parent for the focused pane
+split-ratio = 0.5             # fraction given to a new pane (explicit splits)
+resize-step = 0.1             # fraction of the parent per resize step
+
+# ---------------------------------------------------------------------------
+# searching (ripgrep is used when present)
+# ---------------------------------------------------------------------------
+[search]
+ripgrep = "auto"              # "auto" | path to rg | "off" (use built-in walker)
+hidden = false
+follow = false
+ignore = true                 # honour .gitignore
+prune = ["target", "node_modules", ".git"]
+ignore-case = false           # vim's ignorecase; searches are case sensitive by default
+smart-case = true             # uppercase in a pattern makes it case sensitive again
+max-results = 5000
+highlight = true              # highlight search matches in the text
+
+# ---------------------------------------------------------------------------
+# automatic formatting
+# ---------------------------------------------------------------------------
+[format]
+on-idle = "500ms"             # format after this much typing silence ("off" disables)
+on-save = true                # format before writing
+
+# Formatter commands per language.  The buffer is piped to stdin and the formatted
+# text is read back from stdout.  "" disables a language, "!" runs via the shell.
+# Defaults: rust → rustfmt, python → ruff/black, js/ts/json → prettier,
+# toml → taplo, go → gofmt, c → clang-format (each used only if installed).
+[format.command]
+# rust = "rustfmt --edition 2024 --emit stdout"
+# python = "ruff format -"
+# markdown = "!pandoc -f markdown -t markdown"
+
+# ---------------------------------------------------------------------------
+# language servers (scaffolded: diagnostics roll up into the status area)
+# ---------------------------------------------------------------------------
+[lsp]
+# Language server support is a scaffold: initialize handshake, document sync and
+# published diagnostics.  No hover, completion or formatting — that stays
+# external (see [format.command]).
+# Turning this on also implies well-known servers (rust-analyzer, pylsp, gopls,
+# clangd) when those binaries are installed, which is why it is off by default.
+enable = false
+
+# Name a server explicitly to override the implied choice; "" or enable = false
+# turns a language's server off.
+# [lsp.servers.rust]
+# command = "rust-analyzer"
+# args = []
+# languages = ["rust"]        # optional: restrict this server to these languages
+# enable = true
+
+# ---------------------------------------------------------------------------
+# spell checking (comments and strings, curly underline, `z=` to fix)
+# ---------------------------------------------------------------------------
+[spell]
+enable = true
+command = "auto"              # "auto" | "aspell" | "hunspell" | "off"
+only-comments = true          # only check comments and strings
+min-len = 4                   # ignore short words
+ignore-camel-case = true      # ignore IdentifiersLikeThis
+
+# ---------------------------------------------------------------------------
+# colours
+#
+# Empty string = follow the terminal's colour scheme.  Otherwise: "reset",
+# "black" "red" "green" "yellow" "blue" "magenta" "cyan" "white",
+# the "bright-" variants, or "#rrggbb".
+# ---------------------------------------------------------------------------
+[theme]
+
+# vortex asks the terminal how dark it is (an OSC 11 background query at
+# startup, answered in a millisecond or two, skipped if you are already typing).
+# The answer picks the highlight colours, the focused pane border and the quiet
+# blends used for the cursor line, selection, gutter and inactive borders.
+# Pin it if the guess is wrong: "dark" or "light".  At runtime, try the other
+# one with `:set theme.background=light`.
+background = "auto"
+
+# Focused pane border and label: a colour name or "#rrggbb".
+# "" = bright cyan on a dark terminal, dark blue on a light one.
+accent = ""
+
+# Style strings are "<colour> [bold] [italic] [underline] [dim] [on <colour>]";
+# colours are terminal names (red, bright-cyan, gray…), "#rrggbb" or "color13".
+# "" keeps the palette value, which is built from your terminal's own 16 ANSI
+# colours — vortex follows the theme rather than shipping one.
+mode-normal = ""
+mode-insert = ""
+mode-visual = ""
+mode-command = ""
+border = ""
+border-focused = ""
+label = ""
+label-focused = ""
+selection = ""
+cursor-line = ""
+gutter = ""
+gutter-active = ""
+keyword = ""
+string = ""
+comment = ""
+number = ""
+function = ""
+type-name = ""
+constant = ""
+property = ""
+operator = ""
+punctuation = ""
+error = ""
+diagnostic-error = ""
+diagnostic-warning = ""
+diagnostic-hint = ""
+diagnostic-info = ""
+search-match = ""
+prompt = ""
+
+# ---------------------------------------------------------------------------
+# keymap
+#
+# Keys are written in kebab-case: "ctrl-s", "shift-tab", "g g" (a sequence),
+# "<", ">".  Values are action names (`:help keys` lists them all); "none"
+# unbinds a default.  These examples are all no-ops unless you uncomment them.
+# ---------------------------------------------------------------------------
+[keymap.normal]
+# ";" = "find-char-back"          # override a default binding
+# "ctrl-s" = "save"
+# "<space>" = "command-palette"
+
+[keymap.insert]
+# "esc" = "exit-insert"
+
+[keymap.visual]
+# "<" = "unindent"
+
+[keymap.command]
+# "tab" = "complete"

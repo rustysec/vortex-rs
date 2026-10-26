@@ -1,0 +1,3332 @@
+//! The editor: buffers, panes, modes and every editing operation.
+//!
+//! [`Editor`] owns the live configuration (so `:set` and toggles take effect
+//! immediately) and turns key presses into [`Intent`]s — requests the app layer
+//! fulfils by opening prompts, spawning background jobs or exiting.  Keeping that
+//! boundary explicit means the whole editing model can be tested without a
+//! terminal, and background work never blocks a key press.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::Rect;
+
+use crate::action::{
+    Action, Cmd, Direction, FindDir, Motion, Operator, SplitMode, ToggleOption, VisualKind,
+};
+use crate::buffer::{Buffer, BufferId, Change, ChangeGroup, expand_home, next_char_boundary};
+use crate::config::{Config, LineNumber};
+use crate::diagnostic::{Diagnostic, DiagnosticSource};
+use crate::event::{AsyncEvent, JobId};
+use crate::input::motions::{self, Dest, Env, Kind, SearchQuery};
+use crate::input::operators::{self, Case, Region};
+use crate::input::textobject::{self};
+use crate::input::{Awaiting, KeyContext, Mode, OperatorPending, Pending, count_digit, keys};
+use crate::input::{Keymaps, keymap::Lookup};
+use crate::layout::{Axis, Layout, Pane, PaneId};
+use crate::selection::{Dir, Selection, Span};
+
+/// A request for the app layer to act on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Intent {
+    /// Show a message in the status area.
+    Message(StatusLevel, String),
+    /// Open a prompt (command line, search, picker).
+    OpenPrompt(PromptSpec),
+    /// (Re)parse `buffer` with tree-sitter.
+    Parse(BufferId),
+    /// Run the formatter for `buffer`.
+    Format(BufferId),
+    /// Spell check `buffer`.
+    Spell(BufferId),
+    /// Start a file-name search.
+    FindFiles(String),
+    /// Start a project-wide text search.
+    Grep(SearchQuery),
+    /// Copy text to the terminal clipboard (OSC-52).
+    Clipboard(String),
+    /// Re-read configuration from disk.
+    ReloadConfig,
+    /// Keep the cursor on screen after a move.
+    EnsureVisible,
+    /// Leave the editor.
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// What a prompt should collect.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PromptSpec {
+    /// `:` command line.
+    Command(String),
+    /// `/` or `?` — search within this buffer.
+    Search { forward: bool, initial: String },
+    /// `:write <path>` style path entry.
+    Path { initial: String },
+    /// `G` — line number.
+    GotoLine,
+    /// File picker over search results.
+    FindFiles(String),
+    /// Project grep.
+    Grep(String),
+    /// Buffer picker.
+    SwitchBuffer,
+    /// Every `:` command, filterable.
+    Palette(String),
+    /// Spelling suggestions for the word under the cursor.
+    Spell {
+        word: String,
+        span: Span,
+        suggestions: Vec<String>,
+    },
+    /// Diagnostics of the current buffer.
+    Diagnostics,
+    /// `:substitute` — a second argument line.
+    Substitute(String),
+}
+
+/// A register holding yanked or deleted text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Register {
+    pub text: String,
+    pub linewise: bool,
+}
+
+impl Register {
+    pub fn new(text: impl Into<String>, linewise: bool) -> Self {
+        Self {
+            text: text.into(),
+            linewise,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+/// Named, numbered and unnamed registers, like vim's.
+#[derive(Debug, Clone)]
+pub struct Registers {
+    unnamed: Register,
+    /// `0` holds the last yank; `1..=9` the most recent deletes.
+    numbered: Vec<Register>,
+    named: HashMap<char, Register>,
+    /// Last search term, offered as the default at the `/` prompt.
+    pub search: Option<String>,
+}
+
+impl Registers {
+    fn new() -> Self {
+        Self {
+            unnamed: Register::default(),
+            numbered: (0..10).map(|_| Register::default()).collect(),
+            named: HashMap::new(),
+            search: None,
+        }
+    }
+
+    pub fn get(&self, name: char) -> Register {
+        if let Some(index) = digit_index(name) {
+            return self.numbered[index].clone();
+        }
+        if name == '"' {
+            return self.unnamed.clone();
+        }
+        self.named
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| self.unnamed.clone())
+    }
+
+    /// Yanking replaces the target register and `0`, and never shifts numbers.
+    pub fn yank(&mut self, register: Option<char>, value: Register) {
+        if let Some(name) = register {
+            match digit_index(name) {
+                Some(index) => self.numbered[index] = value.clone(),
+                None => {
+                    self.named.insert(name, value.clone());
+                }
+            }
+        }
+        self.numbered[0] = value.clone();
+        self.unnamed = value;
+    }
+
+    /// Deleting shifts `1..=9` down, so the last delete is recoverable.
+    pub fn delete(&mut self, register: Option<char>, value: Register) {
+        match register {
+            Some(name) => {
+                if let Some(index) = digit_index(name) {
+                    self.numbered[index] = value.clone();
+                } else {
+                    self.named.insert(name, value.clone());
+                }
+            }
+            None => {
+                self.numbered.rotate_right(1);
+                self.numbered[1] = value.clone();
+            }
+        }
+        self.unnamed = value;
+    }
+
+    pub fn unnamed(&self) -> Register {
+        self.unnamed.clone()
+    }
+}
+
+fn digit_index(name: char) -> Option<usize> {
+    if name.is_ascii_digit() {
+        Some(name as usize - '0' as usize)
+    } else {
+        None
+    }
+}
+
+/// Jump list behind `ctrl-o` / `ctrl-i`.
+#[derive(Debug, Clone)]
+pub struct JumpList {
+    entries: Vec<(BufferId, usize)>,
+    index: usize,
+    limit: usize,
+}
+
+impl Default for JumpList {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: 0,
+            limit: 100,
+        }
+    }
+}
+
+impl JumpList {
+    pub fn push(&mut self, entry: (BufferId, usize)) {
+        if self
+            .entries
+            .last()
+            .is_some_and(|last| last.0 == entry.0 && (last.1 as isize - entry.1 as isize).abs() < 2)
+        {
+            return;
+        }
+        // Truncate any forward history we just walked away from.
+        if self.index + 1 < self.entries.len() {
+            self.entries.truncate(self.index + 1);
+        }
+        self.entries.push(entry);
+        if self.entries.len() > self.limit {
+            let excess = self.entries.len() - self.limit;
+            self.entries.drain(..excess);
+        }
+        self.index = self.entries.len() - 1;
+    }
+
+    pub fn back(&mut self) -> Option<(BufferId, usize)> {
+        if self.entries.is_empty() || self.index == 0 {
+            return None;
+        }
+        self.index -= 1;
+        Some(self.entries[self.index])
+    }
+
+    pub fn forward(&mut self) -> Option<(BufferId, usize)> {
+        if self.index + 1 >= self.entries.len() {
+            return None;
+        }
+        self.index += 1;
+        Some(self.entries[self.index])
+    }
+}
+
+/// What the `.` key replays.
+#[derive(Debug, Clone)]
+pub enum Repeatable {
+    /// Text typed in insert mode.
+    Insert { text: String },
+    /// An operator plus the thing it applied to.
+    Operator {
+        operator: Operator,
+        target: Target,
+        count: usize,
+        char_arg: Option<char>,
+    },
+    /// A paste.
+    Put {
+        register: char,
+        position: PutPosition,
+    },
+}
+
+/// The "thing" an operator applied to, replayable at a new cursor position.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    Motion(Motion),
+    Find {
+        dir: FindDir,
+        ch: char,
+    },
+    TextObject {
+        inside: bool,
+        key: char,
+    },
+    /// Whole lines (`dd`, `cc`, `S`).
+    Line,
+    /// The current visual selection (`v` + operator).
+    Selection,
+    /// The character(s) under the cursor (`x`).
+    CharAhead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutPosition {
+    AfterCursor,
+    BeforeCursor,
+    AfterLine,
+    BeforeLine,
+}
+
+/// Kinds of background work tracked per buffer, so we do not spawn duplicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobKind {
+    Parse,
+    Format,
+    Spell,
+}
+
+/// Where `i`-like commands put the cursor.
+enum InsertAt {
+    Cursor,
+    AfterCursor,
+    WordEnd,
+    LineEnd,
+    FirstNonBlank,
+    AfterFirstNonBlank,
+}
+
+/// The editor state.
+pub struct Editor {
+    pub config: Config,
+    pub buffers: Vec<Buffer>,
+    pub layout: Layout,
+    pub mode: Mode,
+    pub pending: Pending,
+    pub registers: Registers,
+    pub search: Option<SearchQuery>,
+    /// Byte spans of the current search term, for highlighting.
+    pub search_matches: Vec<Span>,
+    pub jumplist: JumpList,
+    pub last_find: Option<(FindDir, char)>,
+    pub repeatable: Option<Repeatable>,
+    /// `ctrl-o`: one normal-mode action, then straight back to insert.
+    pub normal_once: bool,
+    /// Text typed since insert mode was entered, for `.` repeat.
+    insert_batch: String,
+    /// Where insert mode started, so `Esc` can park the cursor on the last
+    /// character typed the way vim does.
+    insert_anchor: usize,
+    /// `ctrl-a` in insert mode repeats the last inserted text.
+    last_inserted_word: String,
+    next_buffer_id: u32,
+    pub pending_jobs: HashMap<(BufferId, JobKind), JobId>,
+    /// Set when a formatter run is waiting for the idle timer.
+    pub format_due: Option<std::time::Instant>,
+    /// Terminal area of the last frame, so commands can ask for geometry.
+    last_area: AreaCell,
+}
+
+impl Editor {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            buffers: Vec::new(),
+            layout: Layout::default(),
+            mode: Mode::Normal,
+            pending: Pending::default(),
+            registers: Registers::new(),
+            search: None,
+            search_matches: Vec::new(),
+            jumplist: JumpList::default(),
+            last_find: None,
+            repeatable: None,
+            normal_once: false,
+            insert_batch: String::new(),
+            insert_anchor: 0,
+            last_inserted_word: String::new(),
+            next_buffer_id: 1,
+            pending_jobs: HashMap::new(),
+            format_due: None,
+            last_area: AreaCell::default(),
+        }
+    }
+
+    // ------------------------------------------------------------- buffers
+
+    fn alloc_buffer_id(&mut self) -> BufferId {
+        let id = BufferId(self.next_buffer_id);
+        self.next_buffer_id += 1;
+        id
+    }
+
+    pub fn buffers(&self) -> &[Buffer] {
+        &self.buffers
+    }
+
+    pub fn buffer(&self, id: BufferId) -> Option<&Buffer> {
+        self.buffers.iter().find(|buffer| buffer.id == id)
+    }
+
+    pub fn buffer_mut(&mut self, id: BufferId) -> Option<&mut Buffer> {
+        self.buffers.iter_mut().find(|buffer| buffer.id == id)
+    }
+
+    pub fn current_buffer_id(&self) -> Option<BufferId> {
+        self.layout.focused_pane().map(|pane| pane.buffer)
+    }
+
+    pub fn current_buffer(&self) -> Option<&Buffer> {
+        self.current_buffer_id().and_then(|id| self.buffer(id))
+    }
+
+    pub fn current_pane(&self) -> Option<&Pane> {
+        self.layout.focused_pane()
+    }
+
+    pub fn buffer_by_path(&self, path: &Path) -> Option<BufferId> {
+        self.buffers
+            .iter()
+            .find(|buffer| buffer.path() == Some(path))
+            .map(|buffer| buffer.id)
+    }
+
+    pub fn dirty_buffers(&self) -> Vec<BufferId> {
+        self.buffers
+            .iter()
+            .filter(|buffer| buffer.is_dirty())
+            .map(|buffer| buffer.id)
+            .collect()
+    }
+
+    /// Open a file, reusing a buffer that already shows it.
+    ///
+    /// Returns the buffer and whether it was newly created; the pane is not
+    /// touched — use [`Editor::show_in_pane`] for that.
+    pub fn open_path(&mut self, path: &Path) -> (BufferId, bool) {
+        let path = expand_home(path);
+        if let Some(id) = self.buffer_by_path(&path) {
+            return (id, false);
+        }
+        let id = self.alloc_buffer_id();
+        let buffer = match Buffer::open_or_new(id, &path, &self.config.editor) {
+            Ok(buffer) => buffer,
+            // An unreadable file is still editable: start empty and let the
+            // first write fail loudly if it must.
+            Err(_) => Buffer::new(id, Some(path.clone()), String::new(), &self.config.editor),
+        };
+        self.buffers.push(buffer);
+        (id, true)
+    }
+
+    /// An empty, unnamed buffer.
+    pub fn new_scratch(&mut self) -> BufferId {
+        let id = self.alloc_buffer_id();
+        self.buffers
+            .push(Buffer::new(id, None, String::new(), &self.config.editor));
+        id
+    }
+
+    /// Show `buffer` in the focused pane, or in a new pane when `split` is set.
+    pub fn show_in_pane(&mut self, id: BufferId, split: Option<Axis>) -> Option<PaneId> {
+        if let Some(axis) = split {
+            let area = self.frame_area();
+            let new_id =
+                self.layout
+                    .split_focused(Some(axis), &self.config.layout, area, |pane_id| {
+                        Pane::new(pane_id, id)
+                    })?;
+            self.layout.on_focus_changed(&self.config.layout);
+            return Some(new_id);
+        }
+        // No panes yet (the welcome screen): this pane is the first one.
+        if self.layout.root.is_none() {
+            let pane_id = self.layout.show_first(id);
+            self.layout.on_focus_changed(&self.config.layout);
+            return Some(pane_id);
+        }
+        if self.layout.focused().is_none()
+            && let Some(first) = self.layout.panes().first().copied()
+        {
+            self.layout.focus(first);
+        }
+        let pane = self.layout.focused_pane_mut()?;
+        pane.buffer = id;
+        pane.selection = Selection::point(0);
+        pane.view = Default::default();
+        let pane_id = pane.id;
+        self.layout.on_focus_changed(&self.config.layout);
+        Some(pane_id)
+    }
+
+    /// Open a file in the focused pane, like vim's `:edit`.
+    pub fn open_file(&mut self, path: &Path) -> BufferId {
+        let (id, _created) = self.open_path(path);
+        self.show_in_pane(id, None);
+        id
+    }
+
+    /// Open a file in a new pane, like `:split` / `:vsplit`.
+    pub fn open_file_split(&mut self, path: &Path, axis: Axis) -> BufferId {
+        let (id, _created) = self.open_path(path);
+        self.show_in_pane(id, Some(axis));
+        id
+    }
+
+    /// Focus the first pane showing `buffer`, opening one if needed.
+    pub fn focus_buffer(&mut self, id: BufferId) -> bool {
+        if let Some(pane) = self.layout.panes_showing(id).first().copied() {
+            self.layout.focus(pane);
+            self.layout.on_focus_changed(&self.config.layout);
+            return true;
+        }
+        self.show_in_pane(id, None).is_some()
+    }
+
+    /// Close a buffer; refuses to discard unsaved changes unless `force`.
+    pub fn close_buffer(&mut self, id: BufferId, force: bool) -> Result<usize, String> {
+        let buffer = self
+            .buffer(id)
+            .ok_or_else(|| "no such buffer".to_string())?;
+        if buffer.is_dirty() && !force {
+            return Err(format!(
+                "{} has unsaved changes (use :bdelete! to discard)",
+                buffer.display_name()
+            ));
+        }
+        let panes = self.layout.panes_showing(id);
+        for pane in &panes {
+            self.layout.remove(*pane);
+        }
+        self.buffers.retain(|buffer| buffer.id != id);
+        Ok(panes.len())
+    }
+
+    // ------------------------------------------------------------- cursors
+
+    pub fn selection(&self) -> Selection {
+        self.current_pane()
+            .map(|pane| pane.selection.clone())
+            .unwrap_or_else(|| Selection::point(0))
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.selection().cursor()
+    }
+
+    pub fn set_selection(&mut self, selection: Selection) {
+        if let Some(pane) = self.layout.focused_pane_mut() {
+            pane.selection = selection;
+            pane.view.wanted_col = None;
+        }
+    }
+
+    pub fn set_cursor(&mut self, position: usize) {
+        let position = self
+            .current_buffer()
+            .map(|buffer| buffer.clamp_byte(position))
+            .unwrap_or(0);
+        self.set_selection(Selection::point(position));
+    }
+
+    /// Leave visual mode without touching anything else.
+    /// Leave insert mode without inserting anything (Ctrl-C).
+    pub fn leave_insert(&mut self) {
+        if self.mode == Mode::Insert {
+            self.exit_insert();
+        }
+    }
+
+    pub fn leave_visual(&mut self) {
+        if self.mode.is_visual() {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// Apply changes to the focused buffer, recording undo data.
+    pub fn apply(&mut self, changes: Vec<Change>, group: ChangeGroup) {
+        let Some(id) = self.current_buffer_id() else {
+            return;
+        };
+        if self.buffer(id).is_some_and(|buffer| buffer.read_only) {
+            return;
+        }
+        let Some(pane_id) = self.layout.focused() else {
+            return;
+        };
+        // Take the selection out, edit the buffer, then put it back: the borrow
+        // checker is happy and the pane keeps its cursor.
+        let Some(pane) = self.layout.pane_mut(pane_id) else {
+            return;
+        };
+        let mut selection = pane.selection.clone();
+        let Some(buffer) = self.buffer_mut(id) else {
+            return;
+        };
+        buffer.apply(changes, group, &mut selection);
+        if let Some(pane) = self.layout.pane_mut(pane_id) {
+            pane.selection = selection;
+        }
+    }
+
+    /// Apply changes to a specific buffer, keeping every pane's cursor sane.
+    pub fn apply_to(
+        &mut self,
+        id: BufferId,
+        changes: Vec<Change>,
+        group: ChangeGroup,
+    ) -> Option<()> {
+        // One buffer edit, then every pane showing it maps its own cursor
+        // through the same edits.
+        let panes = self.layout.panes_showing(id);
+        let mut selections = Vec::with_capacity(panes.len());
+        for pane_id in panes {
+            let selection = self.layout.pane(pane_id)?.selection.clone();
+            selections.push((pane_id, selection));
+        }
+        let anchor = selections
+            .iter()
+            .find(|(pane_id, _)| self.layout.is_focused(*pane_id))
+            .map(|(pane_id, _)| *pane_id)
+            .or_else(|| selections.first().map(|(pane_id, _)| *pane_id))?;
+        let mut selection = selections
+            .iter()
+            .find(|(pane_id, _)| *pane_id == anchor)
+            .map(|(_, selection)| selection.clone())
+            .unwrap_or_else(|| Selection::point(0));
+        let edits = self.buffer_mut(id)?.apply(changes, group, &mut selection);
+        for (pane_id, pane_selection) in selections {
+            if let Some(pane) = self.layout.pane_mut(pane_id) {
+                pane.selection = pane_selection.map(&edits);
+            }
+        }
+        Some(())
+    }
+
+    /// The region a visual selection covers.
+    pub fn selection_region(&self) -> Region {
+        let Some(buffer) = self.current_buffer() else {
+            return Region::empty();
+        };
+        let selection = self.selection();
+        let span = selection.primary();
+        match self.mode.visual_kind() {
+            Some(VisualKind::Line) => {
+                let first = buffer.line_of(span.start);
+                let last = buffer.line_of(span.end.max(span.start));
+                Region::line(operators::lines_span(buffer, first, last))
+            }
+            Some(VisualKind::Block) => {
+                Region::block(operators::block_spans(buffer, span.start, span.end))
+            }
+            Some(VisualKind::Char) | None => {
+                if span.is_empty() {
+                    Region::empty()
+                } else {
+                    // A characterwise selection includes the character under the
+                    // cursor, so the region extends past it.
+                    Region::char(Span::new(span.start, next_boundary(buffer, span.end)))
+                }
+            }
+        }
+    }
+
+    /// Remember the terminal area so commands can ask for geometry later.
+    pub fn set_last_area(&mut self, area: Rect) {
+        self.last_area.0.set(area);
+    }
+
+    // ------------------------------------------------------------- key flow
+
+    /// Which keymap a key press resolves against right now.
+    pub fn key_context(&self) -> KeyContext {
+        match self.mode {
+            Mode::Insert => KeyContext::Insert,
+            Mode::Visual(_) => KeyContext::Visual,
+            Mode::Normal | Mode::Command => {
+                if self.pending.operator.is_some() {
+                    KeyContext::Operator
+                } else {
+                    KeyContext::Normal
+                }
+            }
+        }
+    }
+
+    /// Resolve one key press in normal, visual or insert mode.
+    pub fn handle_key(&mut self, key: KeyEvent, keymaps: &Keymaps, area: Rect) -> Vec<Intent> {
+        self.set_last_area(area);
+
+        if let Some(awaiting) = self.pending.awaiting.take() {
+            return self.resolve_awaiting(awaiting, key, keymaps, area);
+        }
+
+        // Digits build a count, except in insert mode and except a leading `0`
+        // (which is the first-column motion).
+        if self.mode != Mode::Insert && self.mode != Mode::Command {
+            if let Some(digit) = count_digit(key, self.pending.count.is_some()) {
+                self.pending.push_digit(digit);
+                return Vec::new();
+            }
+        }
+
+        // A key can both complete a binding and start a longer one: with
+        // `wd = close-pane` in the config, `w` is bound *and* a prefix. When
+        // this key does not extend what is already bound, run the shorter
+        // binding and read this key again on its own — otherwise binding `wd`
+        // would make `w` unusable.
+        if let Some(stale) = self.stale_binding(keymaps, key) {
+            let pressed = std::mem::take(&mut self.pending.keys);
+            self.pending.fallback = None;
+            let mut intents = self.dispatch(stale, &pressed, area);
+            intents.extend(self.handle_key(key, keymaps, area));
+            return intents;
+        }
+
+        let action = {
+            let map = keymaps.for_context(self.key_context()).clone();
+            self.pending.note_key(keys::normalize(key));
+            map.lookup(&self.pending.keys)
+        };
+        if matches!(action, Lookup::Prefix) {
+            let map = keymaps.for_context(self.key_context());
+            self.pending.fallback = map.bound_at(&self.pending.keys);
+        }
+
+        match action {
+            Lookup::Prefix => Vec::new(),
+            Lookup::Action(action) => {
+                let pressed = std::mem::take(&mut self.pending.keys);
+                self.pending.fallback = None;
+                self.dispatch(action, &pressed, area)
+            }
+            Lookup::Unknown => {
+                if self.mode == Mode::Insert {
+                    if let Some(text) = insertable(key) {
+                        self.pending.clear_keys();
+                        self.insert_text(&text);
+                        return vec![Intent::EnsureVisible];
+                    }
+                }
+                let pressed: Vec<KeyEvent> = std::mem::take(&mut self.pending.keys);
+                self.pending.fallback = None;
+                let count = self.pending.count.take();
+                let operator = self.pending.operator.take();
+                let _ = count;
+                let rendered = pressed
+                    .iter()
+                    .map(|key| keys::describe(*key))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                match operator {
+                    Some(_) => vec![Intent::Message(
+                        StatusLevel::Warn,
+                        "no motion for that operator".to_string(),
+                    )],
+                    None => vec![Intent::Message(
+                        StatusLevel::Warn,
+                        format!("no binding for \"{rendered}\""),
+                    )],
+                }
+            }
+        }
+    }
+
+    fn resolve_awaiting(
+        &mut self,
+        awaiting: Awaiting,
+        key: KeyEvent,
+        keymaps: &Keymaps,
+        area: Rect,
+    ) -> Vec<Intent> {
+        // `Esc` cancels whatever we were waiting for.
+        if key.code == KeyCode::Esc && !matches!(awaiting, Awaiting::Replace) {
+            self.pending.clear();
+            return Vec::new();
+        }
+        match awaiting {
+            Awaiting::Register => {
+                let Some(name) = keys::typed_char(key) else {
+                    return Vec::new();
+                };
+                self.pending.register = Some(name);
+                // `"<reg>p`, `"<reg>y…`: keep waiting for the command unless the
+                // key alone already resolves to one in this context.
+                let map = keymaps.for_context(self.key_context()).clone();
+                let normalized = keys::normalize(key);
+                match map.lookup(&[normalized]) {
+                    Lookup::Action(action) => self.dispatch(action, &[normalized], area),
+                    Lookup::Prefix | Lookup::Unknown => Vec::new(),
+                }
+            }
+            Awaiting::SetMark => {
+                let Some(name) = keys::typed_char(key) else {
+                    return Vec::new();
+                };
+                self.set_mark(name)
+            }
+            Awaiting::Mark { line } => {
+                let Some(name) = keys::typed_char(key) else {
+                    return Vec::new();
+                };
+                self.goto_mark(name, line)
+            }
+            Awaiting::Find(dir) => {
+                let Some(ch) = keys::typed_char(key) else {
+                    return Vec::new();
+                };
+                self.last_find = Some((dir, ch));
+                let count = self.pending.take_count();
+                self.apply_find(dir, ch, count)
+            }
+            Awaiting::TextObject { inside } => {
+                let Some(ch) = keys::typed_char(key) else {
+                    return Vec::new();
+                };
+                if let Some(operator) = self.pending.operator.take() {
+                    let count = self.pending.take_count();
+                    return self.run_operator(
+                        operator.operator,
+                        Target::TextObject { inside, key: ch },
+                        count,
+                        None,
+                        area,
+                    );
+                }
+                self.select_object(inside, ch)
+            }
+            Awaiting::Replace => {
+                let Some(ch) = keys::typed_char(key) else {
+                    return Vec::new();
+                };
+                let count = self.pending.take_count();
+                self.run_operator(Operator::Replace, Target::CharAhead, count, Some(ch), area)
+            }
+        }
+    }
+
+    /// The binding already typed, when the key just pressed cannot extend it.
+    fn stale_binding(&self, keymaps: &Keymaps, key: KeyEvent) -> Option<Action> {
+        let fallback = self.pending.fallback.clone()?;
+        if self.pending.keys.is_empty() {
+            return None;
+        }
+        let map = keymaps.for_context(self.key_context());
+        let mut extended = self.pending.keys.clone();
+        extended.push(keys::normalize(key));
+        matches!(map.lookup(&extended), Lookup::Unknown).then_some(fallback)
+    }
+
+    /// Resolve a key sequence that has gone quiet, the way vim's `timeoutlen`
+    /// does: whatever is bound runs (`w`, even though `wd` is also bound), and a
+    /// prefix that binds nothing (a stray `g`) is dropped.
+    pub fn expire_pending(&mut self, area: Rect) -> Vec<Intent> {
+        if !self.pending.prefix_expired() {
+            return Vec::new();
+        }
+        let Some(action) = self.pending.fallback.take() else {
+            self.pending.clear_keys();
+            return Vec::new();
+        };
+        let pressed = std::mem::take(&mut self.pending.keys);
+        self.dispatch(action, &pressed, area)
+    }
+
+    /// Turn a resolved action into work.
+    pub fn dispatch(&mut self, action: Action, pressed: &[KeyEvent], area: Rect) -> Vec<Intent> {
+        match action {
+            Action::Operator(operator) => self.begin_operator(operator, pressed, area),
+            Action::OperatorMotion(operator, motion) => {
+                let count = self.pending.take_count();
+                self.pending.operator = None;
+                self.run_operator(operator, Target::Motion(motion), count, None, area)
+            }
+            Action::OperatorLine(operator) => {
+                let count = self.pending.take_count();
+                self.pending.operator = None;
+                self.run_operator(operator, Target::Line, count, None, area)
+            }
+            Action::Motion(Motion::FindChar(dir)) => {
+                self.pending.awaiting = Some(Awaiting::Find(dir));
+                Vec::new()
+            }
+            Action::Extend(Motion::FindChar(dir)) => {
+                self.pending.awaiting = Some(Awaiting::Find(dir));
+                Vec::new()
+            }
+            Action::Motion(motion) => {
+                if let Motion::TextObject { inside } = motion {
+                    // `ciw`, `da"`: the operator stays pending while the object
+                    // itself arrives on the next keypress.
+                    self.pending.awaiting = Some(Awaiting::TextObject { inside });
+                    return Vec::new();
+                }
+                if let Some(operator) = self.pending.operator.take() {
+                    let count = self.pending.take_count();
+                    return self.run_operator(
+                        operator.operator,
+                        Target::Motion(motion),
+                        count,
+                        None,
+                        area,
+                    );
+                }
+                let count = self.pending.take_count();
+                self.apply_motion(motion, count, area)
+            }
+            Action::Extend(motion) => {
+                let count = self.pending.take_count();
+                self.extend_selection(motion, count, area)
+            }
+            Action::Cmd(command) => self.run_command(command, area),
+        }
+    }
+
+    fn begin_operator(
+        &mut self,
+        operator: Operator,
+        pressed: &[KeyEvent],
+        area: Rect,
+    ) -> Vec<Intent> {
+        // A repeated sequence means "whole line": dd, cc, yy, >>, ==…
+        if let Some(existing) = &self.pending.operator {
+            if existing.operator == operator && existing.matches(pressed) {
+                self.pending.operator = None;
+                let count = self.pending.take_count();
+                return self.run_operator(operator, Target::Line, count, None, area);
+            }
+        }
+        if operator == Operator::Replace {
+            self.pending.awaiting = Some(Awaiting::Replace);
+            return Vec::new();
+        }
+        // In visual mode an operator applies to the selection right away.
+        if self.mode.is_visual() {
+            self.pending.operator = None;
+            let count = self.pending.take_count();
+            return self.run_operator(operator, Target::Selection, count, None, area);
+        }
+        self.pending.operator = Some(OperatorPending {
+            operator,
+            keys: pressed.to_vec(),
+        });
+        Vec::new()
+    }
+
+    // ------------------------------------------------------------- motion
+
+    /// Context handed to motion functions.
+    fn motion_env(&self, area: Rect) -> Env<'_> {
+        let pane = self.current_pane();
+        Env {
+            height: self.text_height(area).max(1),
+            scroll_line: pane.map(|pane| pane.view.scroll_line).unwrap_or(0),
+            wanted_col: pane.and_then(|pane| pane.view.wanted_col),
+            last_find: self.last_find,
+            search: self.search.as_ref(),
+        }
+    }
+
+    /// The rectangle of the pane holding the cursor.
+    ///
+    /// Callers hand in the whole terminal area.  Everything measured in rows —
+    /// scrolling, page moves, `H`/`M`/`L` — belongs to the focused pane rather
+    /// than the terminal: after a `:split` the pane is half as tall, and
+    /// measuring the terminal instead lets the cursor walk off screen while the
+    /// editor still counts it as visible.
+    pub fn focused_area(&self, area: Rect) -> Rect {
+        let (_status, panes, _message) = crate::ui::areas(area, &self.config);
+        let Some(focused) = self.layout.focused() else {
+            return panes;
+        };
+        self.layout
+            .rects(panes)
+            .into_iter()
+            .find(|(id, _)| *id == focused)
+            .map(|(_, rect)| rect)
+            .unwrap_or(panes)
+    }
+
+    /// Rows available for text inside the focused pane.
+    pub fn text_height(&self, area: Rect) -> usize {
+        let border = if self.config.layout.border == crate::config::BorderStyle::None {
+            0
+        } else {
+            2
+        };
+        let pane = self.focused_area(area);
+        (pane.height as usize).saturating_sub(border).max(1)
+    }
+
+    fn apply_motion(&mut self, motion: Motion, count: usize, area: Rect) -> Vec<Intent> {
+        if let Motion::TextObject { inside } = motion {
+            self.pending.awaiting = Some(Awaiting::TextObject { inside });
+            return Vec::new();
+        }
+        let (cursor, dest, before_line) = {
+            let Some(buffer) = self.current_buffer() else {
+                return Vec::new();
+            };
+            let cursor = self.cursor();
+            let env = self.motion_env(area);
+            match motions::apply(motion, count, cursor, buffer, &env) {
+                Some(dest) => (cursor, dest, buffer.line_of(cursor)),
+                None => return Vec::new(),
+            }
+        };
+        if should_push_jump(motion, before_line, self.line_at(dest.cursor)) {
+            if let Some(id) = self.current_buffer_id() {
+                self.jumplist.push((id, cursor));
+            }
+        }
+        let clamped = self
+            .current_buffer()
+            .map(|buffer| clamp_cursor(buffer, dest.cursor))
+            .unwrap_or(0);
+        self.set_cursor(clamped);
+        if let Some(column) = dest.wanted_col {
+            if let Some(pane) = self.layout.focused_pane_mut() {
+                pane.view.wanted_col = Some(column);
+            }
+        }
+        vec![Intent::EnsureVisible]
+    }
+
+    fn line_at(&self, position: usize) -> usize {
+        self.current_buffer()
+            .map(|buffer| buffer.line_of(position))
+            .unwrap_or(0)
+    }
+
+    /// Grow the visual selection with a motion.
+    fn extend_selection(&mut self, motion: Motion, count: usize, area: Rect) -> Vec<Intent> {
+        if let Motion::TextObject { inside } = motion {
+            self.pending.awaiting = Some(Awaiting::TextObject { inside });
+            return Vec::new();
+        }
+        let (anchor, cursor, dest) = {
+            let Some(buffer) = self.current_buffer() else {
+                return Vec::new();
+            };
+            let selection = self.selection();
+            let env = self.motion_env(area);
+            match motions::apply(motion, count, selection.cursor(), buffer, &env) {
+                Some(dest) => (selection.anchor(), selection.cursor(), dest),
+                None => return Vec::new(),
+            }
+        };
+        let clamped = self
+            .current_buffer()
+            .map(|buffer| clamp_cursor(buffer, dest.cursor))
+            .unwrap_or(0);
+        let mut selection = self.selection();
+        if cursor == anchor {
+            selection.set_dir(if clamped >= anchor {
+                Dir::Forward
+            } else {
+                Dir::Backward
+            });
+        }
+        selection.extend_to(clamped);
+        self.set_selection(selection);
+        vec![Intent::EnsureVisible]
+    }
+
+    fn apply_find(&mut self, dir: FindDir, ch: char, count: usize) -> Vec<Intent> {
+        let found = {
+            let Some(buffer) = self.current_buffer() else {
+                return Vec::new();
+            };
+            motions::find_char(buffer, self.cursor(), dir, ch, count)
+        };
+        match found {
+            Some(at) => {
+                let at = self
+                    .current_buffer()
+                    .map(|buffer| clamp_cursor(buffer, at))
+                    .unwrap_or(0);
+                self.set_cursor(at);
+                vec![Intent::EnsureVisible]
+            }
+            None => vec![Intent::Message(
+                StatusLevel::Warn,
+                format!("can't find '{ch}'"),
+            )],
+        }
+    }
+
+    /// Select a text object: extend in visual mode, otherwise start visual.
+    fn select_object(&mut self, inside: bool, key: char) -> Vec<Intent> {
+        let Some(object) = textobject::object_from_key(key) else {
+            return vec![Intent::Message(
+                StatusLevel::Warn,
+                format!("unknown text object \"{key}\""),
+            )];
+        };
+        let span = {
+            let Some(buffer) = self.current_buffer() else {
+                return Vec::new();
+            };
+            object.range(buffer, self.cursor(), inside)
+        };
+        let Some(span) = span else {
+            return vec![Intent::Message(
+                StatusLevel::Warn,
+                format!("no {} here", object.label()),
+            )];
+        };
+        if span.is_empty() {
+            return Vec::new();
+        }
+        // A characterwise visual selection ends on the last character *inside*
+        // the object, so the cursor sits on it rather than past it.
+        let end = span.end.saturating_sub(1);
+        if self.mode.is_visual() {
+            let mut selection = self.selection();
+            selection.extend_to(end);
+            self.set_selection(selection);
+        } else {
+            self.mode = Mode::Visual(VisualKind::Char);
+            let mut selection = Selection::point(span.start);
+            selection.set_primary_span(Span::new(span.start, span.start), Dir::Forward);
+            selection.extend_to(end);
+            self.set_selection(selection);
+        }
+        vec![Intent::EnsureVisible]
+    }
+
+    // ------------------------------------------------------------- operators
+
+    fn run_operator(
+        &mut self,
+        operator: Operator,
+        target: Target,
+        count: usize,
+        char_arg: Option<char>,
+        area: Rect,
+    ) -> Vec<Intent> {
+        self.pending.operator = None;
+        self.pending.awaiting = None;
+        let count = count.max(1);
+        let Some(region) = self.region_for(&target, count, area) else {
+            self.pending.clear();
+            return vec![Intent::Message(
+                StatusLevel::Warn,
+                format!("nothing to {}", verb_for(operator)),
+            )];
+        };
+
+        // Take the register first: `buffer` borrows `self` immutably.
+        let register = self.pending.register.take();
+        let Some(buffer) = self.current_buffer() else {
+            return Vec::new();
+        };
+        let text = region.text(buffer);
+        let tab_width = self.tab_width();
+        let expand_tab = self.config.editor.expand_tab;
+        let comment_token = {
+            let token = buffer.language.line_comment;
+            if token.is_empty() { "//" } else { token }
+        };
+        let start = region.extent().start;
+        let mut intents = Vec::new();
+
+        match operator {
+            Operator::Yank => {
+                self.registers
+                    .yank(register, Register::new(text.clone(), region.linewise));
+                self.set_cursor(start);
+                if self.config.editor.clipboard {
+                    intents.push(Intent::Clipboard(text.clone()));
+                }
+                intents.push(Intent::Message(
+                    StatusLevel::Info,
+                    chunk_message("yanked", &text, region.linewise),
+                ));
+            }
+            Operator::Delete => {
+                let changes = operators::delete_changes(&region);
+                self.apply(changes, ChangeGroup::Operator);
+                self.registers
+                    .delete(register, Register::new(text.clone(), region.linewise));
+                if self.config.editor.clipboard {
+                    intents.push(Intent::Clipboard(text.clone()));
+                }
+                intents.push(Intent::Message(
+                    StatusLevel::Info,
+                    chunk_message("deleted", &text, region.linewise),
+                ));
+                let cursor = if region.linewise {
+                    self.indent_of_line_at(start)
+                } else {
+                    start
+                };
+                self.set_cursor(cursor);
+            }
+            Operator::Change => {
+                let (changes, cursor) = {
+                    let buffer = self.current_buffer().expect("checked above");
+                    operators::change_region(buffer, &region)
+                };
+                self.apply(changes, ChangeGroup::Operator);
+                self.registers
+                    .delete(register, Register::new(text, region.linewise));
+                self.leave_visual();
+                self.set_cursor(cursor);
+                self.enter_insert();
+            }
+            Operator::Replace => {
+                let Some(ch) = char_arg else {
+                    return Vec::new();
+                };
+                let changes = {
+                    let buffer = self.current_buffer().expect("checked above");
+                    operators::replace_char_changes(buffer, &region, ch)
+                };
+                self.apply(changes, ChangeGroup::Operator);
+                self.set_cursor(start);
+            }
+            Operator::Join => {
+                let lines = {
+                    let buffer = self.current_buffer().expect("checked above");
+                    if region.linewise {
+                        let extent = region.extent();
+                        buffer
+                            .line_of(extent.end)
+                            .saturating_sub(buffer.line_of(extent.start))
+                            + 1
+                    } else {
+                        count.max(2)
+                    }
+                };
+                let changes = {
+                    let buffer = self.current_buffer().expect("checked above");
+                    operators::join_changes(buffer, &region, lines)
+                };
+                self.apply(changes, ChangeGroup::Operator);
+                let cursor = self
+                    .current_buffer()
+                    .map(|buffer| buffer.clamp_byte(start))
+                    .unwrap_or(0);
+                self.set_cursor(cursor);
+            }
+            Operator::Indent | Operator::Unindent => {
+                let direction = if operator == Operator::Indent { 1 } else { -1 };
+                let changes = {
+                    let buffer = self.current_buffer().expect("checked above");
+                    operators::indent_changes(
+                        buffer, &region, direction, count, expand_tab, tab_width,
+                    )
+                };
+                self.apply(changes, ChangeGroup::Operator);
+                self.set_cursor(self.indent_of_line_at(start));
+            }
+            Operator::Reformat => {
+                let changes = {
+                    let buffer = self.current_buffer().expect("checked above");
+                    operators::reindent_changes(buffer, &region, tab_width)
+                };
+                self.apply(changes, ChangeGroup::Operator);
+                self.set_cursor(self.indent_of_line_at(start));
+                // A configured external formatter handles the whole buffer.
+                let language = self
+                    .current_buffer()
+                    .map(|buffer| buffer.language.id)
+                    .unwrap_or("text");
+                if region.linewise && crate::format::formatter_for(language, &self.config).is_some()
+                {
+                    intents.push(Intent::Format(
+                        self.current_buffer_id().expect("focused buffer"),
+                    ));
+                }
+            }
+            Operator::SwapCase | Operator::Upper | Operator::Lower => {
+                let case = match operator {
+                    Operator::Upper => Case::Upper,
+                    Operator::Lower => Case::Lower,
+                    _ => Case::Swap,
+                };
+                let cursor = {
+                    let buffer = self.current_buffer().expect("checked above");
+                    let changes = operators::case_changes(buffer, &region, case);
+                    let next = start;
+                    (changes, next)
+                };
+                self.apply(cursor.0, ChangeGroup::Operator);
+                self.set_cursor(cursor.1);
+            }
+            Operator::ToggleComment => {
+                let changes = {
+                    let buffer = self.current_buffer().expect("checked above");
+                    operators::comment_changes(buffer, &region, comment_token)
+                };
+                self.apply(changes, ChangeGroup::Operator);
+                self.set_cursor(start);
+            }
+        }
+
+        if self.mode.is_visual() {
+            self.leave_visual();
+        }
+        self.repeatable = Some(Repeatable::Operator {
+            operator,
+            target,
+            count,
+            char_arg,
+        });
+        intents.push(Intent::EnsureVisible);
+        intents
+    }
+
+    /// Byte offset of the first non-blank character of the line containing
+    /// `position` — where most line-wise operators leave the cursor.
+    fn indent_of_line_at(&self, position: usize) -> usize {
+        self.current_buffer()
+            .map(|buffer| {
+                let line = buffer.line_of(position);
+                let non_blank = buffer.first_non_blank(line);
+                if non_blank >= buffer.line_end(line) {
+                    buffer.line_end(line)
+                } else {
+                    non_blank
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    /// Resolve a target into the bytes an operator will touch.
+    fn region_for(&mut self, target: &Target, count: usize, area: Rect) -> Option<Region> {
+        let cursor = self.cursor();
+        match target {
+            Target::Line => {
+                let buffer = self.current_buffer()?;
+                let first = buffer.line_of(cursor);
+                let last = (first + count - 1).min(buffer.last_line());
+                Some(Region::line(operators::lines_span(buffer, first, last)))
+            }
+            Target::Selection => {
+                let region = self.selection_region();
+                (!region.is_empty()).then_some(region)
+            }
+            Target::CharAhead => {
+                let buffer = self.current_buffer()?;
+                let mut stop = next_boundary(buffer, cursor);
+                if stop == cursor {
+                    return None;
+                }
+                for _ in 1..count {
+                    stop = next_boundary(buffer, stop);
+                }
+                Some(Region::char(Span::new(cursor, stop)))
+            }
+            Target::Find { dir, ch } => {
+                let buffer = self.current_buffer()?;
+                let at = motions::find_char(buffer, cursor, *dir, *ch, count)?;
+                Some(operators::region_for_motion(
+                    buffer, cursor, at, false, true,
+                ))
+            }
+            Target::TextObject { inside, key } => {
+                let buffer = self.current_buffer()?;
+                let object = textobject::object_from_key(*key)?;
+                let span = object.range(buffer, cursor, *inside)?;
+                (!span.is_empty()).then(|| Region::char(span))
+            }
+            Target::Motion(motion) => {
+                if matches!(motion, Motion::TextObject { .. }) {
+                    return None;
+                }
+                let buffer = self.current_buffer()?;
+                let env = self.motion_env(area);
+                let Dest {
+                    cursor: to,
+                    kind,
+                    inclusive,
+                    ..
+                } = motions::apply(*motion, count, cursor, buffer, &env)?;
+                if kind == Kind::Line {
+                    let first = buffer.line_of(cursor.min(to));
+                    let last = buffer.line_of(cursor.max(to));
+                    return Some(Region::line(operators::lines_span(buffer, first, last)));
+                }
+                let region = operators::region_for_motion(buffer, cursor, to, false, inclusive);
+                if region.is_empty() {
+                    // A motion that goes nowhere still acts on the character
+                    // under the cursor (`~`, `x`).
+                    let end = next_boundary(buffer, cursor);
+                    return (end != cursor).then(|| Region::char(Span::new(cursor, end)));
+                }
+                Some(region)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- commands
+
+    fn run_command(&mut self, command: Cmd, area: Rect) -> Vec<Intent> {
+        let mut intents = Vec::new();
+        let count = self.pending.take_count();
+        match command {
+            Cmd::Noop => {}
+            Cmd::Cancel => {
+                self.pending.clear();
+                self.leave_visual();
+            }
+            Cmd::Normal | Cmd::ExitInsert => {
+                self.exit_insert();
+                self.leave_visual();
+                self.pending.clear();
+            }
+            Cmd::Visual(kind) => {
+                if self.mode.visual_kind() == Some(kind) {
+                    self.mode = Mode::Normal;
+                } else {
+                    self.begin_visual(kind);
+                }
+            }
+            Cmd::SwapAnchor => {
+                let selection = self.selection();
+                let primary = selection.primary();
+                let target = if selection.cursor() == selection.anchor() {
+                    primary.end
+                } else {
+                    selection.anchor()
+                };
+                let mut selection = selection;
+                selection.set_dir(match selection.dir() {
+                    Dir::Forward => Dir::Backward,
+                    Dir::Backward => Dir::Forward,
+                });
+                selection.extend_to(target);
+                self.set_selection(selection);
+            }
+            // ---- entering insert / visual ----
+            Cmd::Insert => self.begin_insert(InsertAt::Cursor),
+            Cmd::InsertAtWordEnd => self.begin_insert(InsertAt::WordEnd),
+            Cmd::Append => self.begin_insert(InsertAt::AfterCursor),
+            Cmd::AppendLineEnd => self.begin_insert(InsertAt::LineEnd),
+            Cmd::InsertLineStart => self.begin_insert(InsertAt::FirstNonBlank),
+            Cmd::AppendLineStart => self.begin_insert(InsertAt::AfterFirstNonBlank),
+            Cmd::InsertPrevious => {
+                if let Some(at) = self
+                    .current_buffer()
+                    .and_then(|buffer| buffer.last_change_pos)
+                {
+                    self.set_cursor(at);
+                }
+                self.begin_insert(InsertAt::Cursor);
+            }
+            Cmd::OpenBelow | Cmd::OpenAbove => {
+                intents.extend(self.open_line(command == Cmd::OpenBelow))
+            }
+            // ---- insert mode editing ----
+            Cmd::InsertNewline => self.insert_newline(),
+            Cmd::InsertTab => self.insert_tab(),
+            Cmd::InsertBacktab => self.insert_backtab(),
+            Cmd::InsertBackspace => self.insert_backspace(),
+            Cmd::InsertDelete => self.insert_delete(),
+            Cmd::InsertDeleteWord => self.insert_delete_word(),
+            Cmd::InsertDeleteLineStart => self.insert_delete_line_start(),
+            Cmd::InsertIndentLine => {
+                let changes = self.current_buffer().map(|buffer| {
+                    let line = buffer.line_of(self.cursor());
+                    let region = Region::line(operators::lines_span(buffer, line, line));
+                    operators::indent_changes(
+                        buffer,
+                        &region,
+                        1,
+                        1,
+                        self.config.editor.expand_tab,
+                        self.tab_width(),
+                    )
+                });
+                if let Some(changes) = changes {
+                    self.apply(changes, ChangeGroup::Insert);
+                }
+            }
+            Cmd::NormalOnce => {
+                self.normal_once = true;
+                self.mode = Mode::Normal;
+            }
+            // ---- character edits ----
+            Cmd::DeleteCharNext => {
+                intents.extend(self.run_operator(
+                    Operator::Delete,
+                    Target::CharAhead,
+                    count,
+                    None,
+                    area,
+                ));
+            }
+            Cmd::DeleteCharPrev => {
+                let span = self
+                    .current_buffer()
+                    .map(|buffer| {
+                        let cursor = self.cursor();
+                        let start = buffer
+                            .char_before(cursor)
+                            .map(|(offset, _)| offset)
+                            .unwrap_or(cursor);
+                        Span::new(start, cursor)
+                    })
+                    .filter(|span| span.end > span.start);
+                if let Some(span) = span {
+                    let deleted = self
+                        .current_buffer()
+                        .map(|buffer| buffer.slice(span))
+                        .unwrap_or_default();
+                    self.apply(vec![Change::delete(span)], ChangeGroup::Command);
+                    self.registers.delete(None, Register::new(deleted, false));
+                    self.set_cursor(span.start);
+                    self.leave_visual();
+                }
+            }
+            Cmd::DeleteSelection => {
+                let region = self.selection_region();
+                if !region.is_empty() {
+                    let deleted = self
+                        .current_buffer()
+                        .map(|buffer| region.text(buffer))
+                        .unwrap_or_default();
+                    let start = region.extent().start;
+                    self.apply(operators::delete_changes(&region), ChangeGroup::Command);
+                    self.registers
+                        .delete(None, Register::new(deleted, region.linewise));
+                    self.set_cursor(start);
+                    self.mode = Mode::Normal;
+                }
+            }
+            Cmd::RemoveEmptyLines => {
+                let region = self.selection_region();
+                let changes = if region.is_empty() {
+                    Vec::new()
+                } else {
+                    let buffer = self.current_buffer().expect("region implies a buffer");
+                    let extent = region.extent();
+                    let first = buffer.line_of(extent.start);
+                    let last = buffer.line_of(extent.end);
+                    (first..=last)
+                        .rev()
+                        .filter(|line| buffer.is_line_blank(*line))
+                        .map(|line| Change::delete(operators::lines_span(buffer, line, line)))
+                        .collect()
+                };
+                self.apply(changes, ChangeGroup::Command);
+                self.mode = Mode::Normal;
+            }
+            Cmd::DuplicateLine => {
+                let plan = self.current_buffer().map(|buffer| {
+                    let selection = self.selection();
+                    let span = if self.mode.is_visual() {
+                        let region = self.selection_region();
+                        region.extent()
+                    } else {
+                        let line = buffer.line_of(selection.cursor());
+                        operators::lines_span(buffer, line, line)
+                    };
+                    let text = buffer.slice(span);
+                    let text = if text.ends_with('\n') {
+                        text
+                    } else {
+                        format!("{text}\n")
+                    };
+                    (span.end, text)
+                });
+                if let Some((at, text)) = plan {
+                    self.apply(vec![Change::insert(at, text)], ChangeGroup::Command);
+                    self.set_cursor(at);
+                    self.mode = Mode::Normal;
+                }
+            }
+            // ---- paste ----
+            Cmd::PutAfter => intents.extend(self.put(PutPosition::AfterCursor, count)),
+            Cmd::PutBefore => intents.extend(self.put(PutPosition::BeforeCursor, count)),
+            Cmd::PutAfterLine => intents.extend(self.put(PutPosition::AfterLine, count)),
+            Cmd::PutBeforeLine => intents.extend(self.put(PutPosition::BeforeLine, count)),
+            // ---- history ----
+            Cmd::Undo => intents.extend(self.undo()),
+            Cmd::Redo => intents.extend(self.redo()),
+            Cmd::Repeat => intents.extend(self.repeat(area)),
+            Cmd::SelectRegister => self.pending.awaiting = Some(Awaiting::Register),
+            Cmd::SetMark => self.pending.awaiting = Some(Awaiting::SetMark),
+            Cmd::GotoMarkChar => self.pending.awaiting = Some(Awaiting::Mark { line: false }),
+            Cmd::GotoMarkLine => self.pending.awaiting = Some(Awaiting::Mark { line: true }),
+            Cmd::ReplaceChar => self.pending.awaiting = Some(Awaiting::Replace),
+            // ---- viewport ----
+            Cmd::Recenter => intents.extend(self.recenter(area)),
+            Cmd::ScrollToTop => intents.extend(self.scroll_to_edge(true, area)),
+            Cmd::ScrollToBottom => intents.extend(self.scroll_to_edge(false, area)),
+            Cmd::ScrollLine(direction) => intents.extend(self.scroll_lines(direction)),
+            Cmd::JumpBack => intents.extend(self.jump(true)),
+            Cmd::JumpForward => intents.extend(self.jump(false)),
+            // ---- files ----
+            Cmd::Save => intents.extend(self.save(None)),
+            Cmd::SaveAs => intents.push(Intent::OpenPrompt(PromptSpec::Path {
+                initial: self
+                    .current_buffer()
+                    .and_then(|buffer| buffer.path())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            })),
+            Cmd::SaveAll => intents.extend(self.save_all()),
+            Cmd::ReloadFile => intents.extend(self.reload_file(false)),
+            Cmd::Quit => intents.extend(self.quit(false)),
+            Cmd::ForceQuit => intents.extend(self.quit(true)),
+            Cmd::QuitAll => intents.extend(self.quit_all()),
+            Cmd::ForceQuitAll => {
+                // "Quit anyway": close every pane, discarding unsaved changes.
+                for id in self
+                    .buffers
+                    .iter()
+                    .map(|buffer| buffer.id)
+                    .collect::<Vec<_>>()
+                {
+                    let _ = self.close_buffer(id, true);
+                }
+                intents.push(Intent::Quit);
+            }
+            Cmd::ClosePane => intents.extend(self.close_pane()),
+            // ---- prompts ----
+            Cmd::CommandMode => {
+                intents.push(Intent::OpenPrompt(PromptSpec::Command(String::new())))
+            }
+            Cmd::SearchForward => intents.push(Intent::OpenPrompt(PromptSpec::Search {
+                forward: true,
+                initial: self.search_pattern().unwrap_or_default().to_string(),
+            })),
+            Cmd::SearchBackward => intents.push(Intent::OpenPrompt(PromptSpec::Search {
+                forward: false,
+                initial: self.search_pattern().unwrap_or_default().to_string(),
+            })),
+            Cmd::FindWordForward => intents.extend(self.find_word(true)),
+            Cmd::FindWordBackward => intents.extend(self.find_word(false)),
+            Cmd::ClearSearchHighlight => {
+                self.search_matches.clear();
+                intents.push(Intent::Message(
+                    StatusLevel::Info,
+                    "search highlight cleared".into(),
+                ));
+            }
+            Cmd::GotoLine => intents.push(Intent::OpenPrompt(PromptSpec::GotoLine)),
+            Cmd::FindFiles => {
+                intents.push(Intent::OpenPrompt(PromptSpec::FindFiles(String::new())))
+            }
+            Cmd::GrepProject => intents.push(Intent::OpenPrompt(PromptSpec::Grep(String::new()))),
+            Cmd::SwitchBuffer => intents.push(Intent::OpenPrompt(PromptSpec::SwitchBuffer)),
+            Cmd::CommandPalette => {
+                intents.push(Intent::OpenPrompt(PromptSpec::Palette(String::new())))
+            }
+            Cmd::ShowDiagnostics => intents.push(Intent::OpenPrompt(PromptSpec::Diagnostics)),
+            Cmd::SpellSuggest => intents.extend(self.spell_suggest()),
+            Cmd::FormatBuffer => {
+                if let Some(id) = self.current_buffer_id() {
+                    intents.push(Intent::Format(id));
+                }
+            }
+            // ---- layout ----
+            Cmd::SplitVertical => intents.extend(self.split(Some(Axis::Column), area)),
+            Cmd::SplitHorizontal => intents.extend(self.split(Some(Axis::Row), area)),
+            Cmd::SplitAuto => intents.extend(self.split(None, area)),
+            Cmd::OnlyPane => {
+                self.layout.only();
+                self.layout.on_focus_changed(&self.config.layout);
+            }
+            Cmd::ZoomPane => {
+                self.layout.zoomed = !self.layout.zoomed;
+            }
+            Cmd::EqualizePanes => {
+                self.layout.equalize();
+            }
+            Cmd::CycleLayout(mode) => {
+                self.config.layout.split_mode = mode;
+                if mode == SplitMode::Golden {
+                    self.layout.apply_golden(&self.config.layout);
+                }
+                intents.push(Intent::Message(
+                    StatusLevel::Info,
+                    format!("split mode: {}", split_mode_label(mode)),
+                ));
+            }
+            Cmd::FocusNext => {
+                if self.layout.focus_next(false) {
+                    self.layout.on_focus_changed(&self.config.layout);
+                }
+            }
+            Cmd::FocusPrev => {
+                if self.layout.focus_next(true) {
+                    self.layout.on_focus_changed(&self.config.layout);
+                }
+            }
+            Cmd::FocusDir(direction) => {
+                if self.layout.focus_direction(direction, self.text_area(area)) {
+                    self.layout.on_focus_changed(&self.config.layout);
+                }
+            }
+            Cmd::MoveDir(direction) => {
+                self.layout.move_focused(direction, self.text_area(area));
+            }
+            Cmd::ResizeDir(direction) => {
+                self.layout
+                    .resize_focused(direction, &self.config.layout, self.text_area(area));
+            }
+            Cmd::ToggleOption(option) => intents.extend(self.toggle_option(option)),
+            Cmd::Ex(text) => intents.push(Intent::OpenPrompt(PromptSpec::Command(text))),
+        }
+        intents
+    }
+
+    // ------------------------------------------------------------- inserting
+
+    fn begin_insert(&mut self, at: InsertAt) {
+        let cursor = self
+            .current_buffer()
+            .map(|buffer| {
+                let cursor = self.cursor();
+                match at {
+                    InsertAt::Cursor => cursor,
+                    InsertAt::AfterCursor => next_boundary(buffer, cursor),
+                    InsertAt::WordEnd => {
+                        next_boundary(buffer, motions::word_end(buffer, cursor, 1, false))
+                    }
+                    InsertAt::LineEnd => buffer.line_end(buffer.line_of(cursor)),
+                    InsertAt::FirstNonBlank => buffer.first_non_blank(buffer.line_of(cursor)),
+                    InsertAt::AfterFirstNonBlank => {
+                        let first = buffer.first_non_blank(buffer.line_of(cursor));
+                        if first >= buffer.line_end(buffer.line_of(cursor)) {
+                            first
+                        } else {
+                            next_boundary(buffer, first)
+                        }
+                    }
+                }
+            })
+            .unwrap_or(0);
+        self.set_cursor(cursor);
+        self.enter_insert();
+    }
+
+    fn enter_insert(&mut self) {
+        self.mode = Mode::Insert;
+        self.insert_anchor = self.cursor();
+        self.insert_batch.clear();
+        self.pending.clear();
+        if let Some(id) = self.current_buffer_id()
+            && let Some(buffer) = self.buffer_mut(id)
+        {
+            buffer.break_undo_group();
+        }
+    }
+
+    fn exit_insert(&mut self) {
+        let was_inserting = self.mode == Mode::Insert;
+        if was_inserting {
+            // Vim leaves the cursor on the last character typed.
+            let cursor = self.cursor();
+            if cursor > self.insert_anchor {
+                let back = self.current_buffer().and_then(|buffer| {
+                    let line = buffer.line_of(cursor);
+                    let line_start = buffer.line_start(line);
+                    buffer
+                        .char_before(cursor)
+                        .map(|(previous, _)| previous)
+                        .filter(|previous| *previous >= line_start)
+                });
+                if let Some(previous) = back {
+                    self.set_cursor(previous);
+                }
+            }
+            if let Some(id) = self.current_buffer_id()
+                && let Some(buffer) = self.buffer_mut(id)
+            {
+                buffer.break_undo_group();
+            }
+            if !self.insert_batch.is_empty() {
+                self.last_inserted_word = std::mem::take(&mut self.insert_batch);
+                self.repeatable = Some(Repeatable::Insert {
+                    text: self.last_inserted_word.clone(),
+                });
+            }
+        }
+        if self.normal_once {
+            self.normal_once = false;
+            self.mode = Mode::Insert;
+        } else {
+            self.mode = Mode::Normal;
+        }
+        self.pending.clear();
+    }
+
+    fn begin_visual(&mut self, kind: VisualKind) {
+        if !self.mode.is_visual() {
+            let cursor = self.cursor();
+            let mut selection = Selection::point(cursor);
+            selection.set_primary_span(Span::point(cursor), Dir::Forward);
+            self.set_selection(selection);
+        }
+        self.mode = Mode::Visual(kind);
+        self.pending.clear();
+    }
+
+    /// `o` / `O`: open a line below or above, keeping indentation, and insert.
+    fn open_line(&mut self, below: bool) -> Vec<Intent> {
+        let plan = self.current_buffer().map(|buffer| {
+            let selection = self.selection();
+            let primary = selection.primary();
+            let region = if self.mode.is_visual() && !primary.is_empty() {
+                Some(self.selection_region())
+            } else {
+                None
+            };
+            let anchor = region
+                .as_ref()
+                .map(|region| region.extent().start)
+                .unwrap_or_else(|| selection.cursor());
+            let line = buffer.line_of(anchor);
+            let indent = buffer.indent_str(line);
+            let at = if below {
+                buffer.line_range_with_ending(line).end
+            } else {
+                buffer.line_start(line)
+            };
+            (at, indent, region, line, below)
+        });
+        let Some((at, indent, region, _line, below)) = plan else {
+            return Vec::new();
+        };
+        let text = if below {
+            format!("\n{indent}")
+        } else {
+            format!("{indent}\n")
+        };
+        let mut changes = Vec::new();
+        if let Some(region) = &region {
+            changes.extend(operators::delete_changes(region));
+        }
+        changes.push(Change::insert(at, text.clone()));
+        self.apply(changes, ChangeGroup::Command);
+        self.mode = Mode::Normal;
+        // The cursor goes on the new line, after its indentation.
+        let landing = at + text.len();
+        self.enter_insert();
+        let landing = if below { landing } else { at + indent.len() };
+        self.set_cursor(
+            self.current_buffer()
+                .map(|buffer| buffer.clamp_byte(landing))
+                .unwrap_or(landing),
+        );
+        vec![Intent::EnsureVisible]
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(buffer) = self.current_buffer() else {
+            return;
+        };
+        if buffer.read_only {
+            return;
+        }
+        let region = if self.mode.is_visual() {
+            let region = self.selection_region();
+            (!region.is_empty()).then_some(region)
+        } else {
+            None
+        };
+        let cursor = self.cursor();
+        let mut changes = Vec::new();
+        if let Some(region) = &region {
+            changes.extend(operators::delete_changes(region));
+        }
+        let at = region
+            .as_ref()
+            .map(|region| region.extent().start)
+            .unwrap_or(cursor);
+        changes.push(Change::insert(at, text));
+        self.apply(changes, ChangeGroup::Insert);
+        self.insert_batch.push_str(text);
+        let landing = at + text.len();
+        if let Some(buffer) = self.current_buffer() {
+            self.set_cursor(buffer.clamp_byte(landing));
+        }
+    }
+
+    fn insert_newline(&mut self) {
+        let indent = self
+            .current_buffer()
+            .map(|buffer| {
+                if self.config.editor.auto_indent {
+                    buffer.indent_str(buffer.line_of(self.cursor()))
+                } else {
+                    String::new()
+                }
+            })
+            .unwrap_or_default();
+        self.insert_text(&format!("\n{indent}"));
+    }
+
+    fn insert_tab(&mut self) {
+        let unit = if self.config.editor.expand_tab {
+            " ".repeat(self.tab_width())
+        } else {
+            "\t".to_string()
+        };
+        self.insert_text(&unit);
+    }
+
+    fn insert_backtab(&mut self) {
+        let removed = self
+            .current_buffer()
+            .map(|buffer| {
+                let cursor = self.cursor();
+                let line_start = buffer.line_start(buffer.line_of(cursor));
+                let text = buffer.slice(Span::new(line_start, cursor));
+                let spaces = text.len() - text.trim_end_matches(' ').len();
+                if spaces > 0 {
+                    spaces.min(self.tab_width())
+                } else if text.ends_with('\t') {
+                    1
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        if removed == 0 {
+            return;
+        }
+        let cursor = self.cursor();
+        self.apply(
+            vec![Change::delete(Span::new(cursor - removed, cursor))],
+            ChangeGroup::Insert,
+        );
+        self.set_cursor(cursor - removed);
+        for _ in 0..removed {
+            self.insert_batch.pop();
+        }
+    }
+
+    fn insert_backspace(&mut self) {
+        if self.mode.is_visual() {
+            let region = self.selection_region();
+            if !region.is_empty() {
+                let start = region.extent().start;
+                self.apply(operators::delete_changes(&region), ChangeGroup::Insert);
+                self.set_cursor(start);
+                self.mode = Mode::Insert;
+            }
+            return;
+        }
+        let span = self
+            .current_buffer()
+            .map(|buffer| {
+                let cursor = self.cursor();
+                let start = if self.config.editor.expand_tab {
+                    // Delete a run of spaces one indent unit at a time.
+                    let line_start = buffer.line_start(buffer.line_of(cursor));
+                    let text = buffer.slice(Span::new(line_start, cursor));
+                    let spaces = text.len() - text.trim_end_matches(' ').len();
+                    if spaces > 0 {
+                        cursor - spaces.min(self.tab_width())
+                    } else {
+                        buffer
+                            .char_before(cursor)
+                            .map(|(offset, _)| offset)
+                            .unwrap_or(cursor)
+                    }
+                } else {
+                    buffer
+                        .char_before(cursor)
+                        .map(|(offset, _)| offset)
+                        .unwrap_or(cursor)
+                };
+                Span::new(start, cursor)
+            })
+            .filter(|span| span.end > span.start);
+        let Some(span) = span else { return };
+        let removed = self
+            .current_buffer()
+            .map(|buffer| buffer.slice(span))
+            .unwrap_or_default();
+        self.apply(vec![Change::delete(span)], ChangeGroup::Insert);
+        self.set_cursor(span.start);
+        for _ in removed.chars() {
+            self.insert_batch.pop();
+        }
+    }
+
+    fn insert_delete(&mut self) {
+        let span = self
+            .current_buffer()
+            .map(|buffer| {
+                let cursor = self.cursor();
+                Span::new(cursor, next_boundary(buffer, cursor))
+            })
+            .filter(|span| span.end > span.start);
+        if let Some(span) = span {
+            self.apply(vec![Change::delete(span)], ChangeGroup::Insert);
+        }
+    }
+
+    fn insert_delete_word(&mut self) {
+        let span = self
+            .current_buffer()
+            .map(|buffer| {
+                let cursor = self.cursor();
+                let target = motions::word_back(buffer, cursor, 1, false);
+                Span::new(target.min(cursor), cursor)
+            })
+            .filter(|span| span.end > span.start);
+        let Some(span) = span else { return };
+        let removed = self
+            .current_buffer()
+            .map(|buffer| buffer.slice(span))
+            .unwrap_or_default();
+        self.apply(vec![Change::delete(span)], ChangeGroup::Insert);
+        self.set_cursor(span.start);
+        for _ in removed.chars() {
+            self.insert_batch.pop();
+        }
+    }
+
+    fn insert_delete_line_start(&mut self) {
+        let span = self
+            .current_buffer()
+            .map(|buffer| {
+                let cursor = self.cursor();
+                Span::new(buffer.line_start(buffer.line_of(cursor)), cursor)
+            })
+            .filter(|span| span.end > span.start);
+        if let Some(span) = span {
+            self.apply(vec![Change::delete(span)], ChangeGroup::Insert);
+            self.set_cursor(span.start);
+        }
+    }
+
+    // ------------------------------------------------------------- paste
+
+    fn put(&mut self, position: PutPosition, count: usize) -> Vec<Intent> {
+        let register = self.pending.register.take().unwrap_or('"');
+        let value = self.registers.get(register);
+        if value.is_empty() {
+            return vec![Intent::Message(
+                StatusLevel::Warn,
+                format!("register \"{register}\" is empty"),
+            )];
+        }
+        let plan = self.current_buffer().map(|buffer| {
+            let selection = self.selection();
+            let replace = self.mode.is_visual() && !selection.primary().is_empty();
+            let region = if replace {
+                Some(self.selection_region())
+            } else {
+                None
+            };
+            let anchor = region
+                .as_ref()
+                .map(|region| region.extent().start)
+                .unwrap_or_else(|| selection.cursor());
+            let at = if region.is_some() {
+                anchor
+            } else if value.linewise {
+                match position {
+                    PutPosition::BeforeCursor | PutPosition::BeforeLine => {
+                        buffer.line_start(buffer.line_of(anchor))
+                    }
+                    PutPosition::AfterCursor | PutPosition::AfterLine => {
+                        buffer.line_range_with_ending(buffer.line_of(anchor)).end
+                    }
+                }
+            } else {
+                match position {
+                    PutPosition::AfterCursor | PutPosition::AfterLine => {
+                        next_boundary(buffer, anchor)
+                    }
+                    PutPosition::BeforeCursor | PutPosition::BeforeLine => anchor,
+                }
+            };
+            (at, region)
+        });
+        let Some((at, region)) = plan else {
+            return Vec::new();
+        };
+
+        let mut payload = value.text.clone();
+        if value.linewise && !payload.ends_with('\n') {
+            payload.push('\n');
+        }
+        let mut insertion = String::new();
+        for _ in 0..count.max(1) {
+            insertion.push_str(&payload);
+        }
+        let mut changes = Vec::new();
+        if let Some(region) = &region {
+            changes.extend(operators::delete_changes(region));
+        }
+        changes.push(Change::insert(at, insertion.clone()));
+        self.apply(changes, ChangeGroup::Command);
+
+        let landing = if value.linewise {
+            match position {
+                PutPosition::BeforeCursor | PutPosition::BeforeLine => at,
+                _ => at + insertion.len().saturating_sub(2),
+            }
+        } else {
+            at + insertion.len().saturating_sub(1)
+        };
+        let landing = self
+            .current_buffer()
+            .map(|buffer| clamp_cursor(buffer, landing))
+            .unwrap_or(0);
+        self.set_cursor(landing);
+        self.mode = Mode::Normal;
+        self.repeatable = Some(Repeatable::Put { register, position });
+        vec![Intent::EnsureVisible]
+    }
+
+    // ------------------------------------------------------------- history
+
+    fn undo(&mut self) -> Vec<Intent> {
+        let Some(id) = self.current_buffer_id() else {
+            return Vec::new();
+        };
+        let selection = self.selection();
+        let _selection = selection;
+        let outcome = self.buffer_mut(id).and_then(|buffer| buffer.undo());
+        match outcome {
+            Some(outcome) => {
+                self.set_selection(clamped_to_buffer(self.current_buffer(), outcome.selection));
+                self.mode = Mode::Normal;
+                vec![
+                    Intent::Message(StatusLevel::Info, self.undo_message("Undo", id)),
+                    Intent::EnsureVisible,
+                    Intent::Parse(id),
+                ]
+            }
+            None => vec![Intent::Message(StatusLevel::Warn, "nothing to undo".into())],
+        }
+    }
+
+    fn redo(&mut self) -> Vec<Intent> {
+        let Some(id) = self.current_buffer_id() else {
+            return Vec::new();
+        };
+        let selection = self.selection();
+        let _selection = selection;
+        let outcome = self.buffer_mut(id).and_then(|buffer| buffer.redo());
+        match outcome {
+            Some(outcome) => {
+                self.set_selection(clamped_to_buffer(self.current_buffer(), outcome.selection));
+                self.mode = Mode::Normal;
+                vec![
+                    Intent::Message(StatusLevel::Info, self.undo_message("Redo", id)),
+                    Intent::EnsureVisible,
+                    Intent::Parse(id),
+                ]
+            }
+            None => vec![Intent::Message(StatusLevel::Warn, "nothing to redo".into())],
+        }
+    }
+
+    /// Replay the last change.
+    fn repeat(&mut self, area: Rect) -> Vec<Intent> {
+        match self.repeatable.clone() {
+            Some(Repeatable::Insert { text }) => {
+                self.enter_insert();
+                self.insert_text(&text);
+                self.exit_insert();
+                vec![Intent::EnsureVisible]
+            }
+            Some(Repeatable::Operator {
+                operator,
+                target,
+                count,
+                char_arg,
+            }) => {
+                let mut intents = self.run_operator(operator, target, count, char_arg, area);
+                if self.mode == Mode::Insert {
+                    self.exit_insert();
+                }
+                intents.push(Intent::Message(StatusLevel::Info, ".".into()));
+                intents
+            }
+            Some(Repeatable::Put { register, position }) => {
+                self.pending.register = Some(register);
+                self.put(position, 1)
+            }
+            None => vec![Intent::Message(
+                StatusLevel::Warn,
+                "nothing to repeat".into(),
+            )],
+        }
+    }
+
+    // ------------------------------------------------------------- files
+
+    /// Write the focused buffer, or ask for a path when it has none.
+    fn save(&mut self, path: Option<&Path>) -> Option<Intent> {
+        let id = self.current_buffer_id()?;
+        if let Some(path) = path {
+            let buffer = self.buffer_mut(id)?;
+            return match buffer.save_as(path) {
+                Ok(outcome) => {
+                    self.layout.on_focus_changed(&self.config.layout);
+                    Some(Intent::Message(StatusLevel::Info, outcome.summary()))
+                }
+                Err(error) => Some(Intent::Message(StatusLevel::Error, error.to_string())),
+            };
+        }
+        if self.buffer(id)?.path().is_none() {
+            return Some(Intent::OpenPrompt(PromptSpec::Path {
+                initial: String::new(),
+            }));
+        }
+        let name = self.buffer(id)?.display_name();
+        match self.buffer_mut(id)?.save() {
+            Ok(Some(outcome)) => Some(Intent::Message(StatusLevel::Info, outcome.summary())),
+            Ok(None) => Some(Intent::Message(
+                StatusLevel::Info,
+                format!("{name} unchanged"),
+            )),
+            Err(error) => Some(Intent::Message(StatusLevel::Error, error.to_string())),
+        }
+    }
+
+    /// Write the focused buffer to an explicit path (`:write <path>`).
+    pub fn write_to(&mut self, path: &Path) -> Intent {
+        match self.save(Some(path)) {
+            Some(intent) => intent,
+            None => Intent::Message(StatusLevel::Error, "no buffer to write".into()),
+        }
+    }
+
+    fn save_all(&mut self) -> Vec<Intent> {
+        let ids: Vec<BufferId> = self.buffers.iter().map(|buffer| buffer.id).collect();
+        let mut saved = 0usize;
+        let mut failures = Vec::new();
+        for id in ids {
+            let worth_saving = self
+                .buffer(id)
+                .is_some_and(|buffer| buffer.path().is_some() && buffer.is_dirty());
+            if !worth_saving {
+                continue;
+            }
+            match self
+                .buffer_mut(id)
+                .and_then(|buffer| buffer.save().transpose())
+            {
+                Some(Ok(_)) => saved += 1,
+                Some(Err(error)) => failures.push(error.to_string()),
+                None => {}
+            }
+        }
+        let message = if failures.is_empty() {
+            format!("saved {saved} buffer(s)")
+        } else {
+            format!("saved {saved}; {}", failures.join("; "))
+        };
+        vec![Intent::Message(
+            if failures.is_empty() {
+                StatusLevel::Info
+            } else {
+                StatusLevel::Error
+            },
+            message,
+        )]
+    }
+
+    fn reload_file(&mut self, force: bool) -> Option<Intent> {
+        let id = self.current_buffer_id()?;
+        let dirty = self.buffer(id).is_some_and(|buffer| buffer.is_dirty());
+        if dirty && !force {
+            return Some(Intent::Message(
+                StatusLevel::Error,
+                "unsaved changes; :edit! discards them".to_string(),
+            ));
+        }
+        let mut selection = self.selection();
+        let result = self.buffer_mut(id)?.reload(&mut selection);
+        self.set_selection(selection);
+        match result {
+            Ok(bytes) => Some(Intent::Message(
+                StatusLevel::Info,
+                format!("reloaded {bytes} bytes"),
+            )),
+            Err(error) => Some(Intent::Message(StatusLevel::Error, error.to_string())),
+        }
+    }
+
+    fn quit(&mut self, force: bool) -> Option<Intent> {
+        if self.layout.panes().len() > 1 {
+            // `:q` closes the window first, like vim.
+            return self.close_pane();
+        }
+        if !force
+            && let Some(buffer) = self.current_buffer_id().and_then(|id| self.buffer(id))
+            && buffer.is_dirty()
+        {
+            return Some(Intent::Message(
+                StatusLevel::Error,
+                format!(
+                    "{} has unsaved changes (use ZQ or :q!)",
+                    buffer.display_name()
+                ),
+            ));
+        }
+        Some(Intent::Quit)
+    }
+
+    fn quit_all(&mut self) -> Option<Intent> {
+        let dirty = self.dirty_buffers();
+        if !dirty.is_empty() {
+            return Some(Intent::Message(
+                StatusLevel::Error,
+                format!("{} buffer(s) have unsaved changes", dirty.len()),
+            ));
+        }
+        Some(Intent::Quit)
+    }
+
+    fn close_pane(&mut self) -> Option<Intent> {
+        let focused = self.layout.focused()?;
+        if self.layout.panes().len() <= 1 {
+            return Some(Intent::Quit);
+        }
+        self.layout.remove(focused);
+        self.layout.on_focus_changed(&self.config.layout);
+        Some(Intent::EnsureVisible)
+    }
+
+    // ------------------------------------------------------------- layout
+
+    fn split(&mut self, axis: Option<Axis>, area: Rect) -> Option<Intent> {
+        let buffer = self.current_buffer_id()?;
+        let area = self.text_area(area);
+        self.layout
+            .split_focused(axis, &self.config.layout, area, |id| Pane::new(id, buffer))?;
+        self.layout.on_focus_changed(&self.config.layout);
+        Some(Intent::EnsureVisible)
+    }
+
+    /// Area available for panes inside the terminal.
+    pub fn text_area(&self, area: Rect) -> Rect {
+        let status = self.config.status.height.min(6).min(area.height);
+        if self.config.status.position.is_top() {
+            Rect {
+                y: area.y + status,
+                height: area.height.saturating_sub(status),
+                ..area
+            }
+        } else {
+            Rect {
+                height: area.height.saturating_sub(status),
+                ..area
+            }
+        }
+    }
+
+    pub fn tab_width(&self) -> usize {
+        self.config.editor.tab_width.max(1) as usize
+    }
+
+    // ------------------------------------------------------------- search
+
+    /// Set the search term and refresh the highlight set.
+    ///
+    /// Case follows `[search] ignore-case`, and an uppercase pattern turns case
+    /// sensitivity back on when `smart-case` is enabled.
+    pub fn set_search(&mut self, pattern: &str) -> Vec<Intent> {
+        if pattern.is_empty() {
+            self.search = None;
+            self.search_matches.clear();
+            return Vec::new();
+        }
+        let case_sensitive = !self.config.search.ignore_case
+            || (self.config.search.smart_case && pattern.chars().any(char::is_uppercase));
+        self.search = Some(SearchQuery {
+            pattern: pattern.to_string(),
+            case_sensitive,
+            backward: false,
+        });
+        self.registers.search = Some(pattern.to_string());
+        self.refresh_search_matches();
+        vec![Intent::Message(
+            StatusLevel::Info,
+            format!("{} match(es) for \"{pattern}\"", self.search_matches.len()),
+        )]
+    }
+
+    pub fn refresh_search_matches(&mut self) {
+        let matches = match &self.search {
+            Some(query) if self.config.search.highlight => self
+                .current_buffer()
+                .map(|buffer| {
+                    motions::search_matches(buffer, query, self.config.search.max_results)
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        self.search_matches = matches;
+    }
+
+    /// Jump to the next match of the current term.
+    pub fn search_next(&mut self, backward: bool, count: usize) -> Vec<Intent> {
+        let Some(query) = self.search.clone() else {
+            return vec![Intent::Message(StatusLevel::Warn, "no search term".into())];
+        };
+        let found = {
+            let Some(buffer) = self.current_buffer() else {
+                return Vec::new();
+            };
+            let cursor = self.cursor();
+            let direction = backward ^ query.backward;
+            motions::search_next(buffer, cursor, &query, direction, count.max(1))
+                .map(|at| (cursor, at))
+        };
+        match found {
+            Some((before, at)) => {
+                if let Some(id) = self.current_buffer_id() {
+                    self.jumplist.push((id, before));
+                }
+                let at = self
+                    .current_buffer()
+                    .map(|buffer| clamp_cursor(buffer, at))
+                    .unwrap_or(0);
+                self.set_cursor(at);
+                vec![Intent::EnsureVisible]
+            }
+            None => vec![Intent::Message(
+                StatusLevel::Warn,
+                format!("pattern not found: {}", query.pattern),
+            )],
+        }
+    }
+
+    /// `*` / `#`: search for the word under the cursor.
+    fn find_word(&mut self, forward: bool) -> Vec<Intent> {
+        let Some(word) = self
+            .current_buffer()
+            .and_then(|buffer| buffer.word_under_cursor(self.cursor()))
+        else {
+            return vec![Intent::Message(
+                StatusLevel::Warn,
+                "no word under cursor".into(),
+            )];
+        };
+        let intents = self.set_search(&word);
+        if self.search_matches.is_empty() {
+            return intents;
+        }
+        let mut intents = intents;
+        intents.extend(self.search_next(!forward, 1));
+        intents
+    }
+
+    /// Move to a search hit in another file or buffer.
+    pub fn goto_hit(&mut self, path: &Path, line: usize) -> Vec<Intent> {
+        let mut intents = Vec::new();
+        let existing = self.buffer_by_path(&expand_home(path));
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let (id, created) = self.open_path(path);
+                if created {
+                    intents.push(Intent::Parse(id));
+                }
+                id
+            }
+        };
+        self.focus_buffer(id);
+        let target = self
+            .buffer(id)
+            .map(|buffer| {
+                let line = line.saturating_sub(1).min(buffer.last_line());
+                buffer.first_non_blank(line)
+            })
+            .unwrap_or(0);
+        self.set_cursor(target);
+        intents.push(Intent::EnsureVisible);
+        intents
+    }
+
+    pub fn goto_line(&mut self, line: usize) -> Vec<Intent> {
+        let target = self
+            .current_buffer()
+            .map(|buffer| {
+                let line = line.saturating_sub(1).min(buffer.last_line());
+                buffer.first_non_blank(line)
+            })
+            .unwrap_or(0);
+        let before = self.cursor();
+        if let Some(id) = self.current_buffer_id() {
+            self.jumplist.push((id, before));
+        }
+        self.set_cursor(target);
+        vec![Intent::EnsureVisible]
+    }
+
+    // ------------------------------------------------------------- viewport
+
+    /// Keep the cursor inside the focused pane, scrolling when needed.
+    pub fn ensure_visible(&mut self, area: Rect) {
+        let height = self.text_height(area);
+        let margin = (self.config.editor.scroll_margin as usize).min(height / 2);
+        let Some(focused) = self.layout.focused() else {
+            return;
+        };
+        let plan = self
+            .current_buffer()
+            .map(|buffer| (buffer.line_of(self.cursor()), 0usize));
+        let Some((line, _)) = plan else { return };
+        let scroll = self
+            .layout
+            .pane(focused)
+            .map(|pane| pane.view.scroll_line)
+            .unwrap_or(0);
+        let mut next = scroll;
+        if line < scroll + margin {
+            next = line.saturating_sub(margin);
+        } else if line + margin + 1 > scroll + height {
+            next = line + margin + 1 - height;
+        }
+        // Keep the viewport inside the buffer for *this* pane's height, so a
+        // pane that shrank (a new split, a smaller terminal) cannot be scrolled
+        // past its last line.
+        let lines = self
+            .current_buffer()
+            .map(|buffer| buffer.display_line_count())
+            .unwrap_or(1);
+        next = next.min(lines.saturating_sub(height));
+        if let Some(pane) = self.layout.pane_mut(focused) {
+            pane.view.scroll_line = next;
+        }
+    }
+
+    fn recenter(&mut self, area: Rect) -> Option<Intent> {
+        let height = self.text_height(area);
+        let line = self.line_at(self.cursor());
+        let scroll = line.saturating_sub(height / 2);
+        if let Some(pane) = self.layout.focused_pane_mut() {
+            pane.view.scroll_line = scroll;
+        }
+        Some(Intent::EnsureVisible)
+    }
+
+    fn scroll_to_edge(&mut self, top: bool, area: Rect) -> Option<Intent> {
+        let height = self.text_height(area);
+        let scroll = self.current_pane()?.view.scroll_line;
+        let line = if top {
+            scroll
+        } else {
+            scroll + height.saturating_sub(1)
+        };
+        let at = self
+            .current_buffer()
+            .map(|buffer| buffer.line_start(line.min(buffer.last_line())))?;
+        self.set_cursor(at);
+        Some(Intent::EnsureVisible)
+    }
+
+    fn scroll_lines(&mut self, direction: Direction) -> Option<Intent> {
+        let count = self.pending.take_count().max(1);
+        let focused = self.layout.focused()?;
+        let max = self.current_buffer()?.last_line() as i32;
+        let scroll = self.layout.pane(focused)?.view.scroll_line as i32;
+        let next = (scroll + direction.sign() * count as i32).clamp(0, max) as usize;
+        if let Some(pane) = self.layout.pane_mut(focused) {
+            pane.view.scroll_line = next;
+        }
+        Some(Intent::EnsureVisible)
+    }
+
+    fn jump(&mut self, back: bool) -> Option<Intent> {
+        let entry = if back {
+            self.jumplist.back()?
+        } else {
+            self.jumplist.forward()?
+        };
+        let (buffer, offset) = entry;
+        if self.current_buffer_id() != Some(buffer) && !self.focus_buffer(buffer) {
+            return None;
+        }
+        let at = self
+            .buffer(buffer)
+            .map(|buffer| buffer.clamp_byte(offset))?;
+        self.set_cursor(at);
+        Some(Intent::EnsureVisible)
+    }
+
+    // ------------------------------------------------------------- marks
+
+    fn set_mark(&mut self, name: char) -> Vec<Intent> {
+        let Some(id) = self.current_buffer_id() else {
+            return Vec::new();
+        };
+        let cursor = self.cursor();
+        if let Some(buffer) = self.buffer_mut(id) {
+            buffer.marks.insert(name, cursor);
+        }
+        vec![Intent::Message(
+            StatusLevel::Info,
+            format!("mark {name} set"),
+        )]
+    }
+
+    fn goto_mark(&mut self, name: char, line: bool) -> Vec<Intent> {
+        let target = {
+            let Some(buffer) = self.current_buffer() else {
+                return Vec::new();
+            };
+            let at = match name {
+                '.' => buffer.last_change_pos,
+                _ => buffer.marks.get(&name).copied(),
+            };
+            at.map(|at| {
+                if line {
+                    buffer.first_non_blank(buffer.line_of(at))
+                } else {
+                    buffer.clamp_byte(at)
+                }
+            })
+        };
+        let Some(target) = target else {
+            return vec![Intent::Message(
+                StatusLevel::Warn,
+                format!("mark {name} is not set"),
+            )];
+        };
+        let before = self.cursor();
+        if let Some(id) = self.current_buffer_id() {
+            self.jumplist.push((id, before));
+        }
+        self.set_cursor(target);
+        vec![Intent::EnsureVisible]
+    }
+
+    // ------------------------------------------------------------- results
+
+    /// Adopt a tree handed back by the parser task.
+    ///
+    /// Returns false when the result is stale, which is normal: it means the
+    /// buffer changed while the parse was running.
+    pub fn adopt_tree(
+        &mut self,
+        id: BufferId,
+        version: u64,
+        slot: crate::syntax::TreeSlot,
+    ) -> bool {
+        let Some(buffer) = self.buffer_mut(id) else {
+            return false;
+        };
+        if buffer.version != version {
+            return false;
+        }
+        match slot.take() {
+            Some(tree) => {
+                let has_errors = tree.root_node().has_error();
+                buffer.syntax.tree = Some(tree);
+                buffer.syntax.tree_version = version;
+                buffer.syntax.status = crate::syntax::ParseStatus::Current;
+                buffer.syntax.has_errors = has_errors;
+                true
+            }
+            None => {
+                buffer.syntax.status = crate::syntax::ParseStatus::Failed;
+                false
+            }
+        }
+    }
+
+    /// Apply formatter output, keeping the cursor at the same line and column.
+    pub fn apply_format(&mut self, id: BufferId, text: &str) -> Result<bool, String> {
+        let current = self
+            .buffer(id)
+            .map(|buffer| buffer.text())
+            .ok_or_else(|| "buffer is gone".to_string())?;
+        if current == text {
+            return Ok(false);
+        }
+        let anchor = self
+            .layout
+            .panes_showing(id)
+            .first()
+            .and_then(|pane| self.layout.pane(*pane))
+            .map(|pane| pane.selection.cursor())
+            .unwrap_or(0);
+        let position = {
+            let buffer = self.buffer(id).expect("checked above");
+            crate::format::position_of(&buffer.rope, anchor)
+        };
+        let changes = {
+            let buffer = self.buffer(id).expect("checked above");
+            crate::format::diff_changes(&buffer.rope, text)
+        };
+        if changes.is_empty() {
+            return Ok(false);
+        }
+        // `Format` groups so undo walks back over a whole format run at once.
+        let panes = self.layout.panes_showing(id);
+        for pane_id in &panes {
+            let selection = self
+                .layout
+                .pane(*pane_id)
+                .map(|pane| pane.selection.clone());
+            let Some(mut selection) = selection else {
+                continue;
+            };
+            let buffer = self.buffer_mut(id).expect("checked above");
+            buffer.apply(changes.clone(), ChangeGroup::Format, &mut selection);
+            if let Some(pane) = self.layout.pane_mut(*pane_id) {
+                pane.selection = selection;
+            }
+        }
+        let restored = {
+            let buffer = self.buffer(id).expect("checked above");
+            crate::format::byte_at_position(&buffer.rope, position)
+        };
+        for pane_id in &panes {
+            if let Some(pane) = self.layout.pane_mut(*pane_id) {
+                pane.selection = Selection::point(restored);
+            }
+        }
+        if let Some(buffer) = self.buffer_mut(id) {
+            buffer.break_undo_group();
+        }
+        Ok(true)
+    }
+
+    /// Replace a span with `text` (the spelling picker).
+    pub fn replace_span(&mut self, span: Span, text: &str) -> Vec<Intent> {
+        let landing = span.start + text.len();
+        self.apply(vec![Change::replace(span, text)], ChangeGroup::Command);
+        self.set_cursor(landing);
+        vec![Intent::EnsureVisible]
+    }
+
+    /// Store diagnostics from a background job, replacing that source's set.
+    pub fn set_diagnostics(
+        &mut self,
+        id: BufferId,
+        source: DiagnosticSource,
+        diagnostics: Vec<Diagnostic>,
+    ) {
+        if let Some(buffer) = self.buffer_mut(id) {
+            buffer
+                .diagnostics
+                .retain(|existing| existing.source != source);
+            buffer.diagnostics.extend(diagnostics);
+        }
+    }
+
+    /// Suggestions for the word under the cursor.
+    fn spell_suggest(&mut self) -> Vec<Intent> {
+        let (word, span, suggestions) = {
+            let Some(buffer) = self.current_buffer() else {
+                return Vec::new();
+            };
+            let cursor = self.cursor();
+            let Some(word) = buffer.word_under_cursor(cursor) else {
+                return vec![Intent::Message(
+                    StatusLevel::Warn,
+                    "no word under cursor".into(),
+                )];
+            };
+            let span = buffer.word_at(cursor);
+            let suggestions = buffer
+                .diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.source == DiagnosticSource::Spell
+                        && diagnostic.range.contains(cursor)
+                })
+                .map(|diagnostic| diagnostic.suggestions.clone())
+                .unwrap_or_default();
+            (word, span, suggestions)
+        };
+        if suggestions.is_empty() {
+            return vec![Intent::Message(
+                StatusLevel::Info,
+                format!("\"{word}\" is not flagged (is [spell] enable on?)"),
+            )];
+        }
+        vec![Intent::OpenPrompt(PromptSpec::Spell {
+            word,
+            span,
+            suggestions,
+        })]
+    }
+
+    // ------------------------------------------------------------- options
+
+    /// Flip a `[section] key` option through the same validation `:set` uses.
+    fn toggle_option(&mut self, option: ToggleOption) -> Vec<Intent> {
+        let key = option.key();
+        let result = match option {
+            ToggleOption::LineNumbers => {
+                let next = match self.config.editor.line_number {
+                    LineNumber::None => "relative",
+                    _ => "none",
+                };
+                self.config.set_value(key, next)
+            }
+            ToggleOption::AutoFormat => {
+                let next = if self.config.format.on_idle.is_disabled() {
+                    "500ms"
+                } else {
+                    "off"
+                };
+                self.config.set_value(key, next)
+            }
+            _ => {
+                let current = self.config.value_of(key).unwrap_or_default();
+                let next = if current == "on" { "false" } else { "true" };
+                self.config.set_value(key, next)
+            }
+        };
+        if let Err(error) = result {
+            return vec![Intent::Message(StatusLevel::Error, error)];
+        }
+        let mut intents = vec![Intent::Message(
+            StatusLevel::Info,
+            format!("{key} = {}", self.config.value_of(key).unwrap_or_default()),
+        )];
+        if option == ToggleOption::SpellCheck {
+            match (self.current_buffer_id(), self.config.spell.enable) {
+                (Some(id), true) => intents.push(Intent::Spell(id)),
+                (Some(id), false) => self.set_diagnostics(id, DiagnosticSource::Spell, Vec::new()),
+                (None, _) => {}
+            }
+        }
+        intents
+    }
+
+    /// Schedule an idle format if `[format] on-idle` is set.
+    pub fn schedule_auto_format(&mut self, id: BufferId) {
+        let delay = self.config.format.on_idle;
+        if delay.is_disabled() {
+            self.format_due = None;
+            return;
+        }
+        let language = match self.buffer(id) {
+            Some(buffer) => buffer.language.id,
+            None => return,
+        };
+        if crate::format::formatter_for(language, &self.config).is_none() {
+            return;
+        }
+        self.format_due =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(delay.as_millis()));
+    }
+
+    /// Background job bookkeeping.
+    pub fn job_started(&mut self, buffer: BufferId, kind: JobKind, job: JobId) {
+        self.pending_jobs.insert((buffer, kind), job);
+    }
+
+    pub fn job_finished(&mut self, buffer: BufferId, kind: JobKind) {
+        self.pending_jobs.remove(&(buffer, kind));
+    }
+
+    /// Report a background task that failed.
+    pub fn report_failure(&mut self, event: AsyncEvent) -> Vec<Intent> {
+        match event {
+            AsyncEvent::Failed { what, error } => {
+                vec![Intent::Message(
+                    StatusLevel::Error,
+                    format!("{what} failed: {error}"),
+                )]
+            }
+            other => vec![Intent::Message(
+                StatusLevel::Warn,
+                format!("unexpected background event: {other:?}"),
+            )],
+        }
+    }
+
+    // ------------------------------------------------------------- status
+
+    pub fn mode_label(&self) -> String {
+        self.mode.label()
+    }
+
+    pub fn pending_echo(&self) -> String {
+        self.pending.echo()
+    }
+
+    pub fn search_pattern(&self) -> Option<&str> {
+        self.search.as_ref().map(|query| query.pattern.as_str())
+    }
+
+    /// The register prefix plus pending keys, for the status echo area.
+    pub fn echo(&self) -> String {
+        let mut echo = self.pending_echo();
+        if echo.is_empty() {
+            if let Some(register) = self.pending.register {
+                echo = format!("\"{register}");
+            }
+        }
+        echo
+    }
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self::new(Config::default())
+    }
+}
+
+/// Geometry of the last rendered frame, remembered for command-time splits.
+#[derive(Default, Debug)]
+struct AreaCell(std::cell::Cell<Rect>);
+
+impl Editor {
+    /// Terminal area of the last frame (`Rect::ZERO` before the first draw).
+    pub fn frame_area(&self) -> Rect {
+        self.last_area.0.get()
+    }
+}
+
+impl Editor {}
+
+fn should_push_jump(motion: Motion, from_line: usize, to_line: usize) -> bool {
+    use Motion::*;
+    match motion {
+        DocumentStart
+        | DocumentEnd
+        | SearchNext
+        | SearchPrev
+        | MatchBracket
+        | ParagraphNext
+        | ParagraphPrev
+        | Column
+        | FindChar(_)
+        | TextObject { .. } => true,
+        PageForward | PageBackward | HalfPageForward | HalfPageBackward | Up | Down => true,
+        WordStart | WordEnd | WordBack | WordEndBack | BigWordStart | BigWordEnd | BigWordBack
+        | BigWordEndBack => from_line.abs_diff(to_line) >= 5,
+        _ => false,
+    }
+}
+
+/// Normal mode cannot sit past the last character of a line.
+fn clamp_cursor(buffer: &Buffer, position: usize) -> usize {
+    let position = buffer.clamp_byte(position);
+    let line_end = buffer.line_end(buffer.line_of(position));
+    position.min(line_end)
+}
+
+fn clamped_to_buffer(buffer: Option<&Buffer>, selection: Selection) -> Selection {
+    let Some(buffer) = buffer else {
+        return selection;
+    };
+    let max = buffer.len_bytes();
+    let mut mapped = Selection::new(
+        selection
+            .spans()
+            .iter()
+            .map(|span| span.clamp(max))
+            .collect(),
+        selection.primary_index(),
+        selection.dir(),
+    );
+    if mapped.spans().is_empty() {
+        mapped.collapse(0);
+    }
+    mapped
+}
+
+fn next_boundary(buffer: &Buffer, byte: usize) -> usize {
+    next_char_boundary(&buffer.rope, byte)
+}
+
+fn chunk_message(verb: &str, text: &str, linewise: bool) -> String {
+    if linewise || text.ends_with('\n') {
+        format!("{verb} {} line(s)", text.lines().count())
+    } else {
+        format!("{verb} {} char(s)", text.chars().count())
+    }
+}
+
+fn format_undo(verb: &str, remaining: usize, redoable: usize) -> String {
+    format!("{verb} ({remaining} left, {redoable} to redo)")
+}
+
+/// The word used when an operator finds nothing to work on.
+fn verb_for(operator: Operator) -> &'static str {
+    match operator {
+        Operator::Delete => "delete",
+        Operator::Change => "change",
+        Operator::Yank => "yank",
+        Operator::Replace => "replace",
+        Operator::Join => "join",
+        Operator::Indent | Operator::Unindent | Operator::Reformat => "indent",
+        Operator::SwapCase | Operator::Upper | Operator::Lower => "re-case",
+        Operator::ToggleComment => "comment",
+    }
+}
+
+pub fn split_mode_label(mode: SplitMode) -> &'static str {
+    match mode {
+        SplitMode::Explicit => "explicit",
+        SplitMode::Auto => "auto",
+        SplitMode::Golden => "golden",
+    }
+}
+
+/// A key press that means "insert this text" in insert mode.
+/// The text a key press types in insert mode, if it types anything.
+///
+/// SHIFT is normal: it is how capitals and `( { !` reach us. Only Ctrl and Alt
+/// mean "this is a command, not text".
+fn insertable(key: KeyEvent) -> Option<String> {
+    keys::typed_char(key).map(|c| c.to_string())
+}
+
+// --------------------------------------------------------------------- facades
+//
+// Small wrappers the app layer uses so it never has to build an `Action` by hand
+// or reach into private editing internals.
+
+impl Editor {
+    /// Run one command as if it had been bound to a key.
+    pub fn run_cmd(&mut self, command: Cmd, area: Rect) -> Vec<Intent> {
+        self.set_last_area(area);
+        self.dispatch(Action::Cmd(command), &[], area)
+    }
+
+    /// `"Undo (3 left, 1 to redo)"`, counting the steps still on the stacks.
+    fn undo_message(&self, verb: &str, id: BufferId) -> String {
+        match self.buffer(id) {
+            Some(buffer) => format_undo(verb, buffer.undo_depth(), buffer.redo_depth()),
+            None => verb.to_string(),
+        }
+    }
+
+    /// Flip an option (`:set number`, a bound toggle key, …).
+    pub fn toggle(&mut self, option: ToggleOption) -> Vec<Intent> {
+        self.toggle_option(option)
+    }
+
+    /// Write the focused buffer to disk.
+    pub fn save_now(&mut self) -> Option<Intent> {
+        self.save(None)
+    }
+
+    /// Re-read the focused buffer from disk (`:edit`).
+    pub fn reload_from_disk(&mut self, force: bool) -> Option<Intent> {
+        self.reload_file(force)
+    }
+
+    /// Insert pasted text as a single undo step.
+    pub fn paste_text(&mut self, text: &str) -> Vec<Intent> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        if self.mode != Mode::Insert {
+            self.enter_insert();
+        }
+        self.insert_text(text);
+        vec![Intent::EnsureVisible]
+    }
+
+    /// Every buffer, for `:buffers` and the picker.
+    pub fn buffer_labels(&self) -> Vec<(BufferId, String, bool)> {
+        self.buffers
+            .iter()
+            .map(|buffer| (buffer.id, buffer.display_name(), buffer.is_dirty()))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An editor with one in-memory buffer shown in a pane.
+    /// A user binding that extends a built-in key must not disable it.
+    fn fixture_with_wd(text: &str) -> Fixture {
+        let mut config = Config::default();
+        config
+            .keymap
+            .entry("normal".to_string())
+            .or_default()
+            .insert("wd".to_string(), "close-pane".to_string());
+        Fixture::with_config(text, config)
+    }
+
+    #[test]
+    fn a_key_that_starts_a_longer_binding_still_runs() {
+        // With `wd = close-pane` bound, `w` is a binding *and* a prefix: the
+        // `x` cannot extend `w`, so `w` runs and `x` is read again.
+        let mut fixture = fixture_with_wd("alpha beta\n");
+        fixture.feed("w");
+        fixture.feed("x");
+        assert_eq!(
+            fixture.editor.current_buffer().unwrap().text(),
+            // `w` lands on the `b` of beta, `x` deletes that `b`.
+            "alpha eta\n",
+            "w then x should move then delete, warning: {:?}",
+            fixture.editor.echo()
+        );
+    }
+
+    #[test]
+    fn a_quiet_key_sequence_runs_what_is_bound() {
+        // `w` alone waits for the longer binding, then vim's `timeoutlen` lets it
+        // through.
+        let mut fixture = fixture_with_wd("alpha beta\n");
+        fixture.feed("w");
+        assert_eq!(
+            fixture.editor.current_buffer().unwrap().text(),
+            "alpha beta\n",
+            "still waiting for a longer binding"
+        );
+        // Backdate the sequence instead of sleeping for the real timeout.
+        fixture.editor.pending.keys_at = Some(
+            std::time::Instant::now()
+                - crate::input::PENDING_TIMEOUT
+                - std::time::Duration::from_millis(5),
+        );
+        let area = fixture.area;
+        fixture.editor.expire_pending(area);
+        assert_eq!(
+            fixture.editor.line_at(fixture.editor.cursor()),
+            0,
+            "the timed-out `w` should have moved the cursor"
+        );
+        assert_eq!(fixture.editor.cursor(), 6, "onto `b` of beta");
+    }
+
+    #[test]
+    fn a_longer_binding_still_wins_and_a_lone_operator_waits() {
+        // `wd` must close the pane rather than run `w` then `d`.
+        let mut fixture = fixture_with_wd("alpha\nbeta\n");
+        fixture.editor.run_cmd(Cmd::SplitHorizontal, fixture.area);
+        assert_eq!(fixture.editor.layout.panes().len(), 2);
+        fixture.feed("wd");
+        assert_eq!(fixture.editor.layout.panes().len(), 1, "wd closed the pane");
+
+        // A pending operator is not a key sequence: `d` waits for its motion
+        // however long the user takes.
+        fixture.feed("d");
+        let area = fixture.area;
+        fixture.editor.pending.keys_at = Some(
+            std::time::Instant::now()
+                - crate::input::PENDING_TIMEOUT
+                - std::time::Duration::from_millis(5),
+        );
+        fixture.editor.expire_pending(area);
+        assert!(
+            fixture.editor.pending.operator.is_some(),
+            "the operator must survive the timeout"
+        );
+        assert_eq!(
+            fixture.editor.current_buffer().unwrap().text(),
+            "alpha\nbeta\n",
+            "nothing deleted yet"
+        );
+    }
+
+    #[test]
+    fn x_deletes_one_multibyte_character() {
+        // A multi-byte character is one character: `x` must not nibble bytes.
+        let mut fixture = Fixture::new("alpha … beta 漢字 gamma\n");
+        fixture.feed("0wx");
+        assert_eq!(
+            fixture.editor.current_buffer().unwrap().text(),
+            "alpha  beta 漢字 gamma\n"
+        );
+        fixture.feed("u");
+        assert_eq!(
+            fixture.editor.current_buffer().unwrap().text(),
+            "alpha … beta 漢字 gamma\n"
+        );
+    }
+
+    struct Fixture {
+        editor: Editor,
+        keymaps: Keymaps,
+        area: Rect,
+    }
+
+    impl Fixture {
+        fn new(text: &str) -> Self {
+            Self::with_config(text, Config::default())
+        }
+
+        fn with_config(text: &str, config: Config) -> Self {
+            let (keymaps, warnings) = Keymaps::build(&config);
+            assert!(warnings.is_empty(), "broken keymap: {warnings:?}");
+            let mut editor = Editor::new(config);
+            let id = editor.alloc_buffer_id();
+            editor.buffers.push(Buffer::new(
+                id,
+                None,
+                text.to_string(),
+                &editor.config.editor,
+            ));
+            editor.show_in_pane(id, None);
+            Self {
+                editor,
+                keymaps,
+                area: Rect::new(0, 0, 80, 24),
+            }
+        }
+
+        /// Feed a key notation such as `gg` or `ciw`.
+        fn feed(&mut self, notation: &str) -> Vec<Intent> {
+            let keys = keys::parse_key_sequence(notation)
+                .unwrap_or_else(|| panic!("\"{notation}\" is not a key sequence"));
+            let mut intents = Vec::new();
+            for key in keys {
+                intents.extend(self.editor.handle_key(key, &self.keymaps, self.area));
+            }
+            intents
+        }
+
+        fn text(&self) -> String {
+            self.editor.current_buffer().expect("a buffer").text()
+        }
+
+        fn cursor(&self) -> usize {
+            self.editor
+                .current_pane()
+                .expect("a pane")
+                .selection
+                .cursor()
+        }
+
+        fn warn(messages: &[Intent]) -> String {
+            messages
+                .iter()
+                .filter_map(|intent| match intent {
+                    Intent::Message(StatusLevel::Warn, text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+    }
+
+    #[test]
+    fn insert_types_capitals_punctuation_and_digits() {
+        let mut fixture = Fixture::new("hello\n");
+        fixture.feed("iZZ!(1)");
+        assert_eq!(fixture.text(), "ZZ!(1)hello\n");
+        assert!(Fixture::warn(&fixture.feed("i")).is_empty());
+    }
+
+    #[test]
+    fn escape_returns_to_normal_mode() {
+        let mut fixture = Fixture::new("one\n");
+        fixture.feed("iabc");
+        assert_eq!(fixture.editor.mode, Mode::Insert);
+        fixture.feed("esc");
+        assert_eq!(fixture.editor.mode, Mode::Normal);
+        // The cursor sits on the last character typed, vim-style.
+        assert_eq!(fixture.cursor(), 2);
+    }
+
+    #[test]
+    fn operators_work_on_motions_and_text_objects() {
+        let mut fixture = Fixture::new("alpha bravo\ncharlie\n");
+        fixture.feed("ggdw");
+        assert_eq!(fixture.text(), "bravo\ncharlie\n");
+
+        let mut fixture = Fixture::new("alpha bravo\n");
+        fixture.feed("gglciwzulu");
+        assert_eq!(fixture.text(), "zulu bravo\n");
+
+        let mut fixture = Fixture::new("alpha\nbravo\ncharlie\n");
+        fixture.feed("gg2dd");
+        assert_eq!(fixture.text(), "charlie\n");
+    }
+
+    #[test]
+    fn counts_apply_to_operators() {
+        let mut fixture = Fixture::new("abcdef\n");
+        fixture.feed("gg3x");
+        assert_eq!(fixture.text(), "def\n");
+    }
+
+    #[test]
+    fn visual_line_deletes_a_range() {
+        let mut fixture = Fixture::new("one\ntwo\nthree\n");
+        fixture.feed("ggVjd");
+        assert_eq!(fixture.text(), "three\n");
+        assert_eq!(fixture.editor.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn undo_and_redo_round_trip_a_change() {
+        let mut fixture = Fixture::new("keep\n");
+        fixture.feed("ideleted\nesc");
+        let edited = fixture.text();
+        assert!(edited.starts_with("deleted"));
+        fixture.feed("u");
+        assert_eq!(fixture.text(), "keep\n");
+        fixture.feed("ctrl-r");
+        assert_eq!(fixture.text(), edited);
+    }
+
+    #[test]
+    fn dollar_stays_on_the_last_character() {
+        let mut fixture = Fixture::new("abc\nde\n");
+        fixture.feed("g");
+        fixture.feed("g");
+        fixture.feed("$");
+        assert_eq!(fixture.cursor(), 2);
+        fixture.feed("j");
+        fixture.feed("$");
+        // `abc\nde`: the `e` of the second line.
+        assert_eq!(fixture.cursor(), 5);
+    }
+
+    #[test]
+    fn unknown_keys_warn_instead_of_panic() {
+        let mut fixture = Fixture::new("x\n");
+        let warnings = Fixture::warn(&fixture.feed("<F9>"));
+        assert!(warnings.contains("no binding"), "got {warnings:?}");
+    }
+
+    #[test]
+    fn the_leader_and_colon_open_prompts() {
+        let mut fixture = Fixture::new("x\n");
+        let intents = fixture.feed("space f");
+        assert!(
+            intents
+                .iter()
+                .any(|intent| matches!(intent, Intent::OpenPrompt(_))),
+            "expected a prompt: {intents:?}"
+        );
+    }
+
+    #[test]
+    fn yank_and_paste_round_trip() {
+        // `yy` is linewise, so `p` drops the copy on the next line.
+        let mut fixture = Fixture::new("copy me\n");
+        fixture.feed("ggyyp");
+        assert_eq!(fixture.text(), "copy me\ncopy me\n");
+
+        // `l` moves over exactly one character, so `yl` yanks one, and `p`
+        // splices it in after the cursor.
+        let mut fixture = Fixture::new("copy me\n");
+        fixture.feed("ggyllp");
+        assert_eq!(fixture.text(), "cocpy me\n");
+    }
+}
