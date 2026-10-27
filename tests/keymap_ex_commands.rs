@@ -18,10 +18,7 @@ fn command_names_are_bindable_actions() {
         parse_action("bnext"),
         Some(Action::Cmd(Cmd::Ex("bnext".into())))
     );
-    assert_eq!(
-        parse_action("bn"),
-        Some(Action::Cmd(Cmd::Ex("bn".into())))
-    );
+    assert_eq!(parse_action("bn"), Some(Action::Cmd(Cmd::Ex("bn".into()))));
     // Action names win on a clash with a command name.
     assert_eq!(parse_action("quit"), Some(Action::Cmd(Cmd::Quit)));
     // Nonsense is still nonsense.

@@ -105,6 +105,10 @@ pub struct Prompt {
     pub limit: usize,
     /// Search-style prompts wrap the typed text in the status line.
     pub smart_case: bool,
+    /// Whether the picker filters candidates by the prompt text.  The grep
+    /// picker turns this off: the prompt text *is* the engine's pattern, and
+    /// hit labels (`path:line`) would never match it, hiding every result.
+    pub filter_items: bool,
 }
 
 impl Prompt {
@@ -124,6 +128,7 @@ impl Prompt {
             completion_suffix: String::new(),
             limit: 200,
             smart_case: true,
+            filter_items: true,
         }
     }
 
@@ -173,6 +178,16 @@ impl Prompt {
         self.refilter();
     }
 
+    /// Drop every candidate.  A new search starts from an empty list: hits that
+    /// streamed in for the previous, usually broader, pattern must not stay on
+    /// screen next to the new ones, or the list stops being the result of the
+    /// pattern that is in the prompt.
+    pub fn clear_items(&mut self) {
+        self.items.clear();
+        self.filtered.clear();
+        self.selected = 0;
+    }
+
     pub fn set_text(&mut self, text: impl Into<String>) {
         let text = text.into();
         self.caret = text.chars().count();
@@ -186,6 +201,12 @@ impl Prompt {
     pub fn refilter(&mut self) {
         if !self.select_mode {
             self.filtered.clear();
+            return;
+        }
+        if !self.filter_items {
+            // Engine-filtered results (grep): show them all, in engine order.
+            self.filtered = (0..self.items.len()).collect();
+            self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
             return;
         }
         let scored = fuzzy::filter_and_sort(
@@ -655,6 +676,44 @@ mod tests {
         let items = vec![Item::new("a"), Item::new("b")];
         let prompt = Prompt::picker("buffers", items);
         assert_eq!(prompt.visible().len(), 2);
+    }
+
+    #[test]
+    fn engine_filtered_picker_shows_hits_whose_labels_do_not_match() {
+        // The grep picker: the text is the search pattern, the hits are
+        // `path:line` labels the pattern will not fuzzy-match.  Everything
+        // streamed in must stay visible, in engine order.
+        let mut prompt = Prompt::picker("grep", Vec::new());
+        prompt.filter_items = false;
+        prompt.set_text("Lookup");
+        prompt.extend_items(vec![
+            Item::new("src/app.rs:12").detail("let lookup = table;"),
+            Item::new("src/prompt.rs:56").detail("fn match_key // Lookup"),
+        ]);
+        assert_eq!(prompt.visible().len(), 2);
+        assert_eq!(prompt.items[prompt.visible()[0]].label, "src/app.rs:12");
+        // Typing more of the pattern must not hide the already-shown hits.
+        prompt.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(prompt.visible().len(), 2);
+    }
+
+    #[test]
+    fn a_new_search_starts_from_an_empty_list() {
+        // The grep picker shows exactly the hits for the pattern in the prompt.
+        // When the pattern changes the old list goes first, otherwise every
+        // broader prefix's hits stay on screen and the list is no longer a
+        // result of the pattern that was typed.
+        let mut prompt = Prompt::picker("grep", Vec::new());
+        prompt.filter_items = false;
+        prompt.set_text("loo");
+        prompt.extend_items(vec![Item::new("src/app.rs:12"), Item::new("src/loop.rs:3")]);
+        prompt.selected = 1;
+        prompt.clear_items();
+        assert!(prompt.visible().is_empty(), "the old hits must go");
+        assert_eq!(prompt.selected, 0);
+        prompt.extend_items(vec![Item::new("src/app.rs:12")]);
+        assert_eq!(prompt.visible().len(), 1);
+        assert_eq!(prompt.selected, 0);
     }
 
     #[test]

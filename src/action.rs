@@ -237,6 +237,17 @@ impl Direction {
         matches!(self, Direction::Left | Direction::Right)
     }
 
+    /// Kebab-case suffix used by the bindable action names
+    /// (`focus-left`, `resize-up`, …).
+    pub fn label(self) -> &'static str {
+        match self {
+            Direction::Left => "left",
+            Direction::Right => "right",
+            Direction::Up => "up",
+            Direction::Down => "down",
+        }
+    }
+
     pub fn sign(self) -> i32 {
         match self {
             Direction::Left | Direction::Up => -1,

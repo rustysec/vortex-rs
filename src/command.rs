@@ -398,13 +398,9 @@ pub fn parse(input: &str) -> Command {
         } else {
             Some(rest.to_string())
         }),
-        Some("grep") => {
-            if rest.is_empty() {
-                Command::FindFiles(None)
-            } else {
-                Command::Grep(rest.to_string())
-            }
-        }
+        // `:grep` with no pattern opens the content prompt (like `space s`),
+        // not the file picker; `:find` is the file-name search.
+        Some("grep") => Command::Grep(rest.to_string()),
         Some("format") => Command::Format,
         Some("config") => match rest.split_whitespace().next() {
             None | Some("path") => Command::Config(ConfigAction::Path),
@@ -922,6 +918,13 @@ mod tests {
             }
         );
         assert_eq!(parse("enew"), Command::NewBuffer);
+        // `:grep` always means contents, with or without a pattern; only
+        // `:find` searches file names.
+        assert_eq!(parse("grep"), Command::Grep(String::new()));
+        assert_eq!(parse("grep todo"), Command::Grep("todo".into()));
+        assert_eq!(parse("gr todo"), Command::Grep("todo".into()));
+        assert_eq!(parse("find"), Command::FindFiles(None));
+        assert_eq!(parse("find rs"), Command::FindFiles(Some("rs".into())));
         assert_eq!(parse("%"), Command::GotoLine(usize::MAX));
         // `:e` reloads; `:e!` reloads and discards; `:e path` opens.
         assert_eq!(parse("e"), Command::Reload { force: false });

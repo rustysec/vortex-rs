@@ -214,7 +214,10 @@ line) at the working directory.
   function and `Point` in `struct Point` is a type.
 * **Searching.** `space f` and `space s` stream results — ripgrep when it is
   available, otherwise a built-in walker that honours `.gitignore`. Results
-  arrive in batches so the picker fills as they come.
+  arrive in batches so the picker fills as they come. `:grep`'s pattern is a
+  ripgrep regex, taken literally while it is still too half-typed to compile
+  (`look(` searches for `look(`), and the list is always the hits for the
+  pattern in the prompt rather than the union of everything typed so far.
 * **Formatting.** External formatters (`rustfmt`, `prettier`, `gofmt`,
   `clang-format`, `taplo`, `ruff` …), triggered by `:format`, `space F`,
   `[format] on-save` or `on-idle`. Only the changed middle of the file is

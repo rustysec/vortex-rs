@@ -248,6 +248,11 @@ fn action_help(action: &Action) -> &'static str {
 /// The registry name of an action, used for help output.
 pub fn action_name(action: &Action) -> String {
     use crate::action::Action as A;
+    // The registry is the single source of truth for bindable names; the
+    // composed fallbacks below only cover actions that are not registered.
+    if let Some(name) = crate::action::name_for(action) {
+        return name.to_string();
+    }
     match action {
         A::Motion(motion) | A::Extend(motion) => motion_name(*motion),
         A::Operator(operator) => operator_name(*operator).to_string(),
@@ -339,7 +344,11 @@ fn cmd_name(command: &Cmd) -> String {
         Cmd::OpenBelow => "open-below",
         Cmd::OpenAbove => "open-above",
         Cmd::Normal => "normal",
-        Cmd::Visual(kind) => return format!("visual-{}", kind.label()),
+        Cmd::Visual(kind) => match kind {
+            crate::action::VisualKind::Char => "visual",
+            crate::action::VisualKind::Line => "visual-line",
+            crate::action::VisualKind::Block => "visual-block",
+        },
         Cmd::Cancel => "cancel",
         Cmd::ExitInsert => "exit-insert",
         Cmd::DeleteCharNext => "delete-char",
@@ -385,17 +394,18 @@ fn cmd_name(command: &Cmd) -> String {
         Cmd::OnlyPane => "only-pane",
         Cmd::ZoomPane => "zoom-pane",
         Cmd::EqualizePanes => "equalize-panes",
-        Cmd::CycleLayout(mode) => return format!("layout-{mode:?}"),
+        Cmd::CycleLayout(mode) => return format!("layout-{}", mode.name()),
         Cmd::FocusNext => "focus-next",
         Cmd::FocusPrev => "focus-prev",
-        Cmd::FocusDir(_) => "focus-dir",
-        Cmd::MoveDir(_) => "move-dir",
-        Cmd::ResizeDir(_) => "resize-dir",
+        // Directional commands must print the exact name that re-binds them.
+        Cmd::FocusDir(direction) => return format!("focus-{}", direction.label()),
+        Cmd::MoveDir(direction) => return format!("buf-move-{}", direction.label()),
+        Cmd::ResizeDir(direction) => return format!("resize-{}", direction.label()),
         Cmd::ClosePane => "close-pane",
         Cmd::Recenter => "recenter",
         Cmd::ScrollToTop => "scroll-to-top",
         Cmd::ScrollToBottom => "scroll-to-bottom",
-        Cmd::ScrollLine(_) => "scroll-line",
+        Cmd::ScrollLine(direction) => return format!("scroll-line-{}", direction.label()),
         Cmd::JumpBack => "jump-back",
         Cmd::JumpForward => "jump-forward",
         Cmd::InsertNewline => "insert-newline",
@@ -493,6 +503,29 @@ mod tests {
     fn the_default_keymap_is_sane() {
         let (_maps, warnings) = crate::input::Keymaps::build(&crate::config::Config::default());
         assert!(warnings.is_empty(), "broken default bindings: {warnings:?}");
+    }
+
+    #[test]
+    fn every_bound_action_name_can_be_rebound() {
+        // `:map` prints `action_name`; a name shown there must be accepted by
+        // `parse_action` and mean the same thing, so directional commands
+        // (`focus-left`, `resize-up`, …) survive the round trip.
+        for (context, table) in crate::input::DEFAULT_BINDINGS {
+            for (keys, name) in *table {
+                let action = crate::action::parse_action(name)
+                    .unwrap_or_else(|| panic!("default binding {context} {keys:?} -> {name:?}"));
+                let rendered = action_name(&action);
+                assert_eq!(
+                    rendered, *name,
+                    "{context} {keys:?} renders as {rendered:?}, which would not rebind"
+                );
+                assert_eq!(
+                    crate::action::parse_action(&rendered),
+                    Some(action),
+                    "{rendered:?} does not parse back"
+                );
+            }
+        }
     }
 
     #[test]

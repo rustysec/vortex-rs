@@ -1078,7 +1078,15 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
     // Candidates.
     let list_top = area.y + 2;
     let list_bottom = area.bottom().saturating_sub(1);
-    for (row, item_index) in picker.visible.iter().enumerate() {
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+    // The window follows the selection.  A grep can return hundreds of hits and
+    // only the first `rows` of them fit on screen, so without scrolling the
+    // rest could be selected but never seen.
+    let first_row = picker
+        .selected
+        .saturating_sub(rows.saturating_sub(1))
+        .min(picker.visible.len().saturating_sub(1));
+    for (row, item_index) in picker.visible[first_row..].iter().enumerate() {
         let y = list_top + row as u16;
         if y >= list_bottom {
             break;
@@ -1086,7 +1094,7 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         let Some(item) = picker.items.get(*item_index) else {
             continue;
         };
-        let selected = row == picker.selected;
+        let selected = first_row + row == picker.selected;
         let base = if selected {
             theme
                 .selection
@@ -1315,6 +1323,42 @@ mod tests {
         assert!(rendered.contains("src/main.rs"), "{rendered}");
         assert!(rendered.contains("src/lib.rs"), "{rendered}");
         assert!(cursor.y < area.height);
+    }
+
+    #[test]
+    fn a_long_result_list_scrolls_to_the_selection() {
+        // `:grep` streams in far more hits than fit on screen; the highlighted
+        // row has to be a row that is actually drawn, otherwise the list looks
+        // frozen once the selection passes the last visible line.
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buffer = Buffer::empty(area);
+        let items: Vec<prompt::Item> = (0..500)
+            .map(|index| prompt::Item::new(format!("src/file{index:03}.rs:{}", index + 1)))
+            .collect();
+        let visible: Vec<usize> = (0..500).collect();
+        let picker = Picker {
+            title: "grep",
+            input: "vortex",
+            caret: 6,
+            suffix: "",
+            visible: &visible,
+            items: &items,
+            selected: 499,
+        };
+        draw_picker(&mut buffer, area, &picker, &Theme::default());
+        let rendered = frame_text(&buffer);
+        assert!(
+            rendered.contains("src/file499.rs:500"),
+            "the selected row is off screen:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("src/file000"),
+            "the head of the list should scroll away:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("500 match"),
+            "the count is wrong:\n{rendered}"
+        );
     }
 
     #[test]

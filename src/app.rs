@@ -578,6 +578,7 @@ impl App {
                 Intent::Grep(query) => {
                     let kind = PromptKind::Grep;
                     self.open_picker(kind.clone(), "grep", &query.pattern, Vec::new());
+                    self.disable_local_filter();
                     self.start_search(SearchKind::Contents, query.pattern);
                 }
                 Intent::Clipboard(text) => {
@@ -650,6 +651,7 @@ impl App {
             }
             PromptSpec::Grep(query) => {
                 self.open_picker(PromptKind::Grep, "grep", &query, Vec::new());
+                self.disable_local_filter();
                 self.start_search(SearchKind::Contents, query);
             }
             PromptSpec::SwitchBuffer => {
@@ -699,6 +701,15 @@ impl App {
         let mut picker = Prompt::picker(title, items);
         picker.set_text(query);
         self.prompt = Some((kind, picker));
+    }
+
+    /// The grep picker's text is the engine's pattern, not a local filter:
+    /// hit labels are `path:line` and would all be fuzzy-filtered away.
+    fn disable_local_filter(&mut self) {
+        if let Some((_, prompt)) = self.prompt.as_mut() {
+            prompt.filter_items = false;
+            prompt.refilter();
+        }
     }
 
     fn cancel_prompt(&mut self) {
@@ -800,8 +811,12 @@ impl App {
                 } else if text.trim().is_empty() {
                     self.set_message(StatusLevel::Warn, "nothing selected");
                 } else {
-                    // Enter with text and no candidate: search the project for it.
-                    self.start_search(SearchKind::Contents, text);
+                    // Enter with text and no candidate: search the project's
+                    // contents for it.  This opens the grep picker rather than
+                    // only starting a job — with the prompt closed here, the
+                    // results of a bare `start_search` would be dropped as
+                    // belonging to no open picker.
+                    self.open_prompt(PromptSpec::Grep(text));
                 }
             }
             PromptKind::SwitchBuffer => {
@@ -1379,12 +1394,11 @@ impl App {
                     })
             })
             .collect();
+        // Every event carries a fresh slice of the current job's hits, and the
+        // list was emptied when the job started, so this is a plain append.
+        // Replacing here would throw away every batch but the last one.
         if let Some((_, prompt)) = self.prompt.as_mut() {
-            if event.done {
-                prompt.set_items(replace_items(prompt, items));
-            } else {
-                prompt.extend_items(items);
-            }
+            prompt.extend_items(items);
         }
         if event.done {
             if event.truncated {
@@ -1450,6 +1464,12 @@ impl App {
     fn start_search(&mut self, kind: SearchKind, query: String) {
         if let Some(handle) = self.search_job.take() {
             handle.cancel();
+        }
+        // The picker shows exactly the hits for the pattern that is in the
+        // prompt, so a new search starts from an empty list instead of
+        // appending to the one it replaces.
+        if let Some((_, prompt)) = self.prompt.as_mut() {
+            prompt.clear_items();
         }
         let config = self.editor.config.search.clone();
         let root = self.search_root.clone();
@@ -1734,13 +1754,6 @@ impl App {
         }
         self.needs_redraw = true;
     }
-}
-
-/// Replace a picker's items while keeping the ones the user has already typed
-/// matching (the list is rebuilt from a fresh search).
-fn replace_items(prompt: &Prompt, items: Vec<prompt::Item>) -> Vec<prompt::Item> {
-    let _ = prompt;
-    items
 }
 
 /// Remember a command-line or search entry, newest last, de-duplicated.
