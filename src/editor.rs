@@ -341,6 +341,13 @@ pub struct Editor {
     pub pending_jobs: HashMap<(BufferId, JobKind), JobId>,
     /// Set when a formatter run is waiting for the idle timer.
     pub format_due: Option<std::time::Instant>,
+    /// A buffer whose idle format is on hold because insert mode is open in it:
+    /// an automatic reformat must never rewrite text under the user's hands.
+    pub format_held: Option<BufferId>,
+    /// Set when the user asked for the formatter by name (`:format`).  That run
+    /// is a change they made, so unlike an automatic one it gets its own undo
+    /// step; the flag is consumed when the formatter result lands.
+    pub format_requested: Option<BufferId>,
     /// Terminal area of the last frame, so commands can ask for geometry.
     last_area: AreaCell,
 }
@@ -366,6 +373,8 @@ impl Editor {
             next_buffer_id: 1,
             pending_jobs: HashMap::new(),
             format_due: None,
+            format_held: None,
+            format_requested: None,
             last_area: AreaCell::default(),
         }
     }
@@ -1638,6 +1647,7 @@ impl Editor {
             Cmd::SpellSuggest => intents.extend(self.spell_suggest()),
             Cmd::FormatBuffer => {
                 if let Some(id) = self.current_buffer_id() {
+                    self.format_requested = Some(id);
                     intents.push(Intent::Format(id));
                 }
             }
@@ -1780,6 +1790,14 @@ impl Editor {
             self.mode = Mode::Normal;
         }
         self.pending.clear();
+        // The idle format held back while typing starts now that hands are off
+        // the keyboard (see `schedule_auto_format`).
+        self.format_held = None;
+        if was_inserting && self.mode != Mode::Insert {
+            if let Some(id) = self.current_buffer_id() {
+                self.schedule_auto_format(id);
+            }
+        }
     }
 
     fn begin_visual(&mut self, kind: VisualKind) {
@@ -1794,52 +1812,76 @@ impl Editor {
     }
 
     /// `o` / `O`: open a line below or above, keeping indentation, and insert.
+    ///
+    /// A visual selection is deleted first, like vim.  The delete is its own
+    /// apply so that the offsets used to place the new line are live ones: an
+    /// insert computed against the pre-delete buffer would land in the wrong
+    /// place once the selection is gone.
     fn open_line(&mut self, below: bool) -> Vec<Intent> {
-        let plan = self.current_buffer().map(|buffer| {
+        let selected = {
             let selection = self.selection();
-            let primary = selection.primary();
-            let region = if self.mode.is_visual() && !primary.is_empty() {
+            if self.mode.is_visual() && !selection.primary().is_empty() {
                 Some(self.selection_region())
             } else {
                 None
+            }
+        };
+        // Where a deleted selection used to be, and how its line was indented.
+        let mut hole = None;
+        if let Some(region) = &selected {
+            let extent = region.extent();
+            let indent = self
+                .current_buffer()
+                .map(|buffer| buffer.indent_str(buffer.line_of(extent.start)))
+                .unwrap_or_default();
+            self.apply(operators::delete_changes(region), ChangeGroup::Command);
+            hole = Some((indent, region.linewise));
+        }
+
+        let plan = self.current_buffer().map(|buffer| {
+            let line = buffer.line_of(self.cursor());
+            // A linewise delete took its line ending with it, so the block's
+            // place is now the start of the cursor line; a characterwise one
+            // leaves the cursor inside the line it came from.
+            let (indent, above) = match &hole {
+                Some((indent, true)) => (indent.clone(), true),
+                _ => (buffer.indent_str(line), !below),
             };
-            let anchor = region
-                .as_ref()
-                .map(|region| region.extent().start)
-                .unwrap_or_else(|| selection.cursor());
-            let line = buffer.line_of(anchor);
-            let indent = buffer.indent_str(line);
-            let at = if below {
-                buffer.line_range_with_ending(line).end
+            let (at, text, caret) = if buffer.len_bytes() == 0 {
+                // Nothing to split: the buffer already is the empty line.
+                (0, String::new(), 0)
+            } else if above {
+                let at = buffer.line_start(line);
+                (at, format!("{indent}\n"), at + indent.len())
+            } else if line + 1 < buffer.line_count() {
+                // Before the *next* line's first byte, with the indentation
+                // first: `"\n{indent}"` after this line's ending would hang the
+                // indentation on the start of the following line and leave the
+                // caret one line too low.
+                let at = buffer.line_range_with_ending(line).end;
+                (at, format!("{indent}\n"), at + indent.len())
             } else {
-                buffer.line_start(line)
+                // The last line and it has no ending of its own: end it first.
+                let at = buffer.line_end(line);
+                (at, format!("\n{indent}"), at + 1 + indent.len())
             };
-            (at, indent, region, line, below)
+            (at, text, caret)
         });
-        let Some((at, indent, region, _line, below)) = plan else {
+        let Some((at, text, caret)) = plan else {
             return Vec::new();
         };
-        let text = if below {
-            format!("\n{indent}")
-        } else {
-            format!("{indent}\n")
-        };
-        let mut changes = Vec::new();
-        if let Some(region) = &region {
-            changes.extend(operators::delete_changes(region));
+        if !text.is_empty() {
+            self.apply(vec![Change::insert(at, text)], ChangeGroup::Command);
         }
-        changes.push(Change::insert(at, text.clone()));
-        self.apply(changes, ChangeGroup::Command);
-        self.mode = Mode::Normal;
-        // The cursor goes on the new line, after its indentation.
-        let landing = at + text.len();
+        // The caret goes on the new line, after its indentation, *before*
+        // `enter_insert`: the insert anchor is what `esc` walks back over, so an
+        // anchor on the old line makes `o<esc>` jump a line.
+        let landing = self
+            .current_buffer()
+            .map(|buffer| buffer.clamp_byte(caret))
+            .unwrap_or(caret);
+        self.set_cursor(landing);
         self.enter_insert();
-        let landing = if below { landing } else { at + indent.len() };
-        self.set_cursor(
-            self.current_buffer()
-                .map(|buffer| buffer.clamp_byte(landing))
-                .unwrap_or(landing),
-        );
         vec![Intent::EnsureVisible]
     }
 
@@ -2689,7 +2731,17 @@ impl Editor {
         if changes.is_empty() {
             return Ok(false);
         }
-        // `Format` groups so undo walks back over a whole format run at once.
+        // `Format` groups so undo walks back over a whole format run at once —
+        // and so an automatic run is not a step of its own (`Buffer::undo`
+        // folds it into the edit it followed).  `:format` is something the user
+        // did, so that one is recorded as a normal change.
+        let asked = self.format_requested == Some(id);
+        self.format_requested = None;
+        let group = if asked {
+            ChangeGroup::Command
+        } else {
+            ChangeGroup::Format
+        };
         let panes = self.layout.panes_showing(id);
         for pane_id in &panes {
             let selection = self
@@ -2700,7 +2752,7 @@ impl Editor {
                 continue;
             };
             let buffer = self.buffer_mut(id).expect("checked above");
-            buffer.apply(changes.clone(), ChangeGroup::Format, &mut selection);
+            buffer.apply(changes.clone(), group, &mut selection);
             if let Some(pane) = self.layout.pane_mut(*pane_id) {
                 pane.selection = selection;
             }
@@ -2826,7 +2878,17 @@ impl Editor {
     }
 
     /// Schedule an idle format if `[format] on-idle` is set.
+    ///
+    /// Held while insert mode is open in the buffer: the formatter rewrites the
+    /// whole buffer and parks the caret back on its old line and column, so a
+    /// run that lands mid-typing deletes the line `o` has just opened.  Leaving
+    /// insert mode arms the same timer instead.
     pub fn schedule_auto_format(&mut self, id: BufferId) {
+        if self.mode == Mode::Insert && self.current_buffer_id() == Some(id) {
+            self.format_due = None;
+            self.format_held = Some(id);
+            return;
+        }
         let delay = self.config.format.on_idle;
         if delay.is_disabled() {
             self.format_due = None;
@@ -3342,6 +3404,173 @@ mod tests {
             intents.contains(&Intent::RunCommand("bnext".to_string())),
             "expected the command to run: {intents:?}"
         );
+    }
+
+    /// Where the caret sits, the way the screen shows it.
+    fn caret_at(fixture: &Fixture) -> (usize, usize) {
+        let buffer = fixture.editor.current_buffer().expect("a buffer");
+        let at = fixture.cursor();
+        let line = buffer.line_of(at);
+        (line, at - buffer.line_start(line))
+    }
+
+    /// A buffer that looks like Rust to the language detection, so the default
+    /// `rustfmt` entry resolves without touching the disk or `$PATH`.
+    fn as_rust(fixture: &mut Fixture) {
+        fixture.editor.buffers[0].set_path(std::path::PathBuf::from("probe.rs"));
+    }
+
+    #[test]
+    fn o_opens_a_line_below_and_types_into_it() {
+        let mut fixture = Fixture::new("fn main() {\n    let a = 1;\n}\n");
+        fixture.feed("jo");
+        assert_eq!(fixture.editor.mode, Mode::Insert);
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\n    let a = 1;\n    \n}\n",
+            "the new line takes the indentation; the closing brace stays put"
+        );
+        assert_eq!(caret_at(&fixture), (2, 4), "the caret is on the new line");
+        // What is typed next belongs to that line, not to the one below it.
+        fixture.feed("x");
+        assert_eq!(fixture.text(), "fn main() {\n    let a = 1;\n    x\n}\n");
+    }
+
+    #[test]
+    fn o_at_the_end_of_the_text_opens_the_last_line() {
+        // No trailing newline: the current line has to be ended first.
+        let mut fixture = Fixture::new("alpha\nbeta");
+        fixture.feed("jo");
+        assert_eq!(fixture.text(), "alpha\nbeta\n");
+        assert_eq!(
+            caret_at(&fixture),
+            (2, 0),
+            "on the opened line, not past it"
+        );
+
+        // A trailing newline already ends the last line.
+        let mut fixture = Fixture::new("one\ntwo\n");
+        fixture.feed("jo");
+        assert_eq!(fixture.text(), "one\ntwo\n\n");
+        assert_eq!(caret_at(&fixture), (2, 0));
+    }
+
+    #[test]
+    fn capital_o_opens_a_line_above() {
+        let mut fixture = Fixture::new("fn main() {\n    let a = 1;\n}\n");
+        fixture.feed("jO");
+        assert_eq!(fixture.text(), "fn main() {\n    \n    let a = 1;\n}\n");
+        assert_eq!(caret_at(&fixture), (1, 4));
+    }
+
+    #[test]
+    fn o_in_visual_mode_swaps_ends_and_never_opens_a_line() {
+        // Visual `o` is vim's swap of the cursor and the far end of the
+        // selection.  The open-a-line form of `o` reaching a selection is what
+        // mangled the text before, so pin the binding down.
+        let mut fixture = Fixture::new("one\ntwo\nthree\n");
+        fixture.feed("jjvk");
+        let before = fixture.cursor();
+        fixture.feed("o");
+        assert_eq!(fixture.editor.mode, Mode::Visual(VisualKind::Char));
+        assert_eq!(fixture.text(), "one\ntwo\nthree\n", "`o` edits nothing");
+        assert_ne!(fixture.cursor(), before, "the caret swapped ends");
+    }
+
+    #[test]
+    fn o_holds_the_idle_format_until_insert_mode_ends() {
+        let mut fixture = Fixture::new("fn main() {\n    let a = 1;\n}\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.feed("jo");
+        assert!(
+            fixture.editor.format_due.is_none(),
+            "`o` must not queue a reformat that lands under the caret"
+        );
+        // What the event loop does when it notices the buffer changed.
+        fixture.editor.schedule_auto_format(id);
+        assert_eq!(
+            fixture.editor.format_held,
+            Some(id),
+            "the format is waiting, not forgotten"
+        );
+        assert!(
+            fixture.editor.format_due.is_none(),
+            "still nothing armed while the caret is typing"
+        );
+        fixture.feed("esc");
+        assert!(
+            fixture.editor.format_due.is_some(),
+            "hands off the keyboard: now it may run"
+        );
+    }
+
+    #[test]
+    fn undo_walks_past_an_idle_format_to_the_last_edit() {
+        let mut fixture = Fixture::new("fn main() {\nlet a=1;\n}\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.feed("jjo");
+        fixture.feed("x");
+        fixture.feed("esc");
+        // What the background formatter does when its run finishes.
+        fixture
+            .editor
+            .apply_format(id, "fn main() {\n    let a = 1;\n    x\n}\n")
+            .expect("the formatter output applies");
+        assert_eq!(fixture.editor.current_buffer().unwrap().undo_depth(), 2);
+
+        fixture.feed("u");
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\nlet a=1;\n}\n\n",
+            "one `u` undoes the typed line, not the formatting"
+        );
+        fixture.feed("u");
+        assert_eq!(fixture.text(), "fn main() {\nlet a=1;\n}\n");
+
+        // Two presses undid two edits, so two put them back — and the format
+        // rides along with the edit it followed rather than being its own step.
+        fixture.feed("ctrl-r");
+        assert_eq!(fixture.text(), "fn main() {\nlet a=1;\n}\n\n");
+        fixture.feed("ctrl-r");
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\n    let a = 1;\n    x\n}\n",
+            "the edit and its format come back together"
+        );
+    }
+
+    #[test]
+    fn an_explicit_format_is_its_own_undo_step() {
+        let mut fixture = Fixture::new("let a=1;\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        // The idle timer: not a step of its own, just part of the edit it followed.
+        fixture
+            .editor
+            .apply_format(id, "let a = 1;\n")
+            .expect("the formatter output applies");
+        assert_eq!(
+            fixture.editor.current_buffer().unwrap().undo_depth(),
+            0,
+            "an automatic run is not a change the user made"
+        );
+
+        // `:format`: asked for by name, so `u` takes the formatting back and
+        // leaves the text alone.
+        fixture.editor.format_requested = Some(id);
+        fixture
+            .editor
+            .apply_format(id, "let a = 1;\n\n")
+            .expect("the formatter output applies");
+        assert_eq!(
+            fixture.editor.current_buffer().unwrap().undo_depth(),
+            1,
+            "a requested run is a step like any other"
+        );
+        fixture.feed("u");
+        assert_eq!(fixture.text(), "let a = 1;\n");
     }
 
     #[test]

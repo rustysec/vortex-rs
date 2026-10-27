@@ -1337,13 +1337,27 @@ impl App {
                     // A missing formatter is common; say it once, briefly.
                     self.set_message(StatusLevel::Warn, format!("{}: {error}", result.formatter));
                 } else if let Some(text) = result.text {
-                    match self.editor.apply_format(result.buffer, &text) {
-                        Ok(true) => self.set_message(
-                            StatusLevel::Info,
-                            format!("formatted with {}", result.formatter),
-                        ),
-                        Ok(false) => {}
-                        Err(error) => self.set_message(StatusLevel::Error, error),
+                    // The formatter read `result.version` of the buffer.  If the
+                    // buffer has moved on it edited while rustfmt ran, and this
+                    // text no longer describes it: drop the result and let the
+                    // idle timer try again.  Insert mode is the same hazard in
+                    // slow motion — a whole-buffer rewrite would yank the caret
+                    // out from under whoever is typing.
+                    let edited = self
+                        .editor
+                        .buffer(result.buffer)
+                        .is_none_or(|buffer| buffer.version != result.version);
+                    if edited || self.editor.mode == Mode::Insert {
+                        self.editor.schedule_auto_format(result.buffer);
+                    } else {
+                        match self.editor.apply_format(result.buffer, &text) {
+                            Ok(true) => self.set_message(
+                                StatusLevel::Info,
+                                format!("formatted with {}", result.formatter),
+                            ),
+                            Ok(false) => {}
+                            Err(error) => self.set_message(StatusLevel::Error, error),
+                        }
                     }
                 }
                 self.needs_redraw = true;

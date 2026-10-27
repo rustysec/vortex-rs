@@ -78,6 +78,9 @@ struct UndoItem {
     changes: Vec<UndoChange>,
     before: Selection,
     after: Selection,
+    /// Redo replays a coalesced step oldest first, so this is set on every item
+    /// of a step except the one that ends it.  See [`Buffer::undo`].
+    redo_more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -114,8 +117,18 @@ impl History {
         !self.redo.is_empty()
     }
 
+    /// Undo steps: user changes, with the formatter runs stacked on top of each
+    /// one walked back by the same press (see [`Buffer::undo`]).
     pub fn undo_depth(&self) -> usize {
-        self.undo.len()
+        self.undo
+            .iter()
+            .filter(|item| item.group != ChangeGroup::Format)
+            .count()
+    }
+
+    /// Redo steps, counting a coalesced batch once.
+    pub fn redo_depth(&self) -> usize {
+        self.redo.iter().filter(|item| !item.redo_more).count()
     }
 
     pub fn clear(&mut self) {
@@ -392,6 +405,7 @@ impl Buffer {
             changes,
             before,
             after,
+            redo_more: false,
         });
         if self.history.undo.len() > self.history.limit {
             let overflow = self.history.undo.len() - self.history.limit;
@@ -407,15 +421,45 @@ impl Buffer {
     }
 
     /// Undo one step; returns the selection to restore.
+    ///
+    /// A formatter run is not something the user did, so it never costs a `u` of
+    /// its own: the `Format` entries on top of the stack are pulled into the edit
+    /// underneath them and walked back in the same press.  That is what "back to
+    /// before I did that" means when the buffer was reformatted after the edit —
+    /// undoing only the edit would leave the text in a state nobody typed.
     pub fn undo(&mut self) -> Option<UndoOutcome> {
-        let item = self.history.undo.pop()?;
-        for change in item.changes.iter().rev() {
-            let range = Span::new(change.at, change.at + change.inserted.len());
-            replace(&mut self.rope, range, &change.removed);
+        // Newest first: the automatic runs sit on top of the change they follow.
+        let mut batch: Vec<UndoItem> = Vec::new();
+        while self
+            .history
+            .undo
+            .last()
+            .is_some_and(|item| item.group == ChangeGroup::Format)
+        {
+            batch.push(self.history.undo.pop()?);
+        }
+        if let Some(item) = self.history.undo.pop() {
+            batch.push(item);
+        }
+        if batch.is_empty() {
+            return None;
+        }
+        // An item's offsets are only valid for the text its own apply produced,
+        // so the newest has to go back first.
+        for item in batch.iter() {
+            for change in item.changes.iter().rev() {
+                let range = Span::new(change.at, change.at + change.inserted.len());
+                replace(&mut self.rope, range, &change.removed);
+            }
         }
         self.version += 1;
-        let restored = item.before.clone();
-        self.history.redo.push(item);
+        let restored = batch.last().expect("a non-empty batch").before.clone();
+        // Redo walks forward, so the oldest item has to end up on top; every
+        // item but the one that ends the step tells redo to keep going.
+        for (index, mut item) in batch.into_iter().enumerate() {
+            item.redo_more = index > 0;
+            self.history.redo.push(item);
+        }
         self.last_group_at = None;
         Some(UndoOutcome {
             selection: restored,
@@ -425,14 +469,26 @@ impl Buffer {
 
     /// Redo one step; returns the selection to restore.
     pub fn redo(&mut self) -> Option<UndoOutcome> {
-        let item = self.history.redo.pop()?;
-        for change in item.changes.iter() {
-            let range = Span::new(change.at, change.at + change.removed.len());
-            replace(&mut self.rope, range, &change.inserted);
+        let first = self.history.redo.pop()?;
+        // Oldest first: the step `undo` coalesced comes back as one step.
+        let mut batch = vec![first];
+        while batch.last().is_some_and(|item| item.redo_more) {
+            match self.history.redo.pop() {
+                Some(next) => batch.push(next),
+                None => break,
+            }
+        }
+        for item in batch.iter() {
+            for change in item.changes.iter() {
+                let range = Span::new(change.at, change.at + change.removed.len());
+                replace(&mut self.rope, range, &change.inserted);
+            }
         }
         self.version += 1;
-        let restored = item.after.clone();
-        self.history.undo.push(item);
+        let restored = batch.last().expect("a non-empty batch").after.clone();
+        for item in batch {
+            self.history.undo.push(item);
+        }
         self.last_group_at = None;
         Some(UndoOutcome {
             selection: restored,
@@ -447,7 +503,7 @@ impl Buffer {
 
     /// Steps left on the redo stack.
     pub fn redo_depth(&self) -> usize {
-        self.history.redo.len()
+        self.history.redo_depth()
     }
 
     pub fn can_undo(&self) -> bool {
@@ -1326,6 +1382,79 @@ mod tests {
         assert_eq!(buffer.undo_depth(), 1, "typing is one undo step");
         buffer.undo();
         assert_eq!(buffer.text(), "");
+    }
+
+    /// The idle formatter rewriting the whole buffer, the way
+    /// `Editor::apply_format` does: a `Format` group, then the group is broken
+    /// so the next keystroke starts a fresh step.
+    fn auto_format(buffer: &mut Buffer, text: &str) {
+        let all = Span::new(0, buffer.len_bytes());
+        let mut selection = Selection::point(0);
+        buffer.apply(
+            vec![Change::replace(all, text)],
+            ChangeGroup::Format,
+            &mut selection,
+        );
+        buffer.break_undo_group();
+    }
+
+    #[test]
+    fn a_formatter_run_is_not_an_undo_step_of_its_own() {
+        let mut buffer = buffer_with("let a=1;\n");
+        insert(&mut buffer, 0, "let b=2;\n", ChangeGroup::Command);
+        assert_eq!(buffer.text(), "let b=2;\nlet a=1;\n");
+        auto_format(&mut buffer, "let b = 2;\nlet a = 1;\n");
+        assert_eq!(
+            buffer.undo_depth(),
+            1,
+            "the format rides along with the edit it followed"
+        );
+
+        // One press goes back over the formatting to before the edit: the user
+        // never has to undo a change they did not make.
+        buffer.undo().expect("undo");
+        assert_eq!(buffer.text(), "let a=1;\n");
+        assert!(buffer.undo().is_none(), "there was one change to undo");
+
+        buffer.redo().expect("redo");
+        assert_eq!(
+            buffer.text(),
+            "let b = 2;\nlet a = 1;\n",
+            "redo brings the edit and its formatting back as one step"
+        );
+        assert_eq!(buffer.redo_depth(), 0);
+    }
+
+    #[test]
+    fn undo_walks_edits_not_formats() {
+        let mut buffer = buffer_with("a\n");
+        insert(&mut buffer, 0, "b\n", ChangeGroup::Command);
+        auto_format(&mut buffer, "b\na\n");
+        insert(&mut buffer, 0, "c\n", ChangeGroup::Command);
+        auto_format(&mut buffer, "c\nb\na\n");
+        assert_eq!(buffer.undo_depth(), 2, "two edits, two presses");
+
+        buffer.undo().expect("undo c");
+        assert_eq!(buffer.text(), "b\na\n");
+        buffer.undo().expect("undo b");
+        assert_eq!(buffer.text(), "a\n");
+        assert!(buffer.undo().is_none());
+
+        buffer.redo().expect("redo b");
+        assert_eq!(buffer.text(), "b\na\n");
+        buffer.redo().expect("redo c");
+        assert_eq!(buffer.text(), "c\nb\na\n");
+        assert!(buffer.redo().is_none());
+    }
+
+    #[test]
+    fn a_format_on_its_own_is_still_reversible() {
+        // Nothing of the user's to walk back to: the format is the only thing
+        // there is, and `u` still has to do something rather than sit there.
+        let mut buffer = buffer_with("x  =  1;\n");
+        auto_format(&mut buffer, "x = 1;\n");
+        buffer.undo().expect("undo");
+        assert_eq!(buffer.text(), "x  =  1;\n");
     }
 
     #[test]

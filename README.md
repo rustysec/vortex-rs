@@ -166,7 +166,7 @@ smart-case = true
 
 [format]
 on-save = true                # format before writing
-on-idle = "500ms"             # format after typing pauses; "off" disables
+on-idle = "500ms"             # format once typing pauses (never mid-insert); "off" disables
 # [format.command]
 # rust = "rustfmt --edition 2024 --emit stdout"
 
@@ -221,7 +221,12 @@ line) at the working directory.
 * **Formatting.** External formatters (`rustfmt`, `prettier`, `gofmt`,
   `clang-format`, `taplo`, `ruff` …), triggered by `:format`, `space F`,
   `[format] on-save` or `on-idle`. Only the changed middle of the file is
-  rewritten, so undo stays granular and the cursor keeps its place.
+  rewritten, so undo stays granular and the cursor keeps its place. An automatic
+  run never lands while insert mode is open — the timer starts when you leave it
+  — and a result describing text you have edited since it started is dropped
+  instead of applied. Automatic formatting is not an undo step of its own either:
+  `u` walks back your edits and takes the formatting that followed each one with
+  it. `:format` is an edit you asked for, so it undoes on its own.
 * **Spelling.** A self-contained English checker for comments and strings,
   with suggestions (`z=`, `space E`). Identifiers, `camelCase`, paths and
   numbers are skipped, so it stays quiet on code.

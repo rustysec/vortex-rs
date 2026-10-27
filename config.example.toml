@@ -82,6 +82,8 @@ highlight = true              # highlight search matches in the text
 # ---------------------------------------------------------------------------
 [format]
 on-idle = "500ms"             # format after this much typing silence ("off" disables)
+                              # held until insert mode ends: it never reformats under the caret,
+                              # and `u` walks back your edits, not the formatter's
 on-save = true                # format before writing
 
 # Formatter commands per language.  The buffer is piped to stdin and the formatted
