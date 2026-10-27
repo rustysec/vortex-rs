@@ -751,7 +751,12 @@ mod tests {
         prompt.filter_items = false;
         prompt.set_text("lookup");
         prompt.extend_items(vec![Item::new("a.rs:1"), Item::new("b.rs:2")]);
-        for key_code in [KeyCode::Down, KeyCode::Up, KeyCode::PageDown, KeyCode::PageUp] {
+        for key_code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+        ] {
             prompt.handle_key(key(key_code));
             assert_eq!(prompt.text, "lookup", "{key_code:?} changed the text");
         }
