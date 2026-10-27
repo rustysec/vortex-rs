@@ -82,6 +82,10 @@ pub enum PromptAction {
     Cancel,
 }
 
+/// Rows moved by `pageup`/`pagedown` in a picker.  The prompt does not know
+/// the overlay's height, so this is a fixed, terminal-sized guess.
+const PICKER_PAGE: isize = 10;
+
 /// An editable line with an optional filtered candidate list.
 pub struct Prompt {
     pub label: String,
@@ -251,6 +255,21 @@ impl Prompt {
         let len = self.filtered.len() as isize;
         let next = (self.selected as isize + delta).rem_euclid(len);
         self.selected = next as usize;
+    }
+
+    /// Move the selection by a page.  Unlike [`Self::select`] this clamps at
+    /// the ends rather than wrapping: paging to the bottom should land there,
+    /// not cycle back to the top.
+    fn select_page(&mut self, delta: isize) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let last = self.filtered.len() - 1;
+        self.selected = if delta >= 0 {
+            self.selected.saturating_add(delta as usize).min(last)
+        } else {
+            self.selected.saturating_sub(delta.unsigned_abs())
+        };
     }
 
     // ------------------------------------------------------------ editing
@@ -463,6 +482,13 @@ impl Prompt {
                 } else {
                     self.recall_history(-1);
                 }
+            }
+            KeyCode::PageUp | KeyCode::PageDown if self.select_mode => {
+                self.select_page(if key.code == KeyCode::PageDown {
+                    PICKER_PAGE
+                } else {
+                    -PICKER_PAGE
+                });
             }
             KeyCode::Char('g') if control => return PromptAction::Cancel,
             KeyCode::Char('l') if control => {
@@ -714,6 +740,62 @@ mod tests {
         prompt.extend_items(vec![Item::new("src/app.rs:12")]);
         assert_eq!(prompt.visible().len(), 1);
         assert_eq!(prompt.selected, 0);
+    }
+
+    #[test]
+    fn navigation_never_touches_the_text() {
+        // The app re-runs the grep whenever the prompt text changes, so
+        // scrolling keys must leave the text (and thus the running search)
+        // alone, or every Down press wipes the list being scrolled.
+        let mut prompt = Prompt::picker("grep", Vec::new());
+        prompt.filter_items = false;
+        prompt.set_text("lookup");
+        prompt.extend_items(vec![Item::new("a.rs:1"), Item::new("b.rs:2")]);
+        for key_code in [KeyCode::Down, KeyCode::Up, KeyCode::PageDown, KeyCode::PageUp] {
+            prompt.handle_key(key(key_code));
+            assert_eq!(prompt.text, "lookup", "{key_code:?} changed the text");
+        }
+    }
+
+    #[test]
+    fn enter_submits_the_highlighted_item_after_navigation() {
+        let mut prompt = Prompt::picker("grep", Vec::new());
+        prompt.filter_items = false;
+        prompt.extend_items(vec![
+            Item::new("a.rs:1"),
+            Item::new("b.rs:2"),
+            Item::new("c.rs:3"),
+        ]);
+        prompt.handle_key(key(KeyCode::Down));
+        prompt.handle_key(key(KeyCode::Down));
+        prompt.handle_key(key(KeyCode::Up));
+        assert_eq!(prompt.selected, 1);
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Enter)),
+            PromptAction::SubmitItem(1),
+            "Enter must submit the highlighted hit, not the raw text"
+        );
+    }
+
+    #[test]
+    fn paging_moves_by_a_page_and_clamps_at_the_ends() {
+        let mut prompt = Prompt::picker("grep", Vec::new());
+        prompt.filter_items = false;
+        let items: Vec<Item> = (0..50).map(|i| Item::new(format!("f{i}.rs:1"))).collect();
+        prompt.extend_items(items);
+        prompt.handle_key(key(KeyCode::PageDown));
+        prompt.handle_key(key(KeyCode::PageDown));
+        assert_eq!(prompt.selected, 20);
+        prompt.handle_key(key(KeyCode::PageUp));
+        assert_eq!(prompt.selected, 10);
+        for _ in 0..10 {
+            prompt.handle_key(key(KeyCode::PageDown));
+        }
+        assert_eq!(prompt.selected, 49, "paging clamps at the last hit");
+        for _ in 0..10 {
+            prompt.handle_key(key(KeyCode::PageUp));
+        }
+        assert_eq!(prompt.selected, 0, "paging clamps at the first hit");
     }
 
     #[test]

@@ -378,14 +378,28 @@ impl App {
                 .as_ref()
                 .map(|(kind, _)| kind.clone())
                 .expect("prompt present");
+            let before = self
+                .prompt
+                .as_ref()
+                .map(|(_, prompt)| prompt.text.clone())
+                .expect("prompt present");
             let outcome = {
                 let (_, prompt) = self.prompt.as_mut().expect("prompt present");
                 prompt.handle_key(key)
             };
+            // Live reactions (re-search, highlight) belong to text edits only.
+            // Navigation keys also return `Continue`, and re-running the grep
+            // on every Down press would clear the list and the selection the
+            // user is trying to move through.
+            let edited = self
+                .prompt
+                .as_ref()
+                .is_some_and(|(_, prompt)| prompt.text != before);
             match outcome {
-                PromptAction::Continue => {
+                PromptAction::Continue if edited => {
                     self.on_prompt_edited(kind);
                 }
+                PromptAction::Continue => {}
                 PromptAction::Submit => self.submit_prompt(None),
                 PromptAction::SubmitItem(index) => self.submit_prompt(Some(index)),
                 PromptAction::Cancel => {
