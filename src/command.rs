@@ -441,10 +441,26 @@ pub fn parse(input: &str) -> Command {
         }
         Some("help") => Command::Editor(Cmd::CommandPalette),
         Some(_) => Command::Noop, // unreachable: command_for returns a known name
-        None => Command::Message(
-            StatusLevel::Error,
-            format!("not an editor command: :{head}  (:help lists them)"),
-        ),
+        None => match action_command(head) {
+            // Every bindable action is also a `:` command, so the two lists
+            // can never drift: if `:help keys` names it, `:name` runs it.
+            Some(cmd) => Command::Editor(cmd),
+            None => Command::Message(
+                StatusLevel::Error,
+                format!("not an editor command: :{head}  (:help lists them)"),
+            ),
+        },
+    }
+}
+
+/// Resolve an action name (`close-pane`, `recenter`, …) to its command.
+///
+/// Only self-contained commands qualify; motions need the key-handling state
+/// machine and make no sense as a one-shot command line.
+fn action_command(name: &str) -> Option<Cmd> {
+    match crate::action::parse_action(name) {
+        Some(crate::action::Action::Cmd(cmd)) => Some(cmd),
+        _ => None,
     }
 }
 
@@ -467,6 +483,12 @@ fn command_for(name: &str) -> Option<&'static str> {
         return None;
     }
     Some(first.name)
+}
+
+/// True when `name` resolves to a `:` command (exact, abbreviation or
+/// unambiguous prefix), so keymaps can bind `"bnext"` as well as `":bnext"`.
+pub fn is_command(name: &str) -> bool {
+    !name.is_empty() && command_for(name).is_some()
 }
 
 fn toggle_for(name: &str) -> Option<ToggleOption> {
@@ -960,6 +982,20 @@ mod tests {
             }
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bindable_actions_are_commands_too() {
+        // Anything the keymap can bind (`:help keys`) also runs from `:`.
+        assert_eq!(parse("close-pane"), Command::Editor(Cmd::ClosePane));
+        assert_eq!(parse("recenter"), Command::Editor(Cmd::Recenter));
+        assert_eq!(parse("equalize-panes"), Command::Editor(Cmd::EqualizePanes));
+        assert_eq!(parse("zoom-pane"), Command::Editor(Cmd::ZoomPane));
+        // Motions need the key state machine, so they stay out of `:`.
+        assert!(matches!(
+            parse("word-forward"),
+            Command::Message(StatusLevel::Error, _)
+        ));
     }
 
     #[test]

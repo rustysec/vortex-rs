@@ -202,7 +202,7 @@ pub enum Cmd {
     SpellSuggest,
     ShowDiagnostics,
     FormatBuffer,
-    /// Run an ex command, used by keybindings such as `":" = "command-mode"`.
+    /// Run an ex command, used by keybindings such as `"bn" = "bnext"`.
     Ex(String),
     Noop,
 }
@@ -1020,7 +1020,8 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
 
 /// Parse an action by its kebab-case name (`"word-forward"`, `"save"`, …).
 ///
-/// Accepts `":w"`-style strings as well, which run an ex command.
+/// Also accepts `":w"`-style strings and bare `:` command names (`"bnext"`,
+/// `"bn"`), which run the command as an ex action.
 pub fn parse_action(name: &str) -> Option<Action> {
     let name = name.trim();
     if name.is_empty() {
@@ -1043,10 +1044,15 @@ pub fn parse_action(name: &str) -> Option<Action> {
         _ => None,
     };
     let lookup = alias.unwrap_or(name);
-    ACTIONS
-        .iter()
-        .find(|(n, _, _)| *n == lookup)
-        .map(|(_, a, _)| a.clone())
+    if let Some((_, action, _)) = ACTIONS.iter().find(|(n, _, _)| *n == lookup) {
+        return Some(action.clone());
+    }
+    // `:` command names double as action names, so a keymap can bind `"bnext"`
+    // exactly as it binds `":bnext"`.  Action names win on a clash (`quit`).
+    if crate::command::is_command(lookup) {
+        return Some(Action::Cmd(Cmd::Ex(lookup.to_string())));
+    }
+    None
 }
 
 /// All action names, for completion and documentation.

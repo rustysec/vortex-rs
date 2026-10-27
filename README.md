@@ -154,8 +154,9 @@ show-diagnostics = true
 
 [layout]
 split-mode = "auto"          # "auto" | "explicit" | "golden"
-                             # auto: side by side while the pane has more
-                             # columns than rows, stacked otherwise
+                             # auto: side by side while the pane is physically
+                             # wider than tall (cells are ~2:1 tall, so roughly
+                             # 2x rows in columns), stacked otherwise
 min-width = 24
 
 [search]

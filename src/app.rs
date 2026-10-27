@@ -563,6 +563,10 @@ impl App {
             match intent {
                 Intent::Message(level, text) => self.set_message(level, text),
                 Intent::OpenPrompt(spec) => self.open_prompt(spec),
+                Intent::RunCommand(line) => {
+                    let parsed = command::parse(line.trim_start_matches(':'));
+                    self.run_command(parsed);
+                }
                 Intent::Parse(id) => self.spawn_parse(id),
                 Intent::Format(id) => self.spawn_format(id),
                 Intent::Spell(id) => self.spawn_spell(id),

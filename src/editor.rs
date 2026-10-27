@@ -34,6 +34,8 @@ pub enum Intent {
     Message(StatusLevel, String),
     /// Open a prompt (command line, search, picker).
     OpenPrompt(PromptSpec),
+    /// Run an ex command line straight away (a keybound `":bnext"`-style action).
+    RunCommand(String),
     /// (Re)parse `buffer` with tree-sitter.
     Parse(BufferId),
     /// Run the formatter for `buffer`.
@@ -1686,7 +1688,15 @@ impl Editor {
                     .resize_focused(direction, &self.config.layout, self.text_area(area));
             }
             Cmd::ToggleOption(option) => intents.extend(self.toggle_option(option)),
-            Cmd::Ex(text) => intents.push(Intent::OpenPrompt(PromptSpec::Command(text))),
+            Cmd::Ex(text) => {
+                // A bound ex command runs immediately; an empty one just opens
+                // the command line, like pressing `:`.
+                if text.trim().is_empty() {
+                    intents.push(Intent::OpenPrompt(PromptSpec::Command(String::new())));
+                } else {
+                    intents.push(Intent::RunCommand(text));
+                }
+            }
         }
         intents
     }
@@ -3313,6 +3323,24 @@ mod tests {
                 .iter()
                 .any(|intent| matches!(intent, Intent::OpenPrompt(_))),
             "expected a prompt: {intents:?}"
+        );
+    }
+
+    #[test]
+    fn a_bound_ex_command_runs_instead_of_opening_the_prompt() {
+        // `"gb" = "bnext"` must switch buffers on the key press, not leave a
+        // pre-filled command line waiting for Enter.
+        let mut config = Config::default();
+        config
+            .keymap
+            .entry("normal".to_string())
+            .or_default()
+            .insert("g b".to_string(), "bnext".to_string());
+        let mut fixture = Fixture::with_config("x\n", config);
+        let intents = fixture.feed("g b");
+        assert!(
+            intents.contains(&Intent::RunCommand("bnext".to_string())),
+            "expected the command to run: {intents:?}"
         );
     }
 

@@ -47,8 +47,11 @@ message-timeout = "6s"        # how long status messages stay up
 [layout]
 split-mode = "auto"           # "explicit" | "auto" | "golden"
                               #   explicit: `split` stacks, `vsplit` places side by side
-                              #   auto:     side by side while the focused pane has
-                              #             more columns than rows, stacked otherwise
+                              #   auto:     side by side while the focused pane is
+                              #             physically wider than tall — cells are
+                              #             about twice as tall as wide, so that means
+                              #             roughly twice as many columns as rows;
+                              #             stacked otherwise
                               #             (the other axis is used if there is no room)
                               #   golden:   focused pane gets golden-ratio of its parent
 border = "rounded"            # "rounded" | "plain" | "square" | "none"
@@ -178,13 +181,16 @@ prompt = ""
 # keymap
 #
 # Keys are written in kebab-case: "ctrl-s", "shift-tab", "g g" (a sequence),
-# "<", ">".  Values are action names (`:help keys` lists them all); "none"
-# unbinds a default.  These examples are all no-ops unless you uncomment them.
+# "<", ">".  Values are action names (`:help keys` lists them all) or `:`
+# command names, with or without the colon ("save", "bnext" and ":bnext" all
+# work); "none" unbinds a default.  These examples are all no-ops unless you
+# uncomment them.
 # ---------------------------------------------------------------------------
 [keymap.normal]
 # ";" = "find-char-back"          # override a default binding
 # "ctrl-s" = "save"
 # "<space>" = "command-palette"
+# "gb" = "bnext"                  # any `:` command works as an action too
 
 [keymap.insert]
 # "esc" = "exit-insert"

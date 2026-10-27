@@ -37,10 +37,19 @@ impl Axis {
         }
     }
 
-    /// Pick the axis with more room: more columns than rows splits side by side
-    /// (`:vsplit`), a tall or square area stacks (`:split`).
+    /// Typical terminal cell aspect ratio (width ÷ height).  For the common
+    /// monospace fonts a cell is about twice as tall as it is wide, so one
+    /// column buys roughly half the physical space of one row.
+    const CELL_ASPECT: f32 = 0.5;
+
+    /// Pick the axis with more *physical* room.
+    ///
+    /// Cell counts alone lie: characters are taller than wide, so a 100×60
+    /// pane looks wide but is nearly square on screen.  Comparing physical
+    /// extents (`width × CELL_ASPECT` against `height`) means side-by-side
+    /// (`:vsplit`) needs roughly twice as many columns as rows.
     pub fn auto(area: Rect) -> Self {
-        if area.width > area.height {
+        if area.width as f32 * Self::CELL_ASPECT > area.height as f32 {
             Axis::Column
         } else {
             Axis::Row
@@ -295,9 +304,14 @@ impl Node {
                     *self = promote(first);
                     return Some(pane_id(self));
                 }
-                match first.remove(id) {
-                    Some(survivor) => Some(survivor),
-                    None => second.remove(id),
+                // Recurse into the branch that actually holds `id`.  Asking
+                // `first` first and trusting its answer is wrong: a leaf in
+                // `first` that is not `id` returns "survivor" without ever
+                // looking at `second`, so nested panes were never removed.
+                if first.contains(id) {
+                    first.remove(id)
+                } else {
+                    second.remove(id)
                 }
             }
         }
@@ -729,11 +743,12 @@ impl Layout {
         let index = panes.iter().position(|p| *p == id)?;
         let neighbour = if panes.len() <= 1 {
             None
+        } else if index > 0 {
+            panes.get(index - 1).copied()
         } else {
-            panes
-                .get(index.saturating_sub(1))
-                .copied()
-                .or_else(|| panes.get(index + 1).copied())
+            // The first pane has no predecessor; fall to the next one rather
+            // than to the removed pane itself.
+            panes.get(1).copied()
         };
         let root = self.root.as_mut()?;
         root.remove(id);
@@ -946,6 +961,49 @@ mod tests {
         assert_eq!(root.pane_count(), 1);
         assert!(matches!(root, Node::Leaf(_)));
         assert_eq!(root.remove(PaneId(1)), None);
+    }
+
+    #[test]
+    fn remove_reaches_nested_panes() {
+        // Splitting the focused pane nests: Split(1, Split(2, 3)).  Closing a
+        // pane inside the second branch used to stop at the first leaf and
+        // remove nothing.
+        let mut root = Node::leaf(pane(1, 1));
+        assert!(root.split_leaf(PaneId(1), Axis::Row, 0.5, pane(2, 1)));
+        assert!(root.split_leaf(PaneId(2), Axis::Column, 0.5, pane(3, 1)));
+        assert_eq!(root.pane_count(), 3);
+        assert!(root.remove(PaneId(3)).is_some());
+        assert_eq!(root.pane_count(), 2);
+        assert!(root.contains(PaneId(1)));
+        assert!(root.contains(PaneId(2)));
+        assert!(!root.contains(PaneId(3)));
+        // And the middle pane of a three-pane tree, from the other side.
+        assert!(root.remove(PaneId(2)).is_some());
+        assert_eq!(root.pane_count(), 1);
+    }
+
+    #[test]
+    fn layout_remove_focuses_a_surviving_neighbour() {
+        // Closing the *first* pane used to pick the removed pane as the
+        // neighbour (saturating at index 0) before falling back arbitrarily.
+        let mut root = Node::leaf(pane(1, 1));
+        assert!(root.split_leaf(PaneId(1), Axis::Row, 0.5, pane(2, 1)));
+        assert!(root.split_leaf(PaneId(2), Axis::Row, 0.5, pane(3, 1)));
+        let mut layout = Layout::new(root, PaneId(1));
+        assert_eq!(layout.remove(PaneId(1)), Some(PaneId(2)));
+        assert_eq!(layout.focused(), Some(PaneId(2)));
+        assert_eq!(layout.panes(), vec![PaneId(2), PaneId(3)]);
+    }
+
+    #[test]
+    fn auto_split_accounts_for_cell_aspect() {
+        // Cells are about twice as tall as wide, so raw counts overstate the
+        // horizontal room: 100x60 looks wide but is physically taller than
+        // wide and must stack; only ~2x columns vs rows goes side by side.
+        assert_eq!(Axis::auto(Rect::new(0, 0, 100, 60)), Axis::Row);
+        assert_eq!(Axis::auto(Rect::new(0, 0, 100, 40)), Axis::Column);
+        assert_eq!(Axis::auto(Rect::new(0, 0, 40, 40)), Axis::Row);
+        assert_eq!(Axis::auto(Rect::new(0, 0, 160, 50)), Axis::Column);
     }
 
     #[test]
