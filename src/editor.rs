@@ -2742,20 +2742,21 @@ impl Editor {
         } else {
             ChangeGroup::Format
         };
+        // One buffer edit, not one per pane: applying per pane would rewrite
+        // the text again for every pane showing the buffer, duplicating the
+        // replacement's tail.  Every pane's caret is parked on the restored
+        // position below anyway.
         let panes = self.layout.panes_showing(id);
-        for pane_id in &panes {
-            let selection = self
-                .layout
-                .pane(*pane_id)
-                .map(|pane| pane.selection.clone());
-            let Some(mut selection) = selection else {
-                continue;
-            };
+        let mut selection = panes
+            .iter()
+            .find(|pane_id| self.layout.is_focused(**pane_id))
+            .or_else(|| panes.first())
+            .and_then(|pane_id| self.layout.pane(*pane_id))
+            .map(|pane| pane.selection.clone())
+            .unwrap_or_else(|| Selection::point(0));
+        {
             let buffer = self.buffer_mut(id).expect("checked above");
-            buffer.apply(changes.clone(), group, &mut selection);
-            if let Some(pane) = self.layout.pane_mut(*pane_id) {
-                pane.selection = selection;
-            }
+            buffer.apply(changes, group, &mut selection);
         }
         let restored = {
             let buffer = self.buffer(id).expect("checked above");
@@ -3570,6 +3571,29 @@ mod tests {
         );
         fixture.feed("u");
         assert_eq!(fixture.text(), "let a = 1;\n");
+    }
+
+    #[test]
+    fn a_format_lands_once_when_two_panes_show_the_buffer() {
+        // The same buffer visible in a split: the formatter's change set must
+        // touch the text once, not once per pane.
+        let mut fixture =
+            Fixture::new("fn main() {\n    if x {\n    println!(\"test\");\n    }\n}\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.editor.run_cmd(Cmd::SplitHorizontal, fixture.area);
+        assert_eq!(fixture.editor.layout.panes_showing(id).len(), 2);
+        fixture
+            .editor
+            .apply_format(
+                id,
+                "fn main() {\n    if x {\n        println!(\"test\");\n    }\n}\n",
+            )
+            .expect("the formatter output applies");
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\n    if x {\n        println!(\"test\");\n    }\n}\n"
+        );
     }
 
     #[test]
