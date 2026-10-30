@@ -408,7 +408,7 @@ mod tests {
             position: Some((12, 4)),
             percentage: Some(30),
             pane: Some((1, 2)),
-            split_mode: Some("auto"),
+            split_mode: Some("equal"),
             diagnostics: DiagnosticCount::default(),
             search: None,
             search_hits: 0,

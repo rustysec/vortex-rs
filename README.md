@@ -74,8 +74,8 @@ The bindings you are most likely to reach for:
 | `Space x` | clear the search highlight |
 | `Space v` / `Space h` | split right / split below |
 | `Space o` `Space z` `Space c` | only this pane / zoom / close pane |
-| `Space n` `Space =` | automatic layout / equal panes |
-| `Space g` `e`·`a`·`g` | layout mode: explicit, auto, golden |
+| `Space n` `Space =` | split along the roomier axis / equal panes |
+| `Space g` `e`·`g` | layout mode: equal, golden |
 | `Space t` `n`·`c`·`w`·`s`·`f`·`m` | toggles: numbers, cursorline, wrap, spell, auto-format, mouse |
 | `Ctrl-W` `h/j/k/l`, `Space ←/→/↑/↓`, `Space Tab` | move between panes |
 | `Space Ctrl-H/J/K/L`, `Space +`, `Space -` | resize the focused pane |
@@ -153,10 +153,20 @@ show-mode = true
 show-diagnostics = true
 
 [layout]
-split-mode = "auto"          # "auto" | "explicit" | "golden"
-                             # auto: side by side while the pane is physically
-                             # wider than tall (cells are ~2:1 tall, so roughly
-                             # 2x rows in columns), stacked otherwise
+split-mode = "equal"          # "equal" | "golden"
+                              # sizing only; the split direction is per command:
+                              # `space h` / `space v` choose it, `space n` takes
+                              # the roomier axis (side by side while the pane is
+                              # physically wider than tall — cells are ~2:1 tall,
+                              # so roughly 2x rows in columns — stacked otherwise)
+                              # equal:  splits keep even shares
+                              # golden: focused pane takes the golden ratio of
+                              # the whole window (spread over the splits on
+                              # its focus path), re-balanced on every focus
+                              # change; splits away from the focus take the
+                              # golden ratio too (first child larger), so
+                              # every pane resizes, not just the focused
+                              # sub-split
 min-width = 24
 
 [search]
@@ -248,7 +258,7 @@ src/
   buffer.rs       rope, undo history, file I/O, dirty/mtime tracking
   selection.rs    multi-span selections, mapping across edits
   input/          keys, keymap trie, motions, text objects, operators
-  layout.rs       pane tree, auto/explicit/golden sizing
+  layout.rs       pane tree, equal/golden sizing
   ui.rs           pure renderer over a ratatui Buffer
   status.rs       configurable status line and message row
   prompt.rs       command line, search, fuzzy pickers

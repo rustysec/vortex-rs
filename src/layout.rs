@@ -371,35 +371,135 @@ impl Node {
         }
     }
 
-    /// Set every split on the path to `id` so the focused branch gets `ratio`.
-    /// Splits away from the path are equalised.
-    pub fn apply_golden(&mut self, id: PaneId, ratio: f64) {
+    /// Number of Row and Column splits between this node and `id`, or
+    /// `None` when `id` is not in this subtree.
+    fn path_axes(&self, id: PaneId) -> Option<(usize, usize)> {
+        match self {
+            Node::Leaf(pane) if pane.id == id => Some((0, 0)),
+            Node::Leaf(_) => None,
+            Node::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => {
+                let (rows, cols) = first.path_axes(id).or_else(|| second.path_axes(id))?;
+                Some(match axis {
+                    Axis::Row => (rows + 1, cols),
+                    Axis::Column => (rows, cols + 1),
+                })
+            }
+        }
+    }
+
+    /// Rectangle of `id` if every split were even.  Golden mode inflates
+    /// the focused pane to its golden share, so `split-auto` judges room
+    /// on this instead of the live rect — otherwise the focused pane
+    /// always looks wide enough to split side by side and the axis never
+    /// flips.
+    pub fn even_rect_of(&self, id: PaneId, area: Rect) -> Option<Rect> {
+        match self {
+            Node::Leaf(pane) if pane.id == id => Some(area),
+            Node::Leaf(_) => None,
+            Node::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => {
+                let (first_area, second_area) = match axis {
+                    Axis::Row => {
+                        let height = (area.height / 2).max(1).min(area.height);
+                        (
+                            Rect { height, ..area },
+                            Rect {
+                                y: area.y + height,
+                                height: area.height - height,
+                                ..area
+                            },
+                        )
+                    }
+                    Axis::Column => {
+                        let width = (area.width / 2).max(1).min(area.width);
+                        (
+                            Rect { width, ..area },
+                            Rect {
+                                x: area.x + width,
+                                width: area.width - width,
+                                ..area
+                            },
+                        )
+                    }
+                };
+                first
+                    .even_rect_of(id, first_area)
+                    .or_else(|| second.even_rect_of(id, second_area))
+            }
+        }
+    }
+
+    /// Set _every_ split to the golden ratio: splits on the path to `id`
+    /// give their axis' step to the focused branch, splits away from the
+    /// path take `ratio` with the first (top/left) child larger.  Nothing
+    /// is left equalised, so a focus change re-sizes the whole tree, not
+    /// just the focused sub-split.
+    ///
+    /// `step_row` / `step_col` are `ratio` spread over the number of Row /
+    /// Column splits on the focus path (see [`Layout::apply_golden`]), so
+    /// the focused pane ends up with `ratio` of the whole window along
+    /// each axis.  Spreading per axis keeps the axes independent: adding
+    /// a column split inside one branch never re-sizes a row split, so
+    /// panes outside that branch keep their size.
+    pub fn apply_golden(&mut self, id: PaneId, step_row: f64, step_col: f64, ratio: f64) {
         match self {
             Node::Leaf(_) => {}
             Node::Split {
-                axis: _,
+                axis,
                 ratio: node_ratio,
                 first,
                 second,
             } => {
                 let first_side = first.contains(id);
-                let on_path = first_side || second.contains(id);
-                if on_path {
-                    *node_ratio = if first_side { ratio } else { 1.0 - ratio };
-                    // Written as two branches so the two children stay
-                    // separately borrow-checked.
-                    if first_side {
-                        first.apply_golden(id, ratio);
-                        second.equalize();
-                    } else {
-                        second.apply_golden(id, ratio);
-                        first.equalize();
-                    }
+                let second_side = second.contains(id);
+                let on_path = first_side || second_side;
+                // On the path the focused branch wins; away from it the
+                // first child takes the golden share.
+                let first_gets = if on_path { first_side } else { true };
+                let step = match axis {
+                    Axis::Row => step_row,
+                    Axis::Column => step_col,
+                };
+                let share = if on_path { step } else { ratio };
+                *node_ratio = if first_gets { share } else { 1.0 - share };
+                // Written as branches so the two children stay separately
+                // borrow-checked.
+                if first_side {
+                    first.apply_golden(id, step_row, step_col, ratio);
+                    second.goldenize(ratio);
+                } else if second_side {
+                    second.apply_golden(id, step_row, step_col, ratio);
+                    first.goldenize(ratio);
                 } else {
-                    *node_ratio = 0.5;
-                    first.equalize();
-                    second.equalize();
+                    first.goldenize(ratio);
+                    second.goldenize(ratio);
                 }
+            }
+        }
+    }
+
+    /// Set every split to `ratio`, first child taking the larger share.
+    fn goldenize(&mut self, ratio: f64) {
+        match self {
+            Node::Leaf(_) => {}
+            Node::Split {
+                ratio: node_ratio,
+                first,
+                second,
+                ..
+            } => {
+                *node_ratio = ratio;
+                first.goldenize(ratio);
+                second.goldenize(ratio);
             }
         }
     }
@@ -689,7 +789,11 @@ impl Layout {
             .map(|(id, _)| id)
     }
 
-    /// Split the focused pane, honouring the configured split mode.
+    /// Split the focused pane.  `axis` names the direction the command asked
+    /// for (`split-horizontal` / `split-vertical`); `None` (`split-auto`)
+    /// picks the axis with the most physical room, falling back to the other
+    /// when this pane is too thin that way.  The split mode only governs the
+    /// resulting sizes, never the direction.
     pub fn split_focused(
         &mut self,
         axis: Option<Axis>,
@@ -709,18 +813,28 @@ impl Layout {
         let new_id = self.alloc_id();
         let root = self.root.as_mut()?;
         let rect = root.rect_of(focus, root_area)?;
-        // No axis named (`space n`, or an explicit split in a pane with no
-        // room): take the one with more space, then fall back to the other if
-        // this pane is too thin to split that way.
-        let preferred = axis.unwrap_or_else(|| Axis::auto(rect));
+        // No axis named (`space n`): take the one with more physical space,
+        // then fall back to the other if this pane is too thin that way.
+        // Golden mode inflates the focused pane to its golden share of the
+        // window, so the live rect would always read "wide" and the axis
+        // would never flip; judge the room on the even-split rect instead.
         let auto_axis = axis.is_none();
+        let mut axis = axis.unwrap_or_else(|| match config.split_mode {
+            SplitMode::Golden => {
+                let even = root.even_rect_of(focus, root_area).unwrap_or(rect);
+                Axis::auto(even)
+            }
+            SplitMode::Equal => Axis::auto(rect),
+        });
+        // The share the existing pane keeps.  Golden re-sizes the tree right
+        // after the split so the new, focused pane gets `golden_ratio` of the
+        // parent; the room check must use those shares, not `split_ratio`.
         let keep = match config.split_mode {
-            SplitMode::Golden => 1.0 - config.split_ratio,
-            _ => 1.0 - config.split_ratio,
+            SplitMode::Golden => 1.0 - config.golden_ratio.clamp(0.05, 0.95),
+            SplitMode::Equal => 1.0 - config.split_ratio,
         };
-        let mut axis = preferred;
         if !root.can_split(focus, axis, keep, root_area, config) {
-            let other = preferred.other();
+            let other = axis.other();
             if !auto_axis || !root.can_split(focus, other, keep, root_area, config) {
                 return None;
             }
@@ -779,8 +893,17 @@ impl Layout {
         let Some(focus) = self.focused() else {
             return;
         };
+        let ratio = config.golden_ratio.clamp(0.05, 0.95);
         if let Some(root) = self.root.as_mut() {
-            root.apply_golden(focus, config.golden_ratio.clamp(0.05, 0.95));
+            // The focused pane should end up with `ratio` of the *window*
+            // along each axis.  Spread the share over the splits on the
+            // focus path per axis — `ratio^(1/depth)` of each Row split
+            // along the path, likewise for Column — so nesting column
+            // splits inside one branch never re-sizes a row split (and
+            // thus never resizes panes outside that branch).
+            let (rows, cols) = root.path_axes(focus).unwrap_or((0, 0));
+            let step = |depth: usize| ratio.powf(1.0 / depth.max(1) as f64);
+            root.apply_golden(focus, step(rows), step(cols), ratio);
         }
     }
 
@@ -1010,14 +1133,171 @@ mod tests {
     fn golden_layout_favours_focus() {
         let mut root = Node::leaf(pane(1, 1));
         assert!(root.split_leaf(PaneId(1), Axis::Row, 0.5, pane(2, 1)));
-        root.apply_golden(PaneId(2), 0.618);
+        root.apply_golden(PaneId(2), 0.618, 0.618, 0.618);
         let rects = root.rect_map(area());
         assert_eq!(rects[0].1.height, 15, "unfocused pane shrinks");
         assert_eq!(rects[1].1.height, 25, "focused pane takes the golden share");
 
-        root.apply_golden(PaneId(1), 0.618);
+        root.apply_golden(PaneId(1), 0.618, 0.618, 0.618);
         let rects = root.rect_map(area());
         assert_eq!(rects[0].1.height, 25);
+    }
+
+    #[test]
+    fn golden_sizes_every_split_not_just_the_focus_path() {
+        // 1 | (2 / 3): focusing pane 1 goldenises the root split _and_ the
+        // off-path sub-split (first child takes the larger share), so all
+        // three panes move, not just the ones on the path.
+        let config = LayoutConfig {
+            split_mode: SplitMode::Golden,
+            ..LayoutConfig::default()
+        };
+        let mut root = Node::leaf(pane(1, 1));
+        assert!(root.split_leaf(PaneId(1), Axis::Column, 0.5, pane(2, 1)));
+        assert!(root.split_leaf(PaneId(2), Axis::Row, 0.5, pane(3, 1)));
+        let mut layout = Layout::new(root, PaneId(1));
+        layout.apply_golden(&config);
+        let rect = |layout: &Layout, id: u32| {
+            layout
+                .rects(area())
+                .iter()
+                .find(|(p, _)| p.0 == id)
+                .unwrap()
+                .1
+        };
+        assert_eq!(
+            rect(&layout, 1).width,
+            62,
+            "focused pane takes the golden share"
+        );
+        let (h2, h3) = (rect(&layout, 2).height, rect(&layout, 3).height);
+        assert_ne!(h2, h3, "off-path sub-split is goldenised, not equalised");
+        assert_eq!((h2, h3), (25, 15), "first child takes the golden share");
+
+        // Focus moving into the sub-split re-balances the whole tree too:
+        // the focused pane takes the golden share of the window along each
+        // axis it is split on, so the outer pane shrinks to the remainder
+        // (one column split on the path: 1 - 0.618 of the width).
+        layout.focus(PaneId(3));
+        layout.apply_golden(&config);
+        assert_eq!(rect(&layout, 3).height, 25, "0.618 of the window height");
+        assert_eq!(rect(&layout, 1).width, 38, "outer pane shrinks");
+    }
+
+    #[test]
+    fn golden_honours_requested_axis() {
+        // Direction is the command's choice, sizing is the mode's: golden
+        // stacks when the command asks for it, then takes the golden share
+        // of the stacked axis.
+        let wide = Rect::new(0, 0, 160, 50);
+        let config = LayoutConfig {
+            split_mode: SplitMode::Golden,
+            ..LayoutConfig::default()
+        };
+        let mut layout = Layout::new(Node::leaf(pane(1, 1)), PaneId(1));
+        let fresh = layout
+            .split_focused(Some(Axis::Row), &config, wide, |id| pane(id.0, 1))
+            .expect("golden split");
+        let rects = layout.rects(wide);
+        assert_eq!(rects.len(), 2);
+        let (_, old) = rects.iter().find(|(id, _)| *id != fresh).unwrap();
+        let (_, new) = rects.iter().find(|(id, _)| *id == fresh).unwrap();
+        assert_eq!((old.width, new.width), (160, 160), "stacked, as asked");
+        // The focused (new) pane keeps the golden share of the height.
+        assert_eq!(new.height, 31, "0.618 of 50");
+        assert_eq!(old.height, 19);
+    }
+
+    #[test]
+    fn golden_split_auto_picks_the_roomier_axis() {
+        // `split-auto` (no axis) in golden mode uses the same physical-room
+        // heuristic as everywhere else: 160x50 is wider than tall.
+        let wide = Rect::new(0, 0, 160, 50);
+        let config = LayoutConfig {
+            split_mode: SplitMode::Golden,
+            ..LayoutConfig::default()
+        };
+        let mut layout = Layout::new(Node::leaf(pane(1, 1)), PaneId(1));
+        let fresh = layout
+            .split_focused(None, &config, wide, |id| pane(id.0, 1))
+            .expect("golden split");
+        let rects = layout.rects(wide);
+        let (_, old) = rects.iter().find(|(id, _)| *id != fresh).unwrap();
+        let (_, new) = rects.iter().find(|(id, _)| *id == fresh).unwrap();
+        assert_eq!((old.height, new.height), (50, 50), "side by side");
+        assert_eq!(new.width, 99, "0.618 of 160");
+        assert_eq!(old.width, 61);
+    }
+
+    #[test]
+    fn golden_room_check_uses_golden_shares() {
+        // 30 columns cannot host two usable panes at the golden 61.8/38.2
+        // split (the small half would be 11 < min-width 12) even though a
+        // 50/50 split would fit, so split-auto falls back to the other axis...
+        let config = LayoutConfig {
+            split_mode: SplitMode::Golden,
+            ..LayoutConfig::default()
+        };
+        let thin = Rect::new(0, 0, 30, 10);
+        let mut layout = Layout::new(Node::leaf(pane(1, 1)), PaneId(1));
+        let fresh = layout
+            .split_focused(None, &config, thin, |id| pane(id.0, 1))
+            .expect("falls back to the row axis");
+        let rects = layout.rects(thin);
+        let (_, old) = rects.iter().find(|(id, _)| *id != fresh).unwrap();
+        let (_, new) = rects.iter().find(|(id, _)| *id == fresh).unwrap();
+        assert_eq!(
+            (old.width, new.width),
+            (30, 30),
+            "stacked, not side by side"
+        );
+        assert!(
+            old.height >= 3 && new.height >= 3,
+            "both halves stay usable"
+        );
+
+        // ...an explicit axis refuses rather than silently switching...
+        let mut layout = Layout::new(Node::leaf(pane(1, 1)), PaneId(1));
+        assert!(
+            layout
+                .split_focused(Some(Axis::Column), &config, thin, |id| pane(id.0, 1))
+                .is_none(),
+            "no room at golden sizes on the chosen axis"
+        );
+        assert_eq!(layout.panes(), vec![PaneId(1)]);
+
+        // ...while equal, which really does bisect, still takes the columns.
+        let config = LayoutConfig {
+            split_mode: SplitMode::Equal,
+            ..LayoutConfig::default()
+        };
+        let mut layout = Layout::new(Node::leaf(pane(1, 1)), PaneId(1));
+        let fresh = layout
+            .split_focused(None, &config, thin, |id| pane(id.0, 1))
+            .expect("equal split");
+        let rects = layout.rects(thin);
+        let (_, old) = rects.iter().find(|(id, _)| *id != fresh).unwrap();
+        assert_eq!(old.height, 10, "split-auto picks the column axis here");
+    }
+
+    #[test]
+    fn golden_refuses_split_without_room() {
+        // 30x6: neither axis can host the golden 61.8/38.2 shares
+        // (11 < min-width 12, 2 < min-height 3), so the split is refused
+        // even though a 50/50 split would fit.
+        let tiny = Rect::new(0, 0, 30, 6);
+        let config = LayoutConfig {
+            split_mode: SplitMode::Golden,
+            ..LayoutConfig::default()
+        };
+        let mut layout = Layout::new(Node::leaf(pane(1, 1)), PaneId(1));
+        assert!(
+            layout
+                .split_focused(None, &config, tiny, |id| pane(id.0, 1))
+                .is_none(),
+            "no room at golden sizes"
+        );
+        assert_eq!(layout.panes(), vec![PaneId(1)]);
     }
 
     #[test]
@@ -1090,5 +1370,127 @@ mod tests {
         let rects = root.rect_map(area());
         let total: u64 = rects.iter().map(|(_, r)| r.area() as u64).sum();
         assert_eq!(total, 100 * 40);
+    }
+
+    #[test]
+    fn golden_focus_takes_the_window_ratio_not_just_its_parent() {
+        // 1 | 2 | 3 side by side: whichever pane is focused takes the
+        // golden share of the *window*, so the leftmost pane shrinks to
+        // the remainder when focus moves into the nested split instead of
+        // ending up the same width as the focused pane.
+        let wide = Rect::new(0, 0, 160, 50);
+        let config = LayoutConfig {
+            split_mode: SplitMode::Golden,
+            ..LayoutConfig::default()
+        };
+        let mut layout = Layout::new(Node::leaf(pane(1, 1)), PaneId(1));
+        let p2 = layout
+            .split_focused(Some(Axis::Column), &config, wide, |id| pane(id.0, 1))
+            .expect("first split");
+        let p3 = layout
+            .split_focused(Some(Axis::Column), &config, wide, |id| pane(id.0, 1))
+            .expect("second split");
+        let width = |layout: &Layout, id: PaneId| {
+            layout
+                .rects(wide)
+                .iter()
+                .find(|(p, _)| *p == id)
+                .unwrap()
+                .1
+                .width
+        };
+        assert_eq!(
+            width(&layout, p3),
+            99,
+            "focused pane takes 0.618 of the window"
+        );
+        assert_eq!(width(&layout, PaneId(1)), 34, "outer pane shrinks");
+
+        layout.focus(PaneId(1));
+        layout.on_focus_changed(&config);
+        assert_eq!(
+            width(&layout, PaneId(1)),
+            99,
+            "focus left: left grows to the golden share"
+        );
+
+        layout.focus(p2);
+        layout.on_focus_changed(&config);
+        assert_eq!(
+            width(&layout, p2),
+            99,
+            "focus middle: focused pane takes the golden share"
+        );
+        assert_eq!(
+            width(&layout, PaneId(1)),
+            34,
+            "focus middle: leftmost shrinks again"
+        );
+    }
+
+    #[test]
+    fn golden_auto_split_flips_axis_despite_inflated_focus() {
+        // 200x55 golden: the first auto split goes side by side, and the
+        // focused pane keeps the golden share of the window forever.  The
+        // next auto split must still be able to stack, so the axis is
+        // judged on the even-split rect, not the inflated live rect.
+        let wide = Rect::new(0, 0, 200, 55);
+        let config = LayoutConfig {
+            split_mode: SplitMode::Golden,
+            ..LayoutConfig::default()
+        };
+        let mut layout = Layout::new(Node::leaf(pane(1, 1)), PaneId(1));
+        let p2 = layout
+            .split_focused(None, &config, wide, |id| pane(id.0, 1))
+            .expect("first auto split");
+        let p3 = layout
+            .split_focused(None, &config, wide, |id| pane(id.0, 1))
+            .expect("second auto split");
+        let rect = |layout: &Layout, id: PaneId| {
+            layout.rects(wide).iter().find(|(p, _)| *p == id).unwrap().1
+        };
+        assert_eq!(
+            rect(&layout, p2).width,
+            rect(&layout, p3).width,
+            "second auto split stacks instead of adding another column"
+        );
+        assert_eq!(rect(&layout, p3).height, 34, "focused half of the stack");
+        assert_eq!(rect(&layout, p2).height, 21);
+    }
+
+    #[test]
+    fn golden_nesting_one_axis_leaves_the_other_alone() {
+        // A over B, then column-split A repeatedly: B's height must not
+        // change as A gains columns.  A split's share depends only on the
+        // splits of _its own axis_ along the focus path.
+        let wide = Rect::new(0, 0, 200, 55);
+        let config = LayoutConfig {
+            split_mode: SplitMode::Golden,
+            ..LayoutConfig::default()
+        };
+        let mut layout = Layout::new(Node::leaf(pane(1, 1)), PaneId(1));
+        let b = layout
+            .split_focused(Some(Axis::Row), &config, wide, |id| pane(id.0, 1))
+            .expect("stacked split");
+        layout.focus(PaneId(1));
+        layout.on_focus_changed(&config);
+        let height = |layout: &Layout, id: PaneId| {
+            layout
+                .rects(wide)
+                .iter()
+                .find(|(p, _)| *p == id)
+                .unwrap()
+                .1
+                .height
+        };
+        let before = height(&layout, b);
+        layout
+            .split_focused(Some(Axis::Column), &config, wide, |id| pane(id.0, 1))
+            .expect("first column split in A");
+        assert_eq!(height(&layout, b), before, "B keeps its height");
+        layout
+            .split_focused(Some(Axis::Column), &config, wide, |id| pane(id.0, 1))
+            .expect("second column split in A");
+        assert_eq!(height(&layout, b), before, "B still keeps its height");
     }
 }

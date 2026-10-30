@@ -3054,8 +3054,7 @@ fn verb_for(operator: Operator) -> &'static str {
 
 pub fn split_mode_label(mode: SplitMode) -> &'static str {
     match mode {
-        SplitMode::Explicit => "explicit",
-        SplitMode::Auto => "auto",
+        SplitMode::Equal => "equal",
         SplitMode::Golden => "golden",
     }
 }

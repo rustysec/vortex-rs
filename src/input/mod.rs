@@ -420,8 +420,7 @@ pub const DEFAULT_BINDINGS: &[(&str, &[(&str, &str)])] = &[
             ("space ctrl-l", "resize-right"),
             ("space plus", "resize-right"),
             ("space minus", "resize-left"),
-            ("space g e", "layout-explicit"),
-            ("space g a", "layout-auto"),
+            ("space g e", "layout-equal"),
             ("space g g", "layout-golden"),
             // toggles
             ("space t n", "toggle-line-numbers"),

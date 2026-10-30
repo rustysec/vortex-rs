@@ -45,22 +45,37 @@ message-timeout = "6s"        # how long status messages stay up
 # panes and splitting
 # ---------------------------------------------------------------------------
 [layout]
-split-mode = "auto"           # "explicit" | "auto" | "golden"
-                              #   explicit: `split` stacks, `vsplit` places side by side
-                              #   auto:     side by side while the focused pane is
-                              #             physically wider than tall — cells are
-                              #             about twice as tall as wide, so that means
-                              #             roughly twice as many columns as rows;
-                              #             stacked otherwise
-                              #             (the other axis is used if there is no room)
-                              #   golden:   focused pane gets golden-ratio of its parent
+split-mode = "equal"          # "equal" | "golden" — sizing only, the split
+                              # direction is chosen per command:
+                              #   `space h` / `:split`  stack below
+                              #   `space v` / `:vsplit` place side by side
+                              #   `space n`             roomier axis: side by
+                              #             side while the focused pane is
+                              #             physically wider than tall — cells
+                              #             are about twice as tall as wide, so
+                              #             that means roughly twice as many
+                              #             columns as rows; stacked otherwise
+                              #             (the other axis is used if there is
+                              #             no room)
+                              #   equal:  splits keep even shares
+                              #   golden: focused pane gets golden-ratio of
+                              #             the whole window (spread over the
+                              #             splits on its focus path),
+                              #             re-balanced on focus change;
+                              #             splits away from the focus take
+                              #             the golden ratio too (first child
+                              #             larger), so every pane resizes,
+                              #             not just the focused sub-split;
+                              #             a split is refused unless both
+                              #             golden-sized halves meet
+                              #             min-height/min-width
 border = "rounded"            # "rounded" | "plain" | "square" | "none"
 show-labels = true            # buffer name in the pane border
 show-flags = true             # "+" modified / "ro" markers next to the label
 min-height = 3                # usable rows per pane
 min-width = 12                # usable columns per pane
 golden-ratio = 0.618          # fraction of the parent for the focused pane
-split-ratio = 0.5             # fraction given to a new pane (explicit splits)
+split-ratio = 0.5             # fraction given to a new pane (equal mode)
 resize-step = 0.1             # fraction of the parent per resize step
 
 # ---------------------------------------------------------------------------

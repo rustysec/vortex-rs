@@ -269,7 +269,7 @@ impl Default for StatusConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct LayoutConfig {
-    /// `"explicit"`, `"auto"` or `"golden"`.
+    /// `"equal"` or `"golden"`.
     pub split_mode: SplitMode,
     /// Pane borders.
     pub border: BorderStyle,
@@ -283,7 +283,7 @@ pub struct LayoutConfig {
     pub min_width: u16,
     /// Fraction of the parent given to the focused pane in golden mode.
     pub golden_ratio: f64,
-    /// Fraction of the parent given to a new pane for explicit splits.
+    /// Fraction of the parent given to a new pane in equal mode.
     pub split_ratio: f64,
     /// Relative resize step, as a fraction of the parent.
     pub resize_step: f64,
@@ -681,8 +681,7 @@ impl Config {
             "editor.undo-group-timeout" => self.editor.undo_group_timeout = duration(key, value)?,
             "editor.large-file-threshold" => self.editor.large_file_threshold = number(key, value)?,
             "layout.split-mode" => {
-                self.layout.split_mode = SplitMode::from_str(&text(key, value)?)
-                    .map_err(|_| "layout.split-mode expects explicit, auto or golden".to_string())?
+                self.layout.split_mode = SplitMode::from_str(&text(key, value)?)?
             }
             "layout.border" => {
                 self.layout.border = match text(key, value)?.as_str() {

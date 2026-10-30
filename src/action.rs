@@ -256,17 +256,17 @@ impl Direction {
     }
 }
 
-/// Which dimension a split uses. Mirrors the `[layout] split-mode` setting.
+/// How panes are sized after splits. Mirrors the `[layout] split-mode`
+/// setting.  The split *direction* is chosen per command (`split-horizontal`,
+/// `split-vertical`, `split-auto`), not by the mode.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum SplitMode {
-    /// Bisect the focused pane along the axis named in the command.
-    Explicit,
-    /// Pick the axis with the most room.
+    /// Splits keep even shares (`split-ratio`); nothing re-balances on focus.
     #[default]
-    Auto,
+    Equal,
     /// Resize every split so the focused pane gets the golden ratio.
     Golden,
 }
@@ -276,12 +276,13 @@ impl std::str::FromStr for SplitMode {
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "explicit" => Ok(SplitMode::Explicit),
-            "auto" => Ok(SplitMode::Auto),
+            "equal" => Ok(SplitMode::Equal),
             "golden" => Ok(SplitMode::Golden),
-            other => Err(format!(
-                "unknown split mode \"{other}\" (explicit, auto, golden)"
+            "explicit" | "auto" => Err(format!(
+                "split mode \"{value}\" was removed; use \"equal\" (direction is a \
+                 per-split choice now) or \"golden\""
             )),
+            other => Err(format!("unknown split mode \"{other}\" (equal, golden)")),
         }
     }
 }
@@ -289,8 +290,7 @@ impl std::str::FromStr for SplitMode {
 impl SplitMode {
     pub fn name(self) -> &'static str {
         match self {
-            SplitMode::Explicit => "explicit",
-            SplitMode::Auto => "auto",
+            SplitMode::Equal => "equal",
             SplitMode::Golden => "golden",
         }
     }
@@ -833,14 +833,9 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
         "make panes equal size",
     ),
     (
-        "layout-explicit",
-        Action::Cmd(Cmd::CycleLayout(SplitMode::Explicit)),
-        "use explicit splits",
-    ),
-    (
-        "layout-auto",
-        Action::Cmd(Cmd::CycleLayout(SplitMode::Auto)),
-        "use automatic splits",
+        "layout-equal",
+        Action::Cmd(Cmd::CycleLayout(SplitMode::Equal)),
+        "use even split sizing",
     ),
     (
         "layout-golden",
@@ -1100,5 +1095,31 @@ impl FromStr for Action {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         parse_action(s).ok_or_else(|| format!("unknown action '{s}'"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_mode_parses_the_two_modes() {
+        assert_eq!("equal".parse::<SplitMode>().unwrap(), SplitMode::Equal);
+        assert_eq!("Golden".parse::<SplitMode>().unwrap(), SplitMode::Golden);
+        assert_eq!(SplitMode::default(), SplitMode::Equal);
+        assert_eq!(SplitMode::Equal.name(), "equal");
+    }
+
+    #[test]
+    fn retired_split_modes_error_with_guidance() {
+        // "explicit" and "auto" described split *direction*, which is now a
+        // per-command choice; the mode only governs sizing.
+        for retired in ["explicit", "auto"] {
+            let error = retired.parse::<SplitMode>().unwrap_err();
+            assert!(error.contains("removed"), "{retired}: {error}");
+            assert!(error.contains("equal"), "{retired}: {error}");
+        }
+        let error = "fibonacci".parse::<SplitMode>().unwrap_err();
+        assert!(error.contains("equal, golden"), "{error}");
     }
 }

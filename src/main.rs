@@ -185,7 +185,7 @@ fn check_config(explicit: Option<&Path>) -> Result<ExitCode> {
     for (key, value) in [
         ("editor.tab-width", "4"),
         ("status.height", "1"),
-        ("layout.split-mode", "auto"),
+        ("layout.split-mode", "golden"),
     ] {
         if let Err(error) = probe.set_value(key, value) {
             problems.push(format!("{key}={value}: {error}"));
