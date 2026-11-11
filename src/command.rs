@@ -689,6 +689,7 @@ pub fn option_summary(editor: &Editor) -> String {
         "search.ripgrep",
         "format.on-idle",
         "lsp.enable",
+        "lsp.completion",
     ];
     KEYS.iter()
         .filter_map(|key| {
@@ -808,6 +809,7 @@ const BOOLEAN_OPTIONS: &[&str] = &[
     "search.ignore",
     "format.on-save",
     "lsp.enable",
+    "lsp.completion",
 ];
 
 /// Vim spellings that mean a specific value rather than a toggle.

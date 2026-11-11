@@ -86,7 +86,12 @@ The bindings you are most likely to reach for:
 Insert mode keeps the readline habits that matter while typing code:
 `Ctrl-W` (delete word back), `Ctrl-U` (delete to the line start), `Ctrl-T`
 (indent line), `Shift-Tab` (unindent), `Ctrl-J` (newline) and `Ctrl-O` for a
-single normal-mode command. The mouse works too: click to place the cursor, drag to select, wheel
+single normal-mode command. Typing is syntax-aware: `Enter` after a line that
+opens a block indents the new line (and splits `{|}` into three lines), `o` on
+such a line opens the new line inside the block, a closing bracket typed alone
+on its line dedents to the block it closes, and `(`/`[`/`{`/quotes insert their
+partner with the caret between the two. The
+mouse works too: click to place the cursor, drag to select, wheel
 to scroll, and click inside a picker to choose an item.
 
 ## Commands
@@ -245,8 +250,12 @@ line) at the working directory.
   binaries are installed, or name your own under `[lsp.servers.<language>]`.
   One server per project root, `initialize` handshake,
   `didOpen`/`didChange`/`didSave` sync, published diagnostics in the gutter and
-  status line. Hover, completion and rename are not wired up yet, which is why
-  formatting is external.
+  status line, and insert-mode completion: typing pauses, the server is asked
+  for candidates at the caret, and a popup opens next to it. `Tab`/`Enter`
+  accept, the arrows move, `Esc` closes it, and typing narrows the list with a
+  fuzzy filter. A slow answer for a caret that has since moved is dropped, and
+  `[lsp] completion = false` turns the popup off while keeping diagnostics.
+  Hover and rename are not wired up yet, which is why formatting is external.
 
 ## Architecture
 
@@ -263,10 +272,12 @@ src/
   status.rs       configurable status line and message row
   prompt.rs       command line, search, fuzzy pickers
   syntax.rs       tree-sitter parsing and highlight spans
+  indent.rs       syntax-aware indentation while typing
+  completion.rs   the completion popup's candidates and prefix filtering
   search.rs       ripgrep driver plus ignore-crate fallback
   format.rs       formatter discovery, diffing, cursor restoration
   spell.rs        dictionary, tokenizer, suggestions
-  lsp/            JSON-RPC framing and the client scaffold
+  lsp/            JSON-RPC framing, the client and completion requests
   config.rs       TOML config, defaults, `:set` plumbing
   theme.rs        style parsing and defaults
 ```
@@ -303,7 +314,8 @@ the bug is "the file was empty" or "the leader key did nothing".
 
 ## Limitations worth knowing
 
-* LSP is diagnostics-only (see above); formatting is external on purpose.
+* LSP covers diagnostics and insert-mode completion; hover, rename and
+  formatting are not wired up (formatting is external on purpose).
 * The spell dictionary is embedded and modest. It favours false negatives over
   nagging; add words to `.vortex-words` when it matters.
 * No tab page concept — buffers, not tabs.

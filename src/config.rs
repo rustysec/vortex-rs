@@ -371,17 +371,29 @@ impl Default for FormatConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct LspConfig {
-    /// Master switch for the (scaffolded) language server support.  Off by
-    /// default: turning it on implies well-known servers (rust-analyzer,
-    /// pylsp, gopls, clangd) when those binaries are installed, which is a
-    /// heavyweight surprise nobody asked for.
+    /// Master switch for language server support.  Off by default: turning it
+    /// on implies well-known servers (rust-analyzer, pylsp, gopls, clangd) when
+    /// those binaries are installed, which is a heavyweight surprise nobody
+    /// asked for.
     pub enable: bool,
+    /// Ask the server for completions while typing in insert mode.
+    pub completion: bool,
     /// Servers keyed by language name.
     #[serde(default)]
     pub servers: BTreeMap<String, LspServer>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            completion: true,
+            servers: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -747,6 +759,7 @@ impl Config {
             "spell.min-len" => self.spell.min_len = number(key, value)?,
             "spell.ignore-camel-case" => self.spell.ignore_camel_case = boolean(key, value)?,
             "lsp.enable" => self.lsp.enable = boolean(key, value)?,
+            "lsp.completion" => self.lsp.completion = boolean(key, value)?,
             other => return Err(format!("unknown option \"{other}\"")),
         }
         // Range checks `validate()` also performs, so a bad `:set` is refused
@@ -815,6 +828,7 @@ impl Config {
             "spell.min-len" => self.spell.min_len.to_string(),
             "spell.ignore-camel-case" => on_off(self.spell.ignore_camel_case),
             "lsp.enable" => on_off(self.lsp.enable),
+            "lsp.completion" => on_off(self.lsp.completion),
             _ => return None,
         })
     }

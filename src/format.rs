@@ -14,7 +14,7 @@ use tokio::process::Command;
 use crate::buffer::{BufferId, Change};
 use crate::config::Config;
 use crate::event::{AsyncEvent, EventTx};
-use crate::selection::Span;
+use crate::selection::{Edit, Selection, Span};
 
 /// A formatter command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +310,31 @@ pub fn byte_at_position(rope: &Rope, position: (usize, usize)) -> usize {
     rope.char_to_byte(target)
 }
 
+/// Where a selection belongs once formatter output has been applied.
+///
+/// `position` is the caret's `(line, character)` in the text *before* the
+/// rewrite.  Outside the rewritten text the selection travels with the text
+/// around it: a formatter that splits or joins lines above the caret must not
+/// leave it sitting on the line number it happened to be on.  Inside the
+/// rewritten text no byte offset survives, so the caret keeps the line and
+/// column it had — the same line of the reformatted block — clamped into what
+/// is there now.
+pub fn selection_after_rewrite(
+    position: (usize, usize),
+    new: &Rope,
+    edits: &[Edit],
+    selection: &Selection,
+) -> Selection {
+    let caret = selection.cursor();
+    let rewritten = edits
+        .iter()
+        .any(|edit| caret > edit.range.start && caret < edit.range.end);
+    if rewritten {
+        return Selection::point(byte_at_position(new, position));
+    }
+    selection.map(edits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +411,74 @@ mod tests {
         // A clamped position lands on the line end, not on the break.
         let far = byte_at_position(&rope, (0, 100));
         assert_eq!(far, 5);
+    }
+
+    /// The edits a rewrite amounts to, in the shape `Selection::map` wants.
+    fn edits(old: &Rope, new_text: &str) -> Vec<Edit> {
+        diff_changes(old, new_text)
+            .iter()
+            .map(|change| Edit::new(change.range, change.text.len()))
+            .collect()
+    }
+
+    #[test]
+    fn a_caret_below_the_rewrite_travels_with_the_text() {
+        // The formatter inserted a line above the caret.  Restoring the caret by
+        // the line number it happened to be on drops it onto the line that
+        // moved up into its place — the "cursor resets at random" jump.
+        let old = Rope::from("a\nb\nc\n");
+        let new_text = "a\nX\nb\nc\n";
+        let new = Rope::from(new_text);
+        let caret = 4; // the "c"
+        let position = position_of(&old, caret);
+        let after = selection_after_rewrite(
+            position,
+            &new,
+            &edits(&old, new_text),
+            &Selection::point(caret),
+        );
+        assert_eq!(
+            after.cursor(),
+            6,
+            "still the `c`, one line later in the file"
+        );
+        assert_eq!(&new_text[after.cursor()..after.cursor() + 1], "c");
+    }
+
+    #[test]
+    fn a_caret_inside_the_rewrite_keeps_its_line_and_column() {
+        // Inside the rewritten text there is no byte offset left to keep, so the
+        // caret stays on the same line and column of the reformatted block.
+        let old = Rope::from("one\ntwo\nthree\n");
+        let new_text = "one\nTWO THREE\nthree\n";
+        let new = Rope::from(new_text);
+        let caret = 5; // the "w" of "two"
+        let position = position_of(&old, caret);
+        let after = selection_after_rewrite(
+            position,
+            &new,
+            &edits(&old, new_text),
+            &Selection::point(caret),
+        );
+        assert_eq!(position, (1, 1));
+        assert_eq!(after.cursor(), 5, "one character into the rewritten line");
+    }
+
+    #[test]
+    fn a_selection_outside_the_rewrite_keeps_its_spans() {
+        // A visual selection above the rewrite is untouched, so it must survive
+        // as a selection rather than collapsing to a caret.
+        let old = Rope::from("one\ntwo\nthree\n");
+        let new_text = "one\ntwo\nTHREE\nfour\n";
+        let new = Rope::from(new_text);
+        let selection = Selection::between(0, 3); // "one"
+        let after = selection_after_rewrite(
+            position_of(&old, 3),
+            &new,
+            &edits(&old, new_text),
+            &selection,
+        );
+        assert_eq!(after.primary(), Span::new(0, 3));
     }
 
     #[tokio::test]

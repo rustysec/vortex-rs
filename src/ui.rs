@@ -52,6 +52,12 @@ pub struct Picker<'a> {
     pub selected: usize,
 }
 
+/// A completion popup drawn next to the caret.
+pub struct CompletionView<'a> {
+    /// The popup state: candidates, the filtered order and the selection.
+    pub completion: &'a crate::completion::Completion,
+}
+
 /// Everything the renderer needs for one frame.
 pub struct Screen<'a> {
     pub editor: &'a Editor,
@@ -60,6 +66,7 @@ pub struct Screen<'a> {
     pub status: Snapshot,
     pub command_line: Option<CommandLine<'a>>,
     pub picker: Option<Picker<'a>>,
+    pub completion: Option<CompletionView<'a>>,
 }
 
 /// Split the terminal into status area, pane area and the message line.
@@ -142,6 +149,15 @@ pub fn draw(frame: &mut Frame, screen: &Screen) -> Option<Position> {
     if let Some(picker) = &screen.picker {
         if let Some(position) = draw_picker(buf, area, picker, screen.theme) {
             cursor = Some(position);
+        }
+    }
+    if let Some(completion) = &screen.completion {
+        // The popup hangs off the caret, so it needs the position the panes
+        // just computed; without one (no focused pane) there is nowhere to put
+        // it.  It is clipped to the pane area so it never covers the status or
+        // message rows.
+        if let Some(anchor) = cursor {
+            draw_completion(buf, pane_area, anchor, completion, screen.theme);
         }
     }
     cursor
@@ -893,7 +909,7 @@ fn pane_flags(buffer: &TextBuffer, editor: &Editor, focused: bool) -> String {
     if !buffer.language.has_tree_sitter() {
         flags.push_str(" plain");
     }
-    if buffer.syntax.status == syntax::ParseStatus::Pending {
+    if buffer.syntax.status.is_pending() {
         flags.push_str(" parsing");
     }
     if focused && !editor.search_matches.is_empty() {
@@ -1140,6 +1156,129 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
     })
 }
 
+/// Draw the completion popup hanging off the caret.
+///
+/// It opens below the caret when there is room and above it otherwise, and is
+/// clipped to the pane area so it never covers the status or message rows.
+fn draw_completion(
+    buf: &mut Buffer,
+    screen: Rect,
+    anchor: Position,
+    view: &CompletionView,
+    theme: &Theme,
+) {
+    let completion = view.completion;
+    let items: Vec<&crate::lsp::CompletionItem> = completion
+        .visible
+        .iter()
+        .filter_map(|index| completion.all.get(*index))
+        .collect();
+    if items.is_empty() || screen.width < 8 || screen.height < 4 {
+        return;
+    }
+    let widest = items
+        .iter()
+        .map(|item| {
+            item.label.chars().count()
+                + item.detail.as_deref().map_or(0, |d| d.chars().count() + 1)
+                + item.kind_label().chars().count()
+                + 3
+        })
+        .max()
+        .unwrap_or(0);
+    let width = (widest + 2)
+        .clamp(12, screen.width as usize)
+        .min(screen.width as usize) as u16;
+    let rows = items.len().clamp(1, 10) as u16;
+    let height = rows + 2;
+
+    // Prefer below the caret; flip above when the bottom would run off screen.
+    let below = anchor.y + 1;
+    let y = if below + height <= screen.bottom() {
+        below
+    } else {
+        anchor.y.saturating_sub(height).max(screen.y)
+    };
+    let x = anchor.x.min(screen.right().saturating_sub(width));
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+
+    // A solid card, like the picker: text bleeding through is unreadable.
+    for row in area.top()..area.bottom() {
+        for column in area.left()..area.right() {
+            buf[(column, row)].set_symbol(" ").set_style(theme.overlay);
+        }
+    }
+    let set = border::ROUNDED;
+    for column in area.left()..area.right() {
+        buf[(column, area.y)].set_symbol(set.horizontal_top);
+        buf[(column, area.bottom() - 1)].set_symbol(set.horizontal_bottom);
+    }
+    for row in area.top()..area.bottom() {
+        buf[(area.x, row)].set_symbol(set.vertical_left);
+        buf[(area.right() - 1, row)].set_symbol(set.vertical_right);
+    }
+    buf[(area.x, area.y)].set_symbol(set.top_left);
+    buf[(area.right() - 1, area.y)].set_symbol(set.top_right);
+    buf[(area.x, area.bottom() - 1)].set_symbol(set.bottom_left);
+    buf[(area.right() - 1, area.bottom() - 1)].set_symbol(set.bottom_right);
+
+    // Scroll the list so the highlighted row is always drawn.
+    let visible_rows = (area.height - 2) as usize;
+    let first = completion
+        .selected
+        .saturating_sub(visible_rows.saturating_sub(1));
+    for (row, item) in items.iter().enumerate().skip(first).take(visible_rows) {
+        let y = area.y + 1 + (row - first) as u16;
+        let selected = row == completion.selected;
+        let base = if selected {
+            theme
+                .selection
+                .patch(Style::default().add_modifier(Modifier::BOLD))
+        } else {
+            theme.text
+        };
+        if selected {
+            for column in (area.x + 1)..area.right().saturating_sub(1) {
+                buf[(column, y)].set_style(theme.selection);
+            }
+        }
+        let limit = area.width.saturating_sub(2) as usize;
+        emit(buf, area.x + 1, y, &item.label, base, 0, limit);
+        let mut detail = String::new();
+        let kind = item.kind_label();
+        if !kind.is_empty() {
+            detail.push(' ');
+            detail.push_str(kind);
+        }
+        if let Some(extra) = &item.detail {
+            detail.push(' ');
+            detail.push_str(extra);
+        }
+        if !detail.is_empty() {
+            let used = item.label.chars().count() + 1;
+            if used + 2 < limit {
+                emit(
+                    buf,
+                    area.x + 1,
+                    y,
+                    &detail,
+                    theme.status_inactive,
+                    used,
+                    limit,
+                );
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn unused_hl(hl: Hl, diagnostic: &Diagnostic) {
     let _ = (hl, diagnostic);
@@ -1177,6 +1316,7 @@ mod tests {
             status: snapshot,
             command_line: None,
             picker: None,
+            completion: None,
         };
         let (status_area, pane_area, message_area) = areas(area, &config);
         buffer.set_style(area, theme.text);
@@ -1416,6 +1556,79 @@ mod tests {
     }
 
     #[test]
+    fn the_completion_popup_draws_next_to_the_caret() {
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::default();
+        let items = vec![
+            crate::lsp::CompletionItem {
+                label: "print".into(),
+                insert_text: "print".into(),
+                snippet: false,
+                kind: Some(3),
+                detail: Some("fn(&str)".into()),
+                documentation: None,
+                replace: None,
+            },
+            crate::lsp::CompletionItem {
+                label: "println".into(),
+                insert_text: "println".into(),
+                snippet: false,
+                kind: Some(3),
+                detail: None,
+                documentation: None,
+                replace: None,
+            },
+        ];
+        let completion =
+            crate::completion::Completion::new(crate::buffer::BufferId(1), 1, 0, items);
+        let view = CompletionView {
+            completion: &completion,
+        };
+        draw_completion(&mut buffer, area, Position { x: 4, y: 3 }, &view, &theme);
+        let rendered = frame_text(&buffer);
+        assert!(rendered.contains("print"), "{rendered}");
+        assert!(rendered.contains("println"), "{rendered}");
+        assert!(rendered.contains("fn"), "the kind is shown: {rendered}");
+    }
+
+    #[test]
+    fn the_completion_popup_flips_above_the_caret_at_the_bottom() {
+        // A caret on the last row has no room below it; the popup must open
+        // upwards rather than run off the screen.
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buffer = Buffer::empty(area);
+        let items: Vec<crate::lsp::CompletionItem> = (0..5)
+            .map(|index| crate::lsp::CompletionItem {
+                label: format!("candidate{index}"),
+                insert_text: String::new(),
+                snippet: false,
+                kind: None,
+                detail: None,
+                documentation: None,
+                replace: None,
+            })
+            .collect();
+        let completion =
+            crate::completion::Completion::new(crate::buffer::BufferId(1), 1, 0, items);
+        let view = CompletionView {
+            completion: &completion,
+        };
+        draw_completion(
+            &mut buffer,
+            area,
+            Position { x: 2, y: 9 },
+            &view,
+            &Theme::default(),
+        );
+        let rendered = frame_text(&buffer);
+        assert!(
+            rendered.contains("candidate0"),
+            "the popup is off screen:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn welcome_screen_appears_without_panes() {
         let editor = Editor::new(Config::default());
         let area = Rect::new(0, 0, 60, 12);
@@ -1429,6 +1642,7 @@ mod tests {
             status: Snapshot::default(),
             command_line: None,
             picker: None,
+            completion: None,
         };
         draw_panes(&mut buffer, area, &screen);
         let rendered = frame_text(&buffer);

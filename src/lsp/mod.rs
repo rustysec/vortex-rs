@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tokio::io::BufReader;
-use tokio::process::Child;
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::buffer::BufferId;
@@ -50,6 +50,15 @@ pub enum LspEvent {
     },
     /// A progress or status message worth showing in the status area.
     Progress { language: String, message: String },
+    /// Completion candidates for one file, in answer to a request.
+    ///
+    /// `request` is the id the app sent, so a slow answer for a caret that has
+    /// since moved can be dropped instead of popping up under the wrong word.
+    Completions {
+        uri: String,
+        request: i64,
+        items: Vec<CompletionItem>,
+    },
     /// A server exited; it will be restarted the next time it is needed.
     Closed { language: String, code: Option<i32> },
 }
@@ -212,7 +221,123 @@ fn position(value: &Value) -> Option<(usize, usize)> {
     ))
 }
 
+/// One completion candidate as the server described it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    /// Text shown in the popup.
+    pub label: String,
+    /// Text inserted when the item is accepted; falls back to `label`.
+    pub insert_text: String,
+    /// True when `insert_text` carries snippet syntax (`$0`, `${1:default}`),
+    /// i.e. the server sent `insertTextFormat: 2`.
+    pub snippet: bool,
+    /// `CompletionItemKind` number, for the icon/colour.
+    pub kind: Option<u64>,
+    /// Short type or signature shown after the label.
+    pub detail: Option<String>,
+    /// Documentation, shown as a preview line.
+    pub documentation: Option<String>,
+    /// Text the server wants replaced, as a byte span in the buffer.
+    pub replace: Option<Span>,
+}
+
+impl CompletionItem {
+    /// The text this item inserts.
+    pub fn text(&self) -> &str {
+        if self.insert_text.is_empty() {
+            &self.label
+        } else {
+            &self.insert_text
+        }
+    }
+
+    /// A short human name for the kind, used in the popup.
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            Some(2) | Some(3) => "fn",
+            Some(4) => "ctor",
+            Some(5) => "field",
+            Some(6) => "var",
+            Some(7) => "class",
+            Some(8) => "iface",
+            Some(9) => "mod",
+            Some(10) => "prop",
+            Some(13) => "enum",
+            Some(14) => "kw",
+            Some(15) => "snippet",
+            Some(21) => "const",
+            Some(22) => "struct",
+            Some(23) => "event",
+            Some(25) => "type",
+            _ => "",
+        }
+    }
+}
+
+/// Decode a `textDocument/completion` result.
+///
+/// The result is either a bare array or a `CompletionList` with an `items`
+/// array; both shapes are legal and servers use both.  `line_starts` and
+/// `content_len` resolve a `textEdit`'s range to a byte span.
+pub fn completion_items(
+    result: &Value,
+    line_starts: &[usize],
+    content_len: usize,
+) -> Vec<CompletionItem> {
+    let items = result
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| result.as_array());
+    let Some(items) = items else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let label = item.get("label").and_then(Value::as_str)?.to_string();
+            // A `textEdit` is the server's exact instruction — its `newText`
+            // wins over `insertText`, which may differ (paths, call parens).
+            let new_text = item
+                .pointer("/textEdit/newText")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let snippet = item.get("insertTextFormat").and_then(Value::as_u64) == Some(2);
+            let insert_text = new_text.unwrap_or_else(|| {
+                item.get("insertText")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| label.clone(), str::to_string)
+            });
+            let replace = item.pointer("/textEdit/range").and_then(|range| {
+                let start = position(range.get("start")?)?;
+                let end = position(range.get("end")?)?;
+                Some(range_to_span(line_starts, content_len, start, end))
+            });
+            let documentation = item.get("documentation").and_then(|value| {
+                value.as_str().map(str::to_string).or_else(|| {
+                    value
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+            });
+            Some(CompletionItem {
+                label,
+                insert_text,
+                snippet,
+                kind: item.get("kind").and_then(Value::as_u64),
+                detail: item
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                documentation,
+                replace,
+            })
+        })
+        .collect()
+}
+
 /// Outgoing messages the app can ask a running server to send.
+#[derive(Debug)]
 enum Outgoing {
     Open {
         uri: String,
@@ -227,7 +352,48 @@ enum Outgoing {
     Save {
         uri: String,
     },
+    /// Ask for completions at a position; `request` is the id the answer will
+    /// carry back, and `trigger` is the character just typed (`:` or `.`) when
+    /// the request answers a member/path access rather than plain typing.
+    Complete {
+        uri: String,
+        request: i64,
+        line: usize,
+        character: usize,
+        trigger: Option<String>,
+    },
     Shutdown,
+}
+
+/// Tracks the `initialize` / `initialized` handshake.
+///
+/// The protocol allows nothing but `initialized` to follow the `initialize`
+/// response.  A server that receives `didOpen` first treats it as a protocol
+/// violation and exits — rust-analyzer does exactly this, which is why it used
+/// to die the instant a Rust file was opened.  Messages that arrive early are
+/// held here and replayed once the handshake completes.
+#[derive(Default)]
+struct Handshake {
+    complete: bool,
+    queued: Vec<Outgoing>,
+}
+
+impl Handshake {
+    /// Hold `message` until the handshake completes, or hand it back to send.
+    fn accept(&mut self, message: Outgoing) -> Option<Outgoing> {
+        if self.complete {
+            Some(message)
+        } else {
+            self.queued.push(message);
+            None
+        }
+    }
+
+    /// Mark the handshake complete and return the messages to replay, in order.
+    fn complete(&mut self) -> Vec<Outgoing> {
+        self.complete = true;
+        std::mem::take(&mut self.queued)
+    }
 }
 
 /// A handle to a running server.
@@ -271,6 +437,24 @@ impl ClientHandle {
 
     pub fn did_save(&self, uri: String) {
         let _ = self.outgoing.send(Outgoing::Save { uri });
+    }
+
+    /// Ask for completions at a 0-based line/character position.
+    pub fn complete(
+        &self,
+        uri: String,
+        request: i64,
+        line: usize,
+        character: usize,
+        trigger: Option<String>,
+    ) {
+        let _ = self.outgoing.send(Outgoing::Complete {
+            uri,
+            request,
+            line,
+            character,
+            trigger,
+        });
     }
 
     pub fn shutdown(&self) {
@@ -339,6 +523,14 @@ async fn session(
                     "synchronization": {
                         "didSave": true,
                         "dynamicRegistration": false
+                    },
+                    "completion": {
+                        "dynamicRegistration": false,
+                        "completionItem": {
+                            "snippetSupport": true,
+                            "documentationFormat": ["plaintext", "markdown"]
+                        },
+                        "contextSupport": true
                     }
                 },
                 "window": { "workDoneProgress": false }
@@ -351,8 +543,13 @@ async fn session(
         .map_err(|error| error.to_string())?;
 
     let mut reader = BufReader::new(stdout);
-    let mut initialized_sent = false;
+    let mut handshake = Handshake::default();
     let next_id: i64 = 2;
+    // Completion requests in flight, keyed by the id the answer will carry.
+    let mut pending: HashMap<i64, String> = HashMap::new();
+    // The text the server has been told about, per URI.  Completion ranges are
+    // resolved against it, so they line up with what the server actually saw.
+    let mut synced: HashMap<String, String> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -367,14 +564,35 @@ async fn session(
                     }
                     Some(value) => {
                         if value.get("id").is_some() && value.get("method").is_none() {
-                            // The initialize response.
-                            if !initialized_sent {
-                                initialized_sent = true;
+                            // A response to one of our requests.
+                            if !handshake.complete {
                                 let note = jsonrpc::notification("initialized", Some(json!({})));
                                 let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
+                                // Now that the handshake is complete, replay
+                                // everything that arrived while it was running.
+                                for message in handshake.complete() {
+                                    send_outgoing(&stdin, message, &mut pending, &mut synced).await;
+                                }
                                 tx.send_async(AsyncEvent::Lsp(LspEvent::Ready {
                                     language: spec.language.clone(),
                                     root: root.clone(),
+                                }));
+                                continue;
+                            }
+                            let id = value.get("id").and_then(Value::as_i64);
+                            if let Some(id) = id
+                                && let Some(uri) = pending.remove(&id)
+                            {
+                                // An error response has no `result`; the app
+                                // treats an empty list as "nothing to offer".
+                                let result = value.get("result").cloned().unwrap_or(Value::Null);
+                                let text = synced.get(&uri).cloned().unwrap_or_default();
+                                let starts = line_starts(&text);
+                                let items = completion_items(&result, &starts, text.len());
+                                tx.send_async(AsyncEvent::Lsp(LspEvent::Completions {
+                                    uri,
+                                    request: id,
+                                    items,
                                 }));
                             }
                             continue;
@@ -429,34 +647,93 @@ async fn session(
                         let _ = child.start_kill();
                         return Ok(());
                     }
-                    Some(Outgoing::Open { uri, language, text }) => {
-                        let note = jsonrpc::notification(
-                            "textDocument/didOpen",
-                            Some(json!({ "textDocument": {
-                                "uri": uri, "languageId": language, "version": 1, "text": text
-                            }})),
-                        );
-                        let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
-                    }
-                    Some(Outgoing::Change { uri, text, version }) => {
-                        // Whole-buffer sync: simplest correct thing to send.
-                        let note = jsonrpc::notification(
-                            "textDocument/didChange",
-                            Some(json!({ "textDocument": { "uri": uri, "version": version },
-                                          "contentChanges": [{ "text": text }] })),
-                        );
-                        let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
-                    }
-                    Some(Outgoing::Save { uri }) => {
-                        let note = jsonrpc::notification(
-                            "textDocument/didSave",
-                            Some(json!({ "textDocument": { "uri": uri } })),
-                        );
-                        let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
+                    Some(message) => {
+                        // Nothing but `initialized` may follow the `initialize`
+                        // response.  A server that sees `didOpen` first treats it
+                        // as a protocol violation and exits, so hold everything
+                        // until the handshake is done.
+                        if let Some(message) = handshake.accept(message) {
+                            send_outgoing(&stdin, message, &mut pending, &mut synced).await;
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/// Write one queued message to the server.
+///
+/// Shared by the live path and the post-handshake flush so the two cannot drift
+/// apart — a message that is only correct when sent live would be a bug that
+/// shows up exactly once, at startup.
+async fn send_outgoing(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    message: Outgoing,
+    pending: &mut HashMap<i64, String>,
+    synced: &mut HashMap<String, String>,
+) {
+    match message {
+        Outgoing::Open {
+            uri,
+            language,
+            text,
+        } => {
+            let note = jsonrpc::notification(
+                "textDocument/didOpen",
+                Some(json!({ "textDocument": {
+                    "uri": uri, "languageId": language, "version": 1, "text": text
+                }})),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
+            synced.insert(uri, text);
+        }
+        Outgoing::Change { uri, text, version } => {
+            // Whole-buffer sync: simplest correct thing to send.
+            let note = jsonrpc::notification(
+                "textDocument/didChange",
+                Some(json!({ "textDocument": { "uri": uri, "version": version },
+                              "contentChanges": [{ "text": text }] })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
+            synced.insert(uri, text);
+        }
+        Outgoing::Save { uri } => {
+            let note = jsonrpc::notification(
+                "textDocument/didSave",
+                Some(json!({ "textDocument": { "uri": uri } })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
+        }
+        Outgoing::Complete {
+            uri,
+            request,
+            line,
+            character,
+            trigger,
+        } => {
+            // The app's request id doubles as the JSON-RPC id, so the answer can
+            // be matched to the caret that asked for it.  A request that answers
+            // a typed `:` or `.` reports it as a trigger character (kind 2):
+            // servers key member and path lists off that context.
+            pending.insert(request, uri.clone());
+            let context = match trigger {
+                Some(character) => json!({ "triggerKind": 2, "triggerCharacter": character }),
+                None => json!({ "triggerKind": 1 }),
+            };
+            let request_message = jsonrpc::request(
+                request,
+                "textDocument/completion",
+                Some(json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                    "context": context
+                })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
+        }
+        // Shutdown is handled by the caller, which also owns the child.
+        Outgoing::Shutdown => {}
     }
 }
 
@@ -643,5 +920,136 @@ mod tests {
             },
         );
         assert!(server_for("go", &config).is_none());
+    }
+
+    #[test]
+    fn completion_items_decode_from_a_bare_array() {
+        let text = "let value = pri\n";
+        let starts = line_starts(text);
+        let result = json!([
+            { "label": "print", "kind": 3, "detail": "fn(&str)" },
+            { "label": "println", "insertText": "println!" }
+        ]);
+        let items = completion_items(&result, &starts, text.len());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "print");
+        assert_eq!(items[0].kind_label(), "fn");
+        assert_eq!(items[0].detail.as_deref(), Some("fn(&str)"));
+        assert_eq!(
+            items[0].text(),
+            "print",
+            "no insertText falls back to label"
+        );
+        assert_eq!(items[1].text(), "println!", "insertText wins");
+    }
+
+    #[test]
+    fn completion_items_decode_from_a_completion_list() {
+        let text = "value.\n";
+        let starts = line_starts(text);
+        let result = json!({
+            "isIncomplete": false,
+            "items": [{ "label": "len", "kind": 2 }]
+        });
+        let items = completion_items(&result, &starts, text.len());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "len");
+    }
+
+    #[test]
+    fn a_completion_text_edit_becomes_a_byte_span() {
+        let text = "let value = pri\n";
+        let starts = line_starts(text);
+        let result = json!([{
+            "label": "print",
+            "textEdit": {
+                "range": {
+                    "start": { "line": 0, "character": 12 },
+                    "end": { "line": 0, "character": 15 }
+                },
+                "newText": "print"
+            }
+        }]);
+        let items = completion_items(&result, &starts, text.len());
+        let span = items[0].replace.expect("a replace range");
+        assert_eq!(&text[span.start..span.end], "pri");
+    }
+
+    #[test]
+    fn a_text_edit_new_text_wins_over_insert_text() {
+        // The `textEdit` is the server's exact instruction; `insertText` may
+        // disagree (rust-analyzer sends paths and call parens only in one).
+        let text = "use std::\n";
+        let starts = line_starts(text);
+        let result = json!([{
+            "label": "io",
+            "insertText": "io",
+            "textEdit": {
+                "range": {
+                    "start": { "line": 0, "character": 9 },
+                    "end": { "line": 0, "character": 9 }
+                },
+                "newText": "std::io"
+            }
+        }]);
+        let items = completion_items(&result, &starts, text.len());
+        assert_eq!(items[0].text(), "std::io", "the newText is authoritative");
+    }
+
+    #[test]
+    fn a_snippet_format_marks_the_item() {
+        let text = "x\n";
+        let starts = line_starts(text);
+        let result = json!([
+            { "label": "main()", "insertTextFormat": 2, "insertText": "main($0)" },
+            { "label": "plain", "insertTextFormat": 1, "insertText": "plain" }
+        ]);
+        let items = completion_items(&result, &starts, text.len());
+        assert!(items[0].snippet, "insertTextFormat 2 is a snippet");
+        assert!(!items[1].snippet);
+    }
+
+    #[test]
+    fn an_empty_or_error_result_offers_nothing() {
+        let text = "x\n";
+        let starts = line_starts(text);
+        assert!(completion_items(&Value::Null, &starts, text.len()).is_empty());
+        assert!(completion_items(&json!({ "items": [] }), &starts, text.len()).is_empty());
+    }
+
+    fn open(uri: &str) -> Outgoing {
+        Outgoing::Open {
+            uri: uri.to_string(),
+            language: "rust".into(),
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn messages_before_the_handshake_are_held_and_replayed_in_order() {
+        // rust-analyzer exits with "expected initialized notification, got
+        // didOpen" if a document message beats the handshake.  Everything that
+        // arrives early has to wait, and then go out in the order it came.
+        let mut handshake = Handshake::default();
+        assert!(handshake.accept(open("file:///a.rs")).is_none());
+        assert!(handshake.accept(open("file:///b.rs")).is_none());
+
+        let replayed = handshake.complete();
+        assert_eq!(replayed.len(), 2);
+        match (&replayed[0], &replayed[1]) {
+            (Outgoing::Open { uri: first, .. }, Outgoing::Open { uri: second, .. }) => {
+                assert_eq!(first, "file:///a.rs");
+                assert_eq!(second, "file:///b.rs");
+            }
+            other => panic!("expected two opens, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn messages_after_the_handshake_go_straight_out() {
+        let mut handshake = Handshake::default();
+        handshake.complete();
+        assert!(handshake.accept(open("file:///a.rs")).is_some());
+        assert!(handshake.complete().is_empty(), "nothing was held back");
     }
 }

@@ -111,15 +111,18 @@ on-save = true                # format before writing
 # markdown = "!pandoc -f markdown -t markdown"
 
 # ---------------------------------------------------------------------------
-# language servers (scaffolded: diagnostics roll up into the status area)
+# language servers (diagnostics and insert-mode completion)
 # ---------------------------------------------------------------------------
 [lsp]
-# Language server support is a scaffold: initialize handshake, document sync and
-# published diagnostics.  No hover, completion or formatting — that stays
-# external (see [format.command]).
+# Language server support: initialize handshake, document sync, published
+# diagnostics and `textDocument/completion`.  Formatting stays external (see
+# [format.command]).
 # Turning this on also implies well-known servers (rust-analyzer, pylsp, gopls,
 # clangd) when those binaries are installed, which is why it is off by default.
 enable = false
+# Ask the server for completions while typing in insert mode.  The popup opens
+# once typing pauses; Tab/Enter accept, the arrows move, Esc closes it.
+completion = true
 
 # Name a server explicitly to override the implied choice; "" or enable = false
 # turns a language's server off.

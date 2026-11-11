@@ -110,6 +110,7 @@ fn every_repo_file_parses_renders_and_spells() {
                     status: snapshot,
                     command_line: None,
                     picker: None,
+                    completion: None,
                 };
                 ui::draw(frame, &screen);
             })

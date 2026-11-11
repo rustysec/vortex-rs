@@ -43,6 +43,9 @@ const PARSE_IDLE: Duration = Duration::from_millis(120);
 const SPELL_IDLE: Duration = Duration::from_millis(1_500);
 /// Idle time before an auto-format runs.
 const FORMAT_FALLBACK_IDLE: Duration = Duration::from_millis(500);
+/// Idle time before a completion request goes out, so typing a word sends one
+/// request rather than one per character.
+const COMPLETION_IDLE: Duration = Duration::from_millis(90);
 
 /// What the open prompt collects; drives how submission is interpreted.
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +114,14 @@ pub struct App {
     versions: HashMap<BufferId, u64>,
     last_change: HashMap<BufferId, Instant>,
     spell_checked: HashMap<BufferId, u64>,
+    /// The open completion popup, if any.
+    pub completion: Option<crate::completion::Completion>,
+    /// The next completion request id, so a late answer can be matched.
+    next_completion_request: i64,
+    /// The request we are waiting for: `(id, prefix start, buffer)`.
+    completion_pending: Option<(i64, usize, BufferId)>,
+    /// When the next completion request is due, for debouncing keystrokes.
+    completion_due: Option<Instant>,
     last_frame: Rect,
 }
 
@@ -172,6 +183,10 @@ impl App {
             versions: HashMap::new(),
             last_change: HashMap::new(),
             spell_checked: HashMap::new(),
+            completion: None,
+            next_completion_request: 1,
+            completion_pending: None,
+            completion_due: None,
             last_frame: Rect::new(0, 0, 80, 24),
         };
         // Initial background work: parse, and check spelling if enabled.
@@ -286,14 +301,20 @@ impl App {
             self.spawn_format(id);
         }
 
-        // A format request that was waiting for the idle timer.
-        if let Some(due) = self.editor.format_due {
+        // A format request that was waiting for the idle timer.  It runs on the
+        // buffer that was edited, not on whichever buffer is on screen when the
+        // timer expires: formatting the wrong buffer rewrote text the user never
+        // touched and parked its caret somewhere else.
+        if let Some((due_buffer, due)) = self.editor.format_due {
             if now >= due {
                 self.editor.format_due = None;
-                if let Some(id) = self.editor.current_buffer_id() {
-                    self.spawn_format(id);
-                }
+                self.spawn_format(due_buffer);
             }
+        }
+
+        // A completion request that was waiting for the typing to settle.
+        if self.completion_due.is_some() {
+            self.flush_completion();
         }
 
         self.needs_redraw |= wake;
@@ -313,6 +334,8 @@ impl App {
             if previous.is_some_and(|previous| previous != version) {
                 self.last_change.insert(id, now);
                 self.editor.schedule_auto_format(id);
+                // The server has to see the edit before it can answer about it.
+                self.notify_lsp_change(id);
             } else if previous.is_none() {
                 self.versions.insert(id, version);
                 self.last_change.insert(id, now);
@@ -330,11 +353,8 @@ impl App {
 
     fn needs_parse(&self) -> Option<BufferId> {
         self.editor.buffers().iter().find_map(|buffer| {
-            let stale = buffer.syntax.tree_version != buffer.version;
-            let running = buffer.syntax.status == syntax::ParseStatus::Pending;
             (buffer.language.has_tree_sitter()
-                && stale
-                && !running
+                && buffer.syntax.parse_due(buffer.version)
                 && self.idle_long_enough(buffer.id, PARSE_IDLE))
             .then_some(buffer.id)
         })
@@ -414,13 +434,22 @@ impl App {
             self.editor.pending.clear();
             self.editor.leave_insert();
             self.editor.leave_visual();
+            self.completion = None;
             self.needs_redraw = true;
+            return;
+        }
+
+        // The completion popup gets first refusal on Tab/Enter/Esc/arrows; any
+        // other key falls through to the editor so typing narrows the list.
+        if self.completion.is_some() && self.completion_key(key) {
             return;
         }
 
         let area = self.last_frame;
         let intents = self.editor.handle_key(key, &self.keymaps, area);
         self.apply_intents(intents);
+        self.refresh_completion();
+        self.schedule_completion();
         self.needs_redraw = true;
     }
 
@@ -947,6 +976,16 @@ impl App {
                     );
                     return;
                 }
+                // A save under a new name adopts that path: the language server
+                // has never seen the new URI, so it will need an open rather
+                // than only the save below.  Compute this before the write,
+                // which is what rewrites the buffer's path.
+                let renamed = match (&target, self.editor.current_buffer_id()) {
+                    (Some(path), Some(id)) => {
+                        self.editor.buffer(id).and_then(|b| b.path()) != Some(path.as_path())
+                    }
+                    _ => false,
+                };
                 if let Some(id) = self.editor.current_buffer_id() {
                     self.notify_lsp_save(id);
                 }
@@ -956,6 +995,11 @@ impl App {
                 };
                 if let Some(intent) = intent {
                     self.apply_intents(vec![intent]);
+                }
+                if renamed {
+                    if let Some(id) = self.editor.current_buffer_id() {
+                        self.notify_lsp_open(id);
+                    }
                 }
                 // `[format] on-save` formats before the write settles.
                 if self.editor.config.format.on_save && !force {
@@ -1251,7 +1295,7 @@ impl App {
         if !buffer.language.has_tree_sitter() {
             return;
         }
-        if buffer.syntax.status == syntax::ParseStatus::Pending {
+        if buffer.syntax.status.is_pending() {
             return;
         }
         let version = buffer.version;
@@ -1486,6 +1530,287 @@ impl App {
                     .set_diagnostics(id, DiagnosticSource::Lsp, diagnostics);
                 self.needs_redraw = true;
             }
+            LspEvent::Completions {
+                uri,
+                request,
+                items,
+            } => {
+                self.on_completions(uri, request, items);
+            }
+        }
+    }
+
+    // ----------------------------------------------------------- completion
+
+    /// Is completion wanted right now?
+    ///
+    /// It needs the server switch, the completion switch, insert mode (a popup
+    /// while navigating would fight the keymap) and a buffer the server knows.
+    fn completion_enabled(&self) -> bool {
+        self.editor.config.lsp.enable
+            && self.editor.config.lsp.completion
+            && self.editor.mode == Mode::Insert
+    }
+
+    /// Ask the language server for completions at the caret.
+    ///
+    /// Only in insert mode, only for a buffer with a path (the server keys
+    /// documents by URI) and only when a server is configured.  The request is
+    /// debounced: typing a word sends one request once the keys settle, not one
+    /// per character.
+    fn schedule_completion(&mut self) {
+        if !self.completion_enabled() {
+            return;
+        }
+        let Some(id) = self.editor.current_buffer_id() else {
+            return;
+        };
+        let Some(buffer) = self.editor.buffer(id) else {
+            return;
+        };
+        if buffer.path().is_none() {
+            return;
+        }
+        let cursor = self.editor.cursor();
+        if crate::completion::prefix_at(buffer, cursor).is_none() {
+            // Not in a word: close any popup and stop asking.
+            self.completion = None;
+            self.completion_due = None;
+            return;
+        }
+        self.completion_due = Some(Instant::now() + COMPLETION_IDLE);
+    }
+
+    /// Send the debounced request, if one is due.
+    fn flush_completion(&mut self) {
+        let Some(due) = self.completion_due else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        self.completion_due = None;
+        self.request_completion();
+    }
+
+    fn request_completion(&mut self) {
+        if !self.completion_enabled() {
+            return;
+        }
+        let Some(id) = self.editor.current_buffer_id() else {
+            return;
+        };
+        let Some(buffer) = self.editor.buffer(id) else {
+            return;
+        };
+        let Some(path) = buffer.path().map(|path| path.to_path_buf()) else {
+            return;
+        };
+        let cursor = self.editor.cursor();
+        let Some((start, prefix)) = crate::completion::prefix_at(buffer, cursor) else {
+            return;
+        };
+        // A request that lands right after `::` or `.` is a trigger-character
+        // request: that is how path and member lists are properly asked for.
+        let trigger = if prefix.is_empty() {
+            crate::completion::trigger_char(buffer, cursor)
+        } else {
+            None
+        };
+        let language = buffer.language.id.to_string();
+        let Some(spec) = self.server_spec_for(&language) else {
+            return;
+        };
+        let root = search::project_root(Some(&path));
+        let uri = lsp::uri_for(&path);
+        let line = buffer.line_of(cursor);
+        let character = buffer.char_in_line(cursor);
+        let request = self.next_completion_request;
+        self.next_completion_request += 1;
+        let sender = self.events.sender();
+        if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
+            client.complete(uri, request, line, character, trigger);
+            self.completion_pending = Some((request, start, id));
+        }
+    }
+
+    /// A server answered a completion request.
+    fn on_completions(
+        &mut self,
+        uri: String,
+        request: i64,
+        items: Vec<crate::lsp::CompletionItem>,
+    ) {
+        // Only the answer to the request we are waiting for is interesting: a
+        // slower answer for an older caret would pop up under the wrong word.
+        let Some((pending, start, buffer)) = self.completion_pending else {
+            return;
+        };
+        if pending != request {
+            return;
+        }
+        self.completion_pending = None;
+        if self.editor.mode != Mode::Insert || self.editor.current_buffer_id() != Some(buffer) {
+            return;
+        }
+        let Some(path) = self.editor.buffer(buffer).and_then(|b| b.path()) else {
+            return;
+        };
+        if lsp::uri_for(path) != uri {
+            return;
+        }
+        if items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let mut completion = crate::completion::Completion::new(buffer, request, start, items);
+        if let Some(buffer) = self.editor.buffer(buffer) {
+            let cursor = self.editor.cursor();
+            // Filter by the word run at the caret, not everything since the
+            // recorded start: after `use std::io` the filter is `io`, never a
+            // string carrying path separators that would fuzzy-match junk.
+            completion.refilter(&crate::completion::filter_prefix(buffer, cursor));
+        }
+        self.completion = Some(completion);
+        self.needs_redraw = true;
+    }
+
+    /// Handle a key while the completion popup is open.
+    ///
+    /// Returns true when the key was consumed.  `Tab`/`Enter` accept, the arrow
+    /// keys move the highlight, and `Esc` closes the popup without leaving
+    /// insert mode.  Anything else falls through to the editor, which is what
+    /// keeps typing narrowing the list.
+    fn completion_key(&mut self, key: KeyEvent) -> bool {
+        let Some(completion) = self.completion.as_mut() else {
+            return false;
+        };
+        // With nothing to offer, the popup must not eat keys: `Tab` still
+        // indents and `Enter` still opens a line.
+        if !completion.is_visible() {
+            self.completion = None;
+            return false;
+        }
+        match key.code {
+            KeyCode::Tab | KeyCode::Enter => {
+                self.accept_completion();
+                true
+            }
+            KeyCode::Esc => {
+                // Closing the popup must also cancel a request that was still
+                // waiting for the typing to settle, or it would reopen at once.
+                self.completion = None;
+                self.completion_due = None;
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Down => {
+                completion.move_selection(1);
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Up => {
+                completion.move_selection(-1);
+                self.needs_redraw = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Insert the highlighted candidate, replacing the typed prefix.
+    fn accept_completion(&mut self) {
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        // Accepting is a decision: a request still waiting for the typing to
+        // settle must not reopen the popup on top of the inserted text.
+        self.completion_due = None;
+        let Some(item) = completion.selected_item().cloned() else {
+            return;
+        };
+        let Some(id) = self.editor.current_buffer_id() else {
+            return;
+        };
+        if id != completion.buffer {
+            return;
+        }
+        // Read the buffer state before mutating it: where the caret is, where
+        // the word under it starts now, and what follows the caret on the line.
+        let (cursor, word_start, tail) = match self.editor.buffer(id) {
+            Some(buffer) => {
+                let cursor = self.editor.cursor();
+                // The live word start, not `completion.start`: an idle rewrite
+                // (auto-format) can move text between the request and this
+                // keystroke, and a stale offset would leave the typed prefix in
+                // place — the `printprintln` bug.
+                let word_start = crate::completion::prefix_at(buffer, cursor)
+                    .map(|(start, _)| start)
+                    .unwrap_or(completion.start);
+                let line = buffer.line_of(cursor);
+                let tail = buffer.slice(crate::selection::Span::new(cursor, buffer.line_end(line)));
+                (cursor, word_start, tail)
+            }
+            None => return,
+        };
+        // The server may name the exact range to replace, but only trust it
+        // when it ends at the caret and covers everything typed so far: an
+        // empty or short range would insert on top of the prefix instead of
+        // replacing it.  Otherwise the live word is the range.
+        let span = item
+            .replace
+            .filter(|range| range.end == cursor && range.start <= word_start.min(cursor))
+            .unwrap_or_else(|| crate::selection::Span::new(word_start.min(cursor), cursor));
+
+        // Snippet payloads carry tab stops; a macro in front of nothing grows
+        // its call shape with the caret between the quotes.  Both live in
+        // `completion::accepted` so they can be tested without an editor.
+        let expanded = crate::completion::accepted(&item, &tail);
+
+        let intents = self.editor.replace_span(span, &expanded.text);
+        self.apply_intents(intents);
+        self.editor.set_cursor(span.start + expanded.caret);
+        self.needs_redraw = true;
+    }
+
+    /// Keep the popup in step with what has been typed since it opened.
+    fn refresh_completion(&mut self) {
+        let Some(completion) = self.completion.as_mut() else {
+            return;
+        };
+        let Some(id) = self.editor.current_buffer_id() else {
+            self.completion = None;
+            return;
+        };
+        if id != completion.buffer || self.editor.mode != Mode::Insert {
+            self.completion = None;
+            return;
+        }
+        let cursor = self.editor.cursor();
+        let Some(buffer) = self.editor.buffer(id) else {
+            self.completion = None;
+            return;
+        };
+        if cursor < completion.start {
+            self.completion = None;
+            return;
+        }
+        let since_start = buffer.slice(crate::selection::Span::new(completion.start, cursor));
+        // Whitespace means the caret left the word.  A `:` or `.` means it
+        // crossed into a new path segment: the list belongs to the old context
+        // (members of `std` while typing `use std::io::`), so drop it and let
+        // the trigger-character request replace it, rather than fuzzy-matching
+        // separators against candidates that never contained them.
+        if since_start
+            .chars()
+            .any(|c| c.is_whitespace() || c == ':' || c == '.')
+        {
+            self.completion = None;
+            return;
+        }
+        completion.refilter(&crate::completion::filter_prefix(buffer, cursor));
+        if !completion.is_visible() {
+            self.completion = None;
         }
     }
 
@@ -1520,6 +1845,11 @@ impl App {
         self.apply_intents(intents);
         if let Some(id) = self.editor.current_buffer_id() {
             self.spawn_parse(id);
+            // The language server only answers about documents it has been told
+            // exist.  Without this `didOpen`, a file reached through the picker
+            // or a grep hit gets completions from no crate context — global
+            // symbols instead of the module's namespace — and no diagnostics.
+            self.notify_lsp_open(id);
         }
     }
 
@@ -1564,6 +1894,30 @@ impl App {
         let uri = lsp::uri_for(path);
         if let Some(client) = self.clients.get(&root) {
             client.did_save(uri);
+        }
+    }
+
+    /// Tell the server the buffer changed.
+    ///
+    /// Without this the server answers completions and diagnostics against the
+    /// text it was opened with, which is wrong from the first keystroke on.
+    fn notify_lsp_change(&mut self, id: BufferId) {
+        if !self.editor.config.lsp.enable {
+            return;
+        }
+        let (path, text, version) = match self.editor.buffer(id) {
+            Some(buffer) => {
+                let Some(path) = buffer.path() else {
+                    return;
+                };
+                (path.to_path_buf(), buffer.text(), buffer.version as i64)
+            }
+            None => return,
+        };
+        let root = search::project_root(Some(&path));
+        let uri = lsp::uri_for(&path);
+        if let Some(client) = self.clients.get(&root) {
+            client.did_change(uri, text, version);
         }
     }
 
@@ -1647,6 +2001,11 @@ impl App {
                 selected: prompt.selected,
             });
 
+        let completion: Option<ui::CompletionView> = self
+            .completion
+            .as_ref()
+            .map(|completion| ui::CompletionView { completion });
+
         let screen = Screen {
             editor,
             config: &editor.config,
@@ -1654,6 +2013,7 @@ impl App {
             status,
             command_line,
             picker,
+            completion,
         };
 
         let terminal = &mut self.terminal;

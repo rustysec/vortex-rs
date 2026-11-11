@@ -53,12 +53,25 @@ pub enum ParseStatus {
     /// Nothing to do: the tree matches the buffer.
     #[default]
     Current,
-    /// A job is in flight.
+    /// A job is in flight.  Only a job may set this, and every job has to end
+    /// with a result: nothing else will ever parse the buffer again while it
+    /// says `Pending`.
     Pending,
+    /// The tree is behind the buffer and no job is running, so the idle timer
+    /// owes it a parse.
+    Stale,
     /// No grammar for this language.
     Unsupported,
     /// Parsing failed.
     Failed,
+}
+
+impl ParseStatus {
+    /// True while a parse job is in flight, which is the only reason to leave
+    /// a stale buffer alone.
+    pub fn is_pending(self) -> bool {
+        self == Self::Pending
+    }
 }
 
 /// Tree-sitter state belonging to one buffer.
@@ -75,7 +88,7 @@ pub struct SyntaxState {
 impl SyntaxState {
     pub fn invalidate(&mut self) {
         self.tree_version = 0;
-        self.status = ParseStatus::Pending;
+        self.status = ParseStatus::Stale;
     }
 
     pub fn root(&self) -> Option<Node<'_>> {
@@ -87,11 +100,21 @@ impl SyntaxState {
         self.tree.is_some() && self.tree_version == version
     }
 
+    /// True when the buffer has changed since the tree was built and no parse
+    /// is in flight, so the idle timer owes it one.
+    ///
+    /// The two halves belong together: a buffer whose status says `Pending`
+    /// after its job has already reported back is waited on forever, and stops
+    /// being highlighted at all.
+    pub fn parse_due(&self, version: u64) -> bool {
+        self.tree_version != version && !self.status.is_pending()
+    }
+
     /// Clear everything (language changed).
     pub fn clear(&mut self) {
         self.tree = None;
         self.tree_version = 0;
-        self.status = ParseStatus::Pending;
+        self.status = ParseStatus::Stale;
         self.has_errors = false;
     }
 }
@@ -110,6 +133,10 @@ pub fn parse_in_place(buffer: &mut Buffer) -> bool {
     let text = buffer.text();
     let mut parser = Parser::new();
     if parser.set_language(&language).is_err() {
+        // Record the version anyway: the text is known not to parse, so
+        // retrying it every idle tick would buy nothing.  The next edit bumps
+        // the version and the buffer is interesting again.
+        buffer.syntax.tree_version = buffer.version;
         buffer.syntax.status = ParseStatus::Failed;
         return false;
     }
@@ -123,6 +150,7 @@ pub fn parse_in_place(buffer: &mut Buffer) -> bool {
             true
         }
         None => {
+            buffer.syntax.tree_version = buffer.version;
             buffer.syntax.status = ParseStatus::Failed;
             false
         }
@@ -130,6 +158,11 @@ pub fn parse_in_place(buffer: &mut Buffer) -> bool {
 }
 
 /// Run a parse on the blocking pool and report through `tx`.
+///
+/// Every job answers exactly once, with a [`AsyncEvent::Parsed`] whose slot is
+/// empty when the parse did not produce a tree.  A job that went silent would
+/// leave the buffer waiting on a parse that never arrives, and it would never
+/// be highlighted again.
 pub fn spawn_parse(
     tx: EventTx,
     buffer: crate::buffer::BufferId,
@@ -144,6 +177,11 @@ pub fn spawn_parse(
             tx.send_async(AsyncEvent::Failed {
                 what: format!("parse #{}", buffer.0),
                 error: "grammar not available".into(),
+            });
+            tx.send_async(AsyncEvent::Parsed {
+                buffer,
+                version,
+                slot,
             });
             return;
         }
@@ -160,6 +198,11 @@ pub fn spawn_parse(
                 tx.send_async(AsyncEvent::Failed {
                     what: format!("parse #{}", buffer.0),
                     error: "parser could not parse this text".into(),
+                });
+                tx.send_async(AsyncEvent::Parsed {
+                    buffer,
+                    version,
+                    slot,
                 });
             }
         }
@@ -833,6 +876,60 @@ pub fn text_objects(buffer: &Buffer, byte: usize, object: TsObject) -> Vec<(Span
     out
 }
 
+/// Does the grammar say a block opens at `at`?
+///
+/// Used by the indenter for blocks that do not start with a bracket — Python's
+/// `def f():`, Ruby's `do`, …  The caret sits at the end of the header line, so
+/// the block node that contains it starts *after* the caret.  A stale tree is
+/// ignored: guessing from an old parse is worse than the text-only fallback.
+pub fn opens_block_at(buffer: &Buffer, at: usize) -> bool {
+    if !buffer.syntax.is_current(buffer.version) {
+        return false;
+    }
+    let Some(root) = buffer.syntax.root() else {
+        return false;
+    };
+    let Some(node) = node_at_offset(root, at) else {
+        return false;
+    };
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if is_block_kind(node.kind()) && node.start_byte() >= at && node.start_byte() > 0 {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+/// The indentation of the line that opens the block containing `at`.
+///
+/// A closing bracket belongs at the level of the line that opened its block, so
+/// this is what the indenter dedents to.  `None` when the tree is stale or the
+/// caret is not inside a block.
+pub fn block_indent_at(buffer: &Buffer, at: usize) -> Option<String> {
+    if !buffer.syntax.is_current(buffer.version) {
+        return None;
+    }
+    let root = buffer.syntax.root()?;
+    let node = node_at_offset(root, at)?;
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if is_block_kind(node.kind()) {
+            let opener = node.parent().unwrap_or(node);
+            let line = buffer.line_of(opener.start_byte());
+            return Some(buffer.indent_str(line));
+        }
+        current = node.parent();
+    }
+    None
+}
+
+/// Node kinds that represent a block body.
+fn is_block_kind(kind: &str) -> bool {
+    kind.ends_with("block") || kind.contains("statement_block") || kind.ends_with("_body")
+}
+
 /// Smallest named node containing `byte`.
 pub fn node_at_offset<'t>(root: Node<'t>, byte: usize) -> Option<Node<'t>> {
     let mut cursor = root.walk();
@@ -894,6 +991,32 @@ pub fn comment_and_string_spans(buffer: &Buffer, range: Span) -> Vec<Span> {
     let range = range.clamp(buffer.len_bytes());
     collect_spans(root, range, &mut out);
     out
+}
+
+/// Is `at` inside a string literal or a comment?
+///
+/// Used to keep auto-pairing from inserting a partner quote inside a string
+/// that is already open.  A stale tree answers `false`: the text-only fallback
+/// is better than a guess from an old parse.
+pub fn in_string_or_comment(buffer: &Buffer, at: usize) -> bool {
+    if !buffer.syntax.is_current(buffer.version) {
+        return false;
+    }
+    let Some(root) = buffer.syntax.root() else {
+        return false;
+    };
+    let Some(node) = node_at_offset(root, at) else {
+        return false;
+    };
+    let mut current = Some(node);
+    while let Some(node) = current {
+        let kind = node.kind();
+        if kind.contains("comment") || kind.contains("string") {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
 }
 
 fn collect_spans(node: Node<'_>, range: Span, out: &mut Vec<Span>) {

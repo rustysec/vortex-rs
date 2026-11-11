@@ -339,8 +339,11 @@ pub struct Editor {
     last_inserted_word: String,
     next_buffer_id: u32,
     pub pending_jobs: HashMap<(BufferId, JobKind), JobId>,
-    /// Set when a formatter run is waiting for the idle timer.
-    pub format_due: Option<std::time::Instant>,
+    /// A formatter run waiting for the idle timer, and the buffer that armed
+    /// it.  The buffer travels with the deadline: an idle timer armed by typing
+    /// in one buffer must not format whichever buffer happens to be on screen
+    /// when it fires.
+    pub format_due: Option<(BufferId, std::time::Instant)>,
     /// A buffer whose idle format is on hold because insert mode is open in it:
     /// an automatic reformat must never rewrite text under the user's hands.
     pub format_held: Option<BufferId>,
@@ -731,7 +734,7 @@ impl Editor {
                 if self.mode == Mode::Insert {
                     if let Some(text) = insertable(key) {
                         self.pending.clear_keys();
-                        self.insert_text(&text);
+                        self.insert_typed(&text);
                         return vec![Intent::EnsureVisible];
                     }
                 }
@@ -1838,6 +1841,8 @@ impl Editor {
             hole = Some((indent, region.linewise));
         }
 
+        let expand_tab = self.config.editor.expand_tab;
+        let tab_width = self.tab_width();
         let plan = self.current_buffer().map(|buffer| {
             let line = buffer.line_of(self.cursor());
             // A linewise delete took its line ending with it, so the block's
@@ -1845,7 +1850,10 @@ impl Editor {
             // leaves the cursor inside the line it came from.
             let (indent, above) = match &hole {
                 Some((indent, true)) => (indent.clone(), true),
-                _ => (buffer.indent_str(line), !below),
+                _ => (
+                    crate::indent::opened_line_indent(buffer, line, below, expand_tab, tab_width),
+                    !below,
+                ),
             };
             let (at, text, caret) = if buffer.len_bytes() == 0 {
                 // Nothing to split: the buffer already is the empty line.
@@ -1919,18 +1927,83 @@ impl Editor {
         }
     }
 
+    /// Insert one typed character, with the syntax-aware extras that only make
+    /// sense while typing: a closing bracket typed alone on its line dedents to
+    /// the block it closes, an opening bracket or quote inserts its partner with
+    /// the caret between the two, and typing the closing half of a pair steps
+    /// over the partner instead of doubling it.
+    fn insert_typed(&mut self, text: &str) {
+        let mut chars = text.chars();
+        let (Some(character), None) = (chars.next(), chars.next()) else {
+            self.insert_text(text);
+            return;
+        };
+        let cursor = self.cursor();
+        // Typing the closing half of a pair that is already there steps over it.
+        // Without this, `(` inserting `()` and then `)` would leave `())`.
+        if self.config.editor.auto_match_pairs
+            && is_closing(character)
+            && self
+                .current_buffer()
+                .and_then(|buffer| buffer.char_at(cursor))
+                == Some(character)
+        {
+            self.set_cursor(cursor + character.len_utf8());
+            return;
+        }
+        if self.config.editor.auto_indent
+            && let Some(indent) = self
+                .current_buffer()
+                .and_then(|buffer| crate::indent::dedent_for_close(buffer, cursor, character))
+        {
+            // Replace the whitespace before the caret with the block's own
+            // indentation, then type the bracket at that column.
+            let line_start = self
+                .current_buffer()
+                .map(|buffer| buffer.line_start(buffer.line_of(cursor)))
+                .unwrap_or(cursor);
+            self.apply(
+                vec![Change::replace(Span::new(line_start, cursor), indent)],
+                ChangeGroup::Insert,
+            );
+        }
+        if self.config.editor.auto_match_pairs
+            && let Some(close) = matching_pair(self.current_buffer(), cursor, character)
+        {
+            let cursor = self.cursor();
+            self.insert_text(&format!("{character}{close}"));
+            self.set_cursor(cursor + character.len_utf8());
+            return;
+        }
+        self.insert_text(text);
+    }
+
     fn insert_newline(&mut self) {
-        let indent = self
-            .current_buffer()
-            .map(|buffer| {
-                if self.config.editor.auto_indent {
-                    buffer.indent_str(buffer.line_of(self.cursor()))
-                } else {
-                    String::new()
+        // Syntax-aware: a line that opens a block indents the next one, and a
+        // closing bracket that was already there keeps its own line.
+        let plan = self.current_buffer().map(|buffer| {
+            if self.config.editor.auto_indent {
+                crate::indent::newline(
+                    buffer,
+                    self.cursor(),
+                    self.config.editor.expand_tab,
+                    self.tab_width(),
+                )
+            } else {
+                crate::indent::Newline {
+                    text: "\n".to_string(),
+                    caret: 1,
                 }
-            })
-            .unwrap_or_default();
-        self.insert_text(&format!("\n{indent}"));
+            }
+        });
+        let Some(plan) = plan else { return };
+        let start = self.cursor();
+        self.insert_text(&plan.text);
+        // `insert_text` parks the caret after everything it inserted; a split
+        // brace wants it between the two lines instead.
+        if plan.caret != plan.text.len() {
+            self.set_cursor(start + plan.caret);
+        }
     }
 
     fn insert_tab(&mut self) {
@@ -2675,7 +2748,10 @@ impl Editor {
     /// Adopt a tree handed back by the parser task.
     ///
     /// Returns false when the result is stale, which is normal: it means the
-    /// buffer changed while the parse was running.
+    /// buffer changed while the parse was running.  Either way the job is over,
+    /// so the status has to stop saying `Pending` — otherwise the buffer waits
+    /// on a parse that is already finished and highlighting freezes for the rest
+    /// of the session.
     pub fn adopt_tree(
         &mut self,
         id: BufferId,
@@ -2686,6 +2762,10 @@ impl Editor {
             return false;
         };
         if buffer.version != version {
+            // The tree describes text that no longer exists, so it cannot be
+            // painted onto this one.  Keep drawing with the previous tree and
+            // let the idle timer re-parse.
+            buffer.syntax.status = crate::syntax::ParseStatus::Stale;
             return false;
         }
         match slot.take() {
@@ -2698,13 +2778,17 @@ impl Editor {
                 true
             }
             None => {
+                // The job reported back with nothing: this text does not parse.
+                // Pin the version so the idle timer does not retry it every
+                // tick; the next edit makes it interesting again.
+                buffer.syntax.tree_version = version;
                 buffer.syntax.status = crate::syntax::ParseStatus::Failed;
                 false
             }
         }
     }
 
-    /// Apply formatter output, keeping the cursor at the same line and column.
+    /// Apply formatter output, keeping each pane's caret on the text it was on.
     pub fn apply_format(&mut self, id: BufferId, text: &str) -> Result<bool, String> {
         let current = self
             .buffer(id)
@@ -2713,17 +2797,6 @@ impl Editor {
         if current == text {
             return Ok(false);
         }
-        let anchor = self
-            .layout
-            .panes_showing(id)
-            .first()
-            .and_then(|pane| self.layout.pane(*pane))
-            .map(|pane| pane.selection.cursor())
-            .unwrap_or(0);
-        let position = {
-            let buffer = self.buffer(id).expect("checked above");
-            crate::format::position_of(&buffer.rope, anchor)
-        };
         let changes = {
             let buffer = self.buffer(id).expect("checked above");
             crate::format::diff_changes(&buffer.rope, text)
@@ -2744,9 +2817,24 @@ impl Editor {
         };
         // One buffer edit, not one per pane: applying per pane would rewrite
         // the text again for every pane showing the buffer, duplicating the
-        // replacement's tail.  Every pane's caret is parked on the restored
-        // position below anyway.
+        // replacement's tail.  Each pane then maps *its own* caret through the
+        // edits it started from — taking the caret from whichever pane happens
+        // to be first would move the focused pane's caret to where an unfocused
+        // one was, and collapsing every selection to a point would throw away
+        // visual selections and extra cursors.
         let panes = self.layout.panes_showing(id);
+        let before: Vec<(PaneId, Selection, (usize, usize))> = {
+            let buffer = self.buffer(id).expect("checked above");
+            panes
+                .iter()
+                .filter_map(|pane_id| self.layout.pane(*pane_id))
+                .map(|pane| {
+                    let selection = pane.selection.clone();
+                    let position = crate::format::position_of(&buffer.rope, selection.cursor());
+                    (pane.id, selection, position)
+                })
+                .collect()
+        };
         let mut selection = panes
             .iter()
             .find(|pane_id| self.layout.is_focused(**pane_id))
@@ -2754,17 +2842,33 @@ impl Editor {
             .and_then(|pane_id| self.layout.pane(*pane_id))
             .map(|pane| pane.selection.clone())
             .unwrap_or_else(|| Selection::point(0));
-        {
+        let edits = {
             let buffer = self.buffer_mut(id).expect("checked above");
-            buffer.apply(changes, group, &mut selection);
-        }
-        let restored = {
-            let buffer = self.buffer(id).expect("checked above");
-            crate::format::byte_at_position(&buffer.rope, position)
+            buffer.apply(changes, group, &mut selection)
         };
-        for pane_id in &panes {
-            if let Some(pane) = self.layout.pane_mut(*pane_id) {
-                pane.selection = Selection::point(restored);
+        let restored: Vec<(PaneId, Selection)> = {
+            let buffer = self.buffer(id).expect("applied above");
+            before
+                .iter()
+                .map(|(pane_id, selection, position)| {
+                    (
+                        *pane_id,
+                        crate::format::selection_after_rewrite(
+                            *position,
+                            &buffer.rope,
+                            &edits,
+                            selection,
+                        ),
+                    )
+                })
+                .collect()
+        };
+        for (pane_id, selection) in restored {
+            if let Some(pane) = self.layout.pane_mut(pane_id) {
+                pane.selection = selection;
+                // The caret may be on a different line now, so a column remembered
+                // from before the rewrite would walk the next `j`/`k` sideways.
+                pane.view.wanted_col = None;
             }
         }
         if let Some(buffer) = self.buffer_mut(id) {
@@ -2902,8 +3006,10 @@ impl Editor {
         if crate::format::formatter_for(language, &self.config).is_none() {
             return;
         }
-        self.format_due =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(delay.as_millis()));
+        self.format_due = Some((
+            id,
+            std::time::Instant::now() + std::time::Duration::from_millis(delay.as_millis()),
+        ));
     }
 
     /// Background job bookkeeping.
@@ -3067,6 +3173,41 @@ pub fn split_mode_label(mode: SplitMode) -> &'static str {
 /// mean "this is a command, not text".
 fn insertable(key: KeyEvent) -> Option<String> {
     keys::typed_char(key).map(|c| c.to_string())
+}
+
+/// The closing partner of an opening bracket or quote, when inserting one is
+/// wanted at `cursor`.
+///
+/// A quote only pairs when it is not already inside a string or a comment: the
+/// grammar knows, and the text-only fallback stays quiet rather than guessing.
+fn matching_pair(buffer: Option<&Buffer>, cursor: usize, open: char) -> Option<char> {
+    let close = match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '"' => '"',
+        '\'' => '\'',
+        '`' => '`',
+        _ => return None,
+    };
+    if matches!(open, '"' | '\'' | '`') {
+        // A quote in the middle of a word is an apostrophe, not a string.
+        let buffer = buffer?;
+        if let Some((_, before)) = buffer.char_before(cursor)
+            && (before.is_alphanumeric() || before == '_')
+        {
+            return None;
+        }
+        if crate::syntax::in_string_or_comment(buffer, cursor) {
+            return None;
+        }
+    }
+    Some(close)
+}
+
+/// Is `character` the closing half of a bracket pair?
+fn is_closing(character: char) -> bool {
+    matches!(character, ')' | ']' | '}')
 }
 
 // --------------------------------------------------------------------- facades
@@ -3304,6 +3445,66 @@ mod tests {
     }
 
     #[test]
+    fn enter_after_an_opening_brace_indents_the_new_line() {
+        let mut fixture = Fixture::new("fn main() {}\n");
+        fixture.feed("f{");
+        fixture.feed("a");
+        fixture.feed("enter");
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\n    \n}\n",
+            "the new line is indented and the brace keeps its own line"
+        );
+        assert_eq!(caret_at(&fixture), (1, 4), "the caret is between them");
+    }
+
+    #[test]
+    fn a_closing_brace_typed_alone_dedents_to_the_block() {
+        // The caret sits at the end of an over-indented blank line inside the
+        // block; typing `}` should line it up with the block, not with the
+        // stray indentation.
+        let mut fixture = Fixture::new("fn main() {\n    let a = 1;\n        ");
+        fixture.feed("jjA");
+        fixture.feed("}");
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\n    let a = 1;\n}",
+            "the brace lines up with the block, not with the stray indentation"
+        );
+    }
+
+    #[test]
+    fn an_opening_bracket_inserts_its_partner() {
+        let mut fixture = Fixture::new("\n");
+        fixture.feed("i");
+        fixture.feed("(");
+        assert_eq!(fixture.text(), "()\n");
+        assert_eq!(fixture.cursor(), 1, "the caret sits between the pair");
+        // Typing the closing half steps over the partner instead of doubling it.
+        fixture.feed(")");
+        assert_eq!(fixture.text(), "()\n");
+        assert_eq!(fixture.cursor(), 2);
+    }
+
+    #[test]
+    fn a_quote_inside_a_word_is_not_paired() {
+        // `don't` must not become `don''t`.
+        let mut fixture = Fixture::new("\n");
+        fixture.feed("idon");
+        fixture.feed("'");
+        assert_eq!(fixture.text(), "don'\n");
+    }
+
+    #[test]
+    fn auto_pairs_can_be_turned_off() {
+        let mut config = Config::default();
+        config.editor.auto_match_pairs = false;
+        let mut fixture = Fixture::with_config("\n", config);
+        fixture.feed("i(");
+        assert_eq!(fixture.text(), "(\n");
+    }
+
+    #[test]
     fn escape_returns_to_normal_mode() {
         let mut fixture = Fixture::new("one\n");
         fixture.feed("iabc");
@@ -3464,6 +3665,51 @@ mod tests {
     }
 
     #[test]
+    fn o_on_a_line_that_opens_a_block_indents_inside_it() {
+        // `o` on `fn main() {` must land inside the block, not at column 0.
+        let mut fixture = Fixture::new("fn main() {\n}\n");
+        fixture.feed("o");
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\n    \n}\n",
+            "the opened line is indented one level"
+        );
+        assert_eq!(caret_at(&fixture), (1, 4));
+    }
+
+    #[test]
+    fn o_on_a_nested_block_indents_one_level_deeper() {
+        let mut fixture = Fixture::new("fn main() {\n    if x {\n    }\n}\n");
+        fixture.feed("jo");
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\n    if x {\n        \n    }\n}\n"
+        );
+        assert_eq!(caret_at(&fixture), (2, 8));
+    }
+
+    #[test]
+    fn capital_o_on_a_block_opener_stays_outside_the_block() {
+        // `O` opens the line *above*, which is outside the block the line
+        // opens, so it keeps the line's own indentation.
+        let mut fixture = Fixture::new("fn main() {\n}\n");
+        fixture.feed("O");
+        assert_eq!(fixture.text(), "\nfn main() {\n}\n");
+        assert_eq!(caret_at(&fixture), (0, 0));
+    }
+
+    #[test]
+    fn o_on_a_plain_line_keeps_its_indentation() {
+        let mut fixture = Fixture::new("fn main() {\n    let a = 1;\n}\n");
+        fixture.feed("jo");
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\n    let a = 1;\n    \n}\n",
+            "a line that opens nothing does not indent further"
+        );
+    }
+
+    #[test]
     fn o_in_visual_mode_swaps_ends_and_never_opens_a_line() {
         // Visual `o` is vim's swap of the cursor and the far end of the
         // selection.  The open-a-line form of `o` reaching a selection is what
@@ -3597,6 +3843,113 @@ mod tests {
     }
 
     #[test]
+    fn a_format_keeps_the_caret_on_the_text_it_was_on() {
+        // The formatter grew the block above the caret.  Restoring the caret by
+        // the line number it happened to be on left it on whatever line moved up
+        // into its place, which is the "cursor resets at random" jump.
+        let mut fixture = Fixture::new("fn main() {\nlet a=1;\n}\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.feed("G");
+        let text = fixture.text();
+        let before = fixture.cursor();
+        assert_eq!(
+            &text[before..before + 1],
+            "}",
+            "the caret starts on the closing brace"
+        );
+
+        fixture
+            .editor
+            .apply_format(id, "fn main() {\n    let a = 1;\n    let b = 2;\n}\n")
+            .expect("the formatter output applies");
+
+        let text = fixture.text();
+        let after = fixture.cursor();
+        assert_eq!(
+            &text[after..after + 1],
+            "}",
+            "still the closing brace, not the line that slid up under it"
+        );
+        assert_eq!(caret_at(&fixture), (3, 0));
+    }
+
+    #[test]
+    fn a_format_keeps_each_panes_own_caret() {
+        // Two panes on one buffer: the caret that gets restored was the one in
+        // the pane being edited.  Taking it from whichever pane the layout lists
+        // first teleported the focused pane's caret to the other pane's place.
+        let mut fixture = Fixture::new("fn main() {\nlet a=1;\n}\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.editor.run_cmd(Cmd::SplitHorizontal, fixture.area);
+        let panes = fixture.editor.layout.panes_showing(id);
+        assert_eq!(panes.len(), 2);
+        let focused = fixture.editor.layout.focused().expect("a focused pane");
+        let other = panes
+            .iter()
+            .copied()
+            .find(|pane| *pane != focused)
+            .expect("2 panes");
+
+        fixture.feed("G");
+        let text = fixture.text();
+        let on_brace = fixture.cursor();
+        assert_eq!(&text[on_brace..on_brace + 1], "}");
+        if let Some(pane) = fixture.editor.layout.pane_mut(other) {
+            pane.selection = Selection::point(0);
+        }
+
+        fixture
+            .editor
+            .apply_format(id, "fn main() {\n    let a = 1;\n    let b = 2;\n}\n")
+            .expect("the formatter output applies");
+
+        let text = fixture.text();
+        assert_eq!(
+            &text[fixture.cursor()..fixture.cursor() + 1],
+            "}",
+            "the focused pane followed its own caret, not the other one's"
+        );
+        assert_ne!(
+            fixture.cursor(),
+            0,
+            "it did not land where the other pane was"
+        );
+        assert_ne!(fixture.cursor(), on_brace, "and it travelled with the text");
+        assert_eq!(
+            fixture
+                .editor
+                .layout
+                .pane(other)
+                .expect("the other pane")
+                .selection
+                .cursor(),
+            0,
+            "the unfocused pane keeps its own caret"
+        );
+    }
+
+    #[test]
+    fn the_idle_format_names_the_buffer_that_armed_it() {
+        // The timer outlives a buffer switch: it formats the buffer that was
+        // edited, not whichever one is on screen when it fires.
+        let mut fixture = Fixture::new("fn main() {\nlet a=1;\n}\n");
+        as_rust(&mut fixture);
+        let edited = fixture.editor.current_buffer_id().expect("a buffer");
+        let other = fixture.editor.new_scratch();
+        fixture.editor.show_in_pane(other, None);
+        assert_eq!(fixture.editor.current_buffer_id(), Some(other));
+
+        fixture.editor.schedule_auto_format(edited);
+        assert_eq!(
+            fixture.editor.format_due.map(|(buffer, _)| buffer),
+            Some(edited),
+            "the deadline belongs to the buffer that was edited"
+        );
+    }
+
+    #[test]
     fn yank_and_paste_round_trip() {
         // `yy` is linewise, so `p` drops the copy on the next line.
         let mut fixture = Fixture::new("copy me\n");
@@ -3608,5 +3961,154 @@ mod tests {
         let mut fixture = Fixture::new("copy me\n");
         fixture.feed("ggyllp");
         assert_eq!(fixture.text(), "cocpy me\n");
+    }
+
+    // ------------------------------------------------------------- highlighting
+
+    /// A slot holding a tree for `text`, the way the blocking parse task hands
+    /// one over.
+    fn slot_for(text: &str) -> crate::syntax::TreeSlot {
+        let language = crate::lang::by_id("rust")
+            .and_then(|lang| lang.grammar())
+            .expect("the Rust grammar is bundled");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("Rust grammar loads");
+        let slot = crate::syntax::TreeSlot::new();
+        slot.store(
+            parser
+                .parse(text, None)
+                .expect("the Rust grammar parses this text"),
+        );
+        slot
+    }
+
+    /// Type a literal string, one key at a time, in whatever mode is current.
+    fn type_text(fixture: &mut Fixture, text: &str) {
+        for ch in text.chars() {
+            let mut buf = [0u8; 4];
+            let token = match ch {
+                ' ' => "space".to_string(),
+                other => other.encode_utf8(&mut buf).to_string(),
+            };
+            fixture.feed(&token);
+        }
+    }
+
+    /// Say a parse job is in flight for `id`, the way `App::spawn_parse` does
+    /// before it hands the text to the blocking pool.
+    fn start_parse_job(editor: &mut Editor, id: BufferId) {
+        editor.buffer_mut(id).unwrap().syntax.status = crate::syntax::ParseStatus::Pending;
+    }
+
+    #[test]
+    fn a_stale_parse_result_leaves_the_buffer_parseable() {
+        // Typing while a parse runs makes its result stale.  Dropping that
+        // result used to leave the buffer still saying a parse was in flight,
+        // so nothing ever parsed it again: highlighting froze from that
+        // keystroke on for the rest of the session.
+        let mut fixture = Fixture::new("fn a() {}\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.editor.buffer_mut(id).unwrap().reparse_now();
+
+        // The job starts on the text as it stands, then the user types.
+        start_parse_job(&mut fixture.editor, id);
+        let stale_version = fixture.editor.buffer(id).unwrap().version;
+        let slot = slot_for("fn a() {}\n");
+        fixture.feed("o");
+        type_text(&mut fixture, "// a note");
+        fixture.feed("esc");
+        let version = fixture.editor.buffer(id).unwrap().version;
+        assert_ne!(version, stale_version, "typing bumped the version");
+
+        assert!(
+            !fixture.editor.adopt_tree(id, stale_version, slot),
+            "the result for the older text is dropped"
+        );
+        let buffer = fixture.editor.buffer(id).unwrap();
+        assert!(
+            buffer.syntax.parse_due(version),
+            "the job is over, so the idle timer has to owe this buffer a parse: {:?}",
+            buffer.syntax
+        );
+
+        // The next parse lands, and the text typed since the dropped result is
+        // highlighted with it.
+        let typed = fixture.editor.buffer(id).unwrap().text();
+        let slot = slot_for(&typed);
+        assert!(
+            fixture.editor.adopt_tree(id, version, slot),
+            "a result for the current version is adopted"
+        );
+        let buffer = fixture.editor.buffer(id).unwrap();
+        assert!(
+            buffer.syntax.is_current(version),
+            "{:?}",
+            buffer.syntax.status
+        );
+        assert!(!buffer.syntax.parse_due(version), "nothing left to do");
+        let groups = crate::syntax::highlights(
+            buffer,
+            crate::selection::Span::new(0, buffer.len_bytes()),
+            buffer.language.id,
+        );
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.hl == crate::syntax::Hl::Comment
+                    && typed[group.span.start..group.span.end].contains("a note")),
+            "the typed comment should be highlighted: {groups:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_parse_waits_for_an_edit_instead_of_retrying_forever() {
+        // A job that comes back with no tree has still finished: the buffer
+        // must not stay `Pending`, and it must not be re-parsed on every idle
+        // tick either — only the next edit makes the text interesting again.
+        let mut fixture = Fixture::new("fn a() {}\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.editor.buffer_mut(id).unwrap().reparse_now();
+        start_parse_job(&mut fixture.editor, id);
+        let version = fixture.editor.buffer(id).unwrap().version;
+
+        assert!(
+            !fixture
+                .editor
+                .adopt_tree(id, version, crate::syntax::TreeSlot::new()),
+            "an empty slot is not a tree"
+        );
+        let buffer = fixture.editor.buffer(id).unwrap();
+        assert_eq!(buffer.syntax.status, crate::syntax::ParseStatus::Failed);
+        assert!(
+            !buffer.syntax.parse_due(version),
+            "this version is known not to parse; retrying it every tick buys nothing"
+        );
+
+        fixture.feed("ix");
+        let buffer = fixture.editor.buffer(id).unwrap();
+        assert!(
+            buffer.syntax.parse_due(buffer.version),
+            "the edit makes the buffer worth another parse"
+        );
+    }
+
+    #[test]
+    fn invalidating_a_tree_asks_for_a_parse_without_waiting_on_one() {
+        // `:edit` and `:source` invalidate the tree and then ask for a parse.
+        // A status that read "a job is already running" turned that request
+        // into a no-op, and the buffer kept its stale colours for good.
+        let mut fixture = Fixture::new("fn a() {}\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.editor.buffer_mut(id).unwrap().reparse_now();
+        fixture.editor.buffer_mut(id).unwrap().syntax.invalidate();
+        let buffer = fixture.editor.buffer(id).unwrap();
+        assert!(
+            buffer.syntax.parse_due(buffer.version),
+            "invalidating is a request for a parse, not a job in flight: {:?}",
+            buffer.syntax.status
+        );
     }
 }
