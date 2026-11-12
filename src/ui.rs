@@ -282,7 +282,7 @@ fn draw_pane(
         return None;
     }
 
-    let tab_width = config.editor.tab_width.max(1) as usize;
+    let tab_width = config.editor.tab_width_for(buffer.language.id);
     let line_count = buffer.display_line_count();
     let scroll = pane.view.scroll_line.min(line_count.saturating_sub(1));
     let cursor = pane.cursor();
@@ -1071,7 +1071,7 @@ pub fn byte_at(
     {
         return None;
     }
-    let tab_width = config.editor.tab_width.max(1) as usize;
+    let tab_width = config.editor.tab_width_for(buffer.language.id);
     let line_count = buffer.display_line_count();
     let scroll = view.scroll_line.min(line_count.saturating_sub(1));
     let cursor_line = buffer.line_of(selection.cursor());

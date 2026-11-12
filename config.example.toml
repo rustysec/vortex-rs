@@ -30,6 +30,15 @@ diagnostic-signs = true       # mark flagged lines in the gutter (● error, ▲
 inline-diagnostics = false    # draw the message dimmed at the end of its line
 diagnostic-float = true       # show the full message when the caret rests on one
 
+# Per-language indentation, overriding the two settings above.  Only the keys
+# given are overridden, so a language can change just the width or just the
+# character.  Keys are language ids, as used by [format.command] and [lsp.servers].
+# [editor.indent.go]
+# tab-width = 4
+# expand-tab = false          # Go indents with tabs
+# [editor.indent.yaml]
+# tab-width = 2
+
 # ---------------------------------------------------------------------------
 # status area
 # ---------------------------------------------------------------------------

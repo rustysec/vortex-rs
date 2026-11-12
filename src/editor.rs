@@ -1153,7 +1153,7 @@ impl Editor {
         };
         let text = region.text(buffer);
         let tab_width = self.tab_width();
-        let expand_tab = self.config.editor.expand_tab;
+        let expand_tab = self.expand_tab();
         let comment_token = {
             let token = buffer.language.line_comment;
             if token.is_empty() { "//" } else { token }
@@ -1466,7 +1466,7 @@ impl Editor {
                         &region,
                         1,
                         1,
-                        self.config.editor.expand_tab,
+                        self.expand_tab(),
                         self.tab_width(),
                     )
                 });
@@ -1843,7 +1843,7 @@ impl Editor {
             hole = Some((indent, region.linewise));
         }
 
-        let expand_tab = self.config.editor.expand_tab;
+        let expand_tab = self.expand_tab();
         let tab_width = self.tab_width();
         let plan = self.current_buffer().map(|buffer| {
             let line = buffer.line_of(self.cursor());
@@ -1988,7 +1988,7 @@ impl Editor {
                 crate::indent::newline(
                     buffer,
                     self.cursor(),
-                    self.config.editor.expand_tab,
+                    self.expand_tab(),
                     self.tab_width(),
                 )
             } else {
@@ -2009,7 +2009,7 @@ impl Editor {
     }
 
     fn insert_tab(&mut self) {
-        let unit = if self.config.editor.expand_tab {
+        let unit = if self.expand_tab() {
             " ".repeat(self.tab_width())
         } else {
             "\t".to_string()
@@ -2063,7 +2063,7 @@ impl Editor {
             .current_buffer()
             .map(|buffer| {
                 let cursor = self.cursor();
-                let start = if self.config.editor.expand_tab {
+                let start = if self.expand_tab() {
                     // Delete a run of spaces one indent unit at a time.
                     let line_start = buffer.line_start(buffer.line_of(cursor));
                     let text = buffer.slice(Span::new(line_start, cursor));
@@ -2467,8 +2467,21 @@ impl Editor {
         }
     }
 
+    /// Indentation width for the focused buffer, honouring `[editor.indent.*]`.
     pub fn tab_width(&self) -> usize {
-        self.config.editor.tab_width.max(1) as usize
+        match self.current_buffer() {
+            Some(buffer) => self.config.editor.tab_width_for(buffer.language.id),
+            None => self.config.editor.tab_width.max(1) as usize,
+        }
+    }
+
+    /// Whether the focused buffer indents with spaces, honouring
+    /// `[editor.indent.*]`.
+    pub fn expand_tab(&self) -> bool {
+        match self.current_buffer() {
+            Some(buffer) => self.config.editor.expand_tab_for(buffer.language.id),
+            None => self.config.editor.expand_tab,
+        }
     }
 
     // ------------------------------------------------------------- search
@@ -3310,6 +3323,12 @@ impl Editor {
     }
 
     /// Insert pasted text as a single undo step.
+    ///
+    /// A block pasted at the start of an indented line is shifted to that
+    /// line's depth, so code copied from column 0 lands inside the function it
+    /// is pasted into instead of at the left margin.  Pasting mid-line is left
+    /// alone: there is no block to align, and adding indentation there would
+    /// corrupt the line.
     pub fn paste_text(&mut self, text: &str) -> Vec<Intent> {
         if text.is_empty() {
             return Vec::new();
@@ -3317,8 +3336,29 @@ impl Editor {
         if self.mode != Mode::Insert {
             self.enter_insert();
         }
-        self.insert_text(text);
+        let text = self.reindent_for_paste(text);
+        self.insert_text(&text);
         vec![Intent::EnsureVisible]
+    }
+
+    /// Shift `text` to the caret line's indentation, when that makes sense.
+    fn reindent_for_paste(&self, text: &str) -> String {
+        if !self.config.editor.auto_indent {
+            return text.to_string();
+        }
+        let Some(buffer) = self.current_buffer() else {
+            return text.to_string();
+        };
+        let cursor = self.cursor();
+        let line = buffer.line_of(cursor);
+        let line_start = buffer.line_start(line);
+        // Only at the start of a line: mid-line pastes have no block to align.
+        let before = buffer.slice(Span::new(line_start, cursor));
+        if !before.chars().all(|c| c == ' ' || c == '\t') {
+            return text.to_string();
+        }
+        let target = buffer.indent_str(line);
+        crate::indent::reindent_paste(text, &target)
     }
 
     /// Every buffer, for `:buffers` and the picker.
@@ -4086,6 +4126,31 @@ mod tests {
         let mut fixture = Fixture::new("copy me\n");
         fixture.feed("ggyllp");
         assert_eq!(fixture.text(), "cocpy me\n");
+    }
+
+    #[test]
+    fn a_paste_at_the_start_of_an_indented_line_takes_that_indentation() {
+        // The caret sits at the start of an indented line inside a block; a
+        // block copied from column 0 lands at the block's depth.  The pasted
+        // text ends with a newline, so the caret line's own newline survives as
+        // a blank line — the same as pasting in vim.
+        let mut fixture = Fixture::new("fn main() {\n    \n}\n");
+        fixture.feed("jA");
+        fixture.editor.paste_text("let a = 1;\nif a {\n    b();\n}\n");
+        assert_eq!(
+            fixture.text(),
+            "fn main() {\n    let a = 1;\n    if a {\n        b();\n    }\n\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_paste_mid_line_is_not_reindented() {
+        // There is no block to align, and adding indentation would corrupt the
+        // line the caret is in.
+        let mut fixture = Fixture::new("    let a = 1;\n");
+        fixture.feed("A");
+        fixture.editor.paste_text(" + 2");
+        assert_eq!(fixture.text(), "    let a = 1; + 2\n");
     }
 
     // ------------------------------------------------------------- highlighting

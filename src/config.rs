@@ -214,6 +214,21 @@ pub struct EditorConfig {
     pub inline_diagnostics: bool,
     /// Show the full diagnostic message in a card when the caret rests on one.
     pub diagnostic_float: bool,
+    /// Per-language indentation overrides, keyed by language id:
+    /// `[editor.indent.go] tab-width = 4`, `expand-tab = false`.
+    #[serde(default)]
+    pub indent: BTreeMap<String, IndentOverride>,
+}
+
+/// Indentation settings for one language, overriding the global ones.
+///
+/// Both fields are optional so a language can change only the width (YAML wants
+/// 2) or only the character (Go wants tabs) without restating the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct IndentOverride {
+    pub tab_width: Option<u16>,
+    pub expand_tab: Option<bool>,
 }
 
 impl Default for EditorConfig {
@@ -236,7 +251,27 @@ impl Default for EditorConfig {
             diagnostic_signs: true,
             inline_diagnostics: false,
             diagnostic_float: true,
+            indent: BTreeMap::new(),
         }
+    }
+}
+
+impl EditorConfig {
+    /// The indentation width for `language`, honouring a per-language override.
+    pub fn tab_width_for(&self, language: &str) -> usize {
+        self.indent
+            .get(language)
+            .and_then(|entry| entry.tab_width)
+            .unwrap_or(self.tab_width)
+            .max(1) as usize
+    }
+
+    /// Whether `language` indents with spaces, honouring a per-language override.
+    pub fn expand_tab_for(&self, language: &str) -> bool {
+        self.indent
+            .get(language)
+            .and_then(|entry| entry.expand_tab)
+            .unwrap_or(self.expand_tab)
     }
 }
 
@@ -977,9 +1012,12 @@ fn check_keys(table: &toml::Table, template: &toml::Value, path: &str, out: &mut
 
 /// Maps whose keys are user data (mode names, languages, colour names).
 fn is_free_form(path: &str) -> bool {
-    matches!(path, "keymap" | "format.command" | "lsp.servers")
-        || path.starts_with("keymap.")
+    matches!(
+        path,
+        "keymap" | "format.command" | "lsp.servers" | "editor.indent"
+    ) || path.starts_with("keymap.")
         || path.starts_with("lsp.servers.")
+        || path.starts_with("editor.indent.")
 }
 
 impl Config {
@@ -1157,5 +1195,33 @@ mod tests {
                 .expect("parses");
         assert_eq!(config.format.on_idle.as_millis(), 2_000);
         assert_eq!(config.editor.undo_group_timeout.as_millis(), 750);
+    }
+
+    #[test]
+    fn per_language_indent_overrides_the_global_setting() {
+        let (config, warnings) = Config::parse(
+            "[editor]\ntab-width = 4\nexpand-tab = true\n\
+             [editor.indent.go]\ntab-width = 8\nexpand-tab = false\n\
+             [editor.indent.yaml]\ntab-width = 2\n",
+        )
+        .expect("parses");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Go overrides both.
+        assert_eq!(config.editor.tab_width_for("go"), 8);
+        assert!(!config.editor.expand_tab_for("go"));
+        // YAML overrides only the width; the global `expand-tab` still applies.
+        assert_eq!(config.editor.tab_width_for("yaml"), 2);
+        assert!(config.editor.expand_tab_for("yaml"));
+        // A language with no entry falls back to the global settings.
+        assert_eq!(config.editor.tab_width_for("rust"), 4);
+        assert!(config.editor.expand_tab_for("rust"));
+    }
+
+    #[test]
+    fn a_zero_width_override_still_indents_by_one() {
+        // A bad value must not make `tab` insert nothing.
+        let (config, _) = Config::parse("[editor.indent.go]\ntab-width = 0\n").expect("parses");
+        assert_eq!(config.editor.tab_width_for("go"), 1);
     }
 }
