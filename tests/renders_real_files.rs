@@ -111,6 +111,7 @@ fn every_repo_file_parses_renders_and_spells() {
                     command_line: None,
                     picker: None,
                     completion: None,
+                    diagnostic_float: None,
                 };
                 ui::draw(frame, &screen);
             })

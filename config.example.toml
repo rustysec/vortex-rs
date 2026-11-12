@@ -27,6 +27,8 @@ undo-limit = 1000             # undo steps kept per buffer
 undo-group-timeout = "500ms"  # idle time that closes an undo group
 large-file-threshold = 2000000 # bytes; bigger files skip background work
 diagnostic-signs = true       # mark flagged lines in the gutter (● error, ▲ warning)
+inline-diagnostics = false    # draw the message dimmed at the end of its line
+diagnostic-float = true       # show the full message when the caret rests on one
 
 # ---------------------------------------------------------------------------
 # status area

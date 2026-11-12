@@ -210,6 +210,10 @@ pub struct EditorConfig {
     pub large_file_threshold: usize,
     /// Draw a sign column in the gutter marking lines with diagnostics.
     pub diagnostic_signs: bool,
+    /// Draw the diagnostic message dimmed at the end of the line it covers.
+    pub inline_diagnostics: bool,
+    /// Show the full diagnostic message in a card when the caret rests on one.
+    pub diagnostic_float: bool,
 }
 
 impl Default for EditorConfig {
@@ -230,6 +234,8 @@ impl Default for EditorConfig {
             undo_group_timeout: DurationMs(500),
             large_file_threshold: 2_000_000,
             diagnostic_signs: true,
+            inline_diagnostics: false,
+            diagnostic_float: true,
         }
     }
 }
@@ -696,6 +702,8 @@ impl Config {
             "editor.undo-group-timeout" => self.editor.undo_group_timeout = duration(key, value)?,
             "editor.large-file-threshold" => self.editor.large_file_threshold = number(key, value)?,
             "editor.diagnostic-signs" => self.editor.diagnostic_signs = boolean(key, value)?,
+            "editor.inline-diagnostics" => self.editor.inline_diagnostics = boolean(key, value)?,
+            "editor.diagnostic-float" => self.editor.diagnostic_float = boolean(key, value)?,
             "layout.split-mode" => {
                 self.layout.split_mode = SplitMode::from_str(&text(key, value)?)?
             }
@@ -804,6 +812,8 @@ impl Config {
             "editor.sidescroll-margin" => self.editor.sidescroll_margin.to_string(),
             "editor.undo-limit" => self.editor.undo_limit.to_string(),
             "editor.diagnostic-signs" => on_off(self.editor.diagnostic_signs),
+            "editor.inline-diagnostics" => on_off(self.editor.inline_diagnostics),
+            "editor.diagnostic-float" => on_off(self.editor.diagnostic_float),
             "layout.split-mode" => split_mode_name(self.layout.split_mode).to_string(),
             "layout.border" => format!("{:?}", self.layout.border).to_lowercase(),
             "layout.golden-ratio" => format!("{:.3}", self.layout.golden_ratio),

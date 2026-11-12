@@ -46,6 +46,8 @@ const FORMAT_FALLBACK_IDLE: Duration = Duration::from_millis(500);
 /// Idle time before a completion request goes out, so typing a word sends one
 /// request rather than one per character.
 const COMPLETION_IDLE: Duration = Duration::from_millis(90);
+/// How long the caret must rest on a diagnostic before its message is shown.
+const DIAGNOSTIC_HOLD: Duration = Duration::from_millis(500);
 
 /// What the open prompt collects; drives how submission is interpreted.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +124,12 @@ pub struct App {
     completion_pending: Option<(i64, usize, BufferId)>,
     /// When the next completion request is due, for debouncing keystrokes.
     completion_due: Option<Instant>,
+    /// When the caret came to rest on the diagnostic it is currently on, so the
+    /// float only appears after a deliberate pause.
+    diagnostic_hold: Option<(usize, Instant)>,
+    /// Whether the float is currently on screen, so the tick that makes it due
+    /// can trigger exactly one redraw.
+    diagnostic_float_shown: bool,
     last_frame: Rect,
 }
 
@@ -187,6 +195,8 @@ impl App {
             next_completion_request: 1,
             completion_pending: None,
             completion_due: None,
+            diagnostic_hold: None,
+            diagnostic_float_shown: false,
             last_frame: Rect::new(0, 0, 80, 24),
         };
         // Initial background work: parse, and check spelling if enabled.
@@ -317,7 +327,67 @@ impl App {
             self.flush_completion();
         }
 
+        // The diagnostic float appears only once the caret has rested on the
+        // same diagnostic for a moment, so moving through a file does not flash
+        // a card on every line.
+        if self.update_diagnostic_hold(now) {
+            wake = true;
+        }
+
         self.needs_redraw |= wake;
+    }
+
+    /// Track how long the caret has rested on the diagnostic it is on.
+    ///
+    /// Returns true when the float should appear or disappear, so the caller
+    /// knows to redraw.  The hold is keyed by the diagnostic's start offset, so
+    /// moving to a different diagnostic restarts the clock.
+    fn update_diagnostic_hold(&mut self, now: Instant) -> bool {
+        let wanted = if self.editor.config.editor.diagnostic_float
+            && self.prompt.is_none()
+            && self.completion.is_none()
+        {
+            self.diagnostic_under_cursor()
+                .map(|diagnostic| diagnostic.range.start)
+        } else {
+            None
+        };
+        let Some(at) = wanted else {
+            let was_shown = self.diagnostic_float_shown;
+            self.diagnostic_hold = None;
+            self.diagnostic_float_shown = false;
+            return was_shown;
+        };
+        match self.diagnostic_hold {
+            Some((held, since)) if held == at => {
+                // Same diagnostic: show the float once the hold has elapsed.
+                // Without this the card would only appear on the next unrelated
+                // redraw, which may never come while the caret sits still.
+                if !self.diagnostic_float_shown && since.elapsed() >= DIAGNOSTIC_HOLD {
+                    self.diagnostic_float_shown = true;
+                    return true;
+                }
+                false
+            }
+            _ => {
+                // A different diagnostic (or the first one): restart the clock
+                // and take down any card that was showing.
+                let was_shown = self.diagnostic_float_shown;
+                self.diagnostic_hold = Some((at, now));
+                self.diagnostic_float_shown = false;
+                was_shown
+            }
+        }
+    }
+
+    /// The diagnostic the caret sits on, if any.
+    fn diagnostic_under_cursor(&self) -> Option<&crate::diagnostic::Diagnostic> {
+        let buffer = self.editor.current_buffer()?;
+        let cursor = self.editor.cursor();
+        buffer
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.range.contains(cursor))
     }
 
     /// Notice buffer edits, so parsing, spell checking and LSP sync follow them.
@@ -2016,6 +2086,25 @@ impl App {
             .as_ref()
             .map(|completion| ui::CompletionView { completion });
 
+        // The float is resolved here rather than through a `&self` method: the
+        // screen already holds an immutable borrow of `editor`, and a method
+        // taking all of `self` would collide with the `&mut self.terminal`
+        // below.
+        let diagnostic_float: Option<ui::DiagnosticFloat> = self
+            .diagnostic_hold
+            .filter(|(_, since)| since.elapsed() >= DIAGNOSTIC_HOLD)
+            .and_then(|(at, _)| {
+                let cursor = editor.cursor();
+                editor
+                    .current_buffer()?
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| {
+                        diagnostic.range.start == at && diagnostic.range.contains(cursor)
+                    })
+                    .map(|diagnostic| ui::DiagnosticFloat { diagnostic })
+            });
+
         let screen = Screen {
             editor,
             config: &editor.config,
@@ -2024,6 +2113,7 @@ impl App {
             command_line,
             picker,
             completion,
+            diagnostic_float,
         };
 
         let terminal = &mut self.terminal;
@@ -2084,8 +2174,16 @@ impl App {
             .map(|diagnostic| {
                 let line = buffer.line_of(diagnostic.range.start) + 1;
                 let column = buffer.display_col(diagnostic.range.start) + 1;
+                // The headline carries the severity and the server's code, so
+                // `error[E0308]` is visible without opening the message.
+                let mut preview = diagnostic.headline();
+                for (message, span) in &diagnostic.related {
+                    let line = buffer.line_of(span.start) + 1;
+                    preview.push_str(&format!("\n  {line}: {message}"));
+                }
                 prompt::Item::new(format!("{line}:{column}"))
-                    .detail(diagnostic.message.clone())
+                    .detail(diagnostic.headline())
+                    .preview(preview)
                     .payload(DiagnosticPayload {
                         buffer: buffer.id,
                         offset: diagnostic.range.start,

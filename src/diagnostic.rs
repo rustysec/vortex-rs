@@ -43,6 +43,29 @@ pub enum DiagnosticSource {
     Format,
 }
 
+/// What kind of "this is not an error" hint a diagnostic carries.
+///
+/// LSP reports these out of band in `tags`, and they are what makes "unused
+/// variable" read differently from "type mismatch" without reading the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiagnosticTag {
+    /// `tags: [1]` — the code is unused and could go.
+    Unnecessary,
+    /// `tags: [2]` — the code is deprecated.
+    Deprecated,
+}
+
+impl DiagnosticTag {
+    /// Decode one LSP `DiagnosticTag` number.
+    pub fn from_lsp(value: u64) -> Option<Self> {
+        match value {
+            1 => Some(DiagnosticTag::Unnecessary),
+            2 => Some(DiagnosticTag::Deprecated),
+            _ => None,
+        }
+    }
+}
+
 /// One problem at a byte range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -52,6 +75,12 @@ pub struct Diagnostic {
     pub source: DiagnosticSource,
     /// Fixes/suggestions, used by the `z=` spelling picker.
     pub suggestions: Vec<String>,
+    /// Server-assigned code (`E0308`, `unused_variables`), shown in the picker.
+    pub code: Option<String>,
+    /// `unnecessary` / `deprecated` hints, which change how the span is drawn.
+    pub tags: Vec<DiagnosticTag>,
+    /// Other places the message refers to, as `(message, span)`.
+    pub related: Vec<(String, Span)>,
 }
 
 impl Diagnostic {
@@ -67,12 +96,50 @@ impl Diagnostic {
             message: message.into(),
             source,
             suggestions: Vec::new(),
+            code: None,
+            tags: Vec::new(),
+            related: Vec::new(),
         }
     }
 
     pub fn with_suggestions(mut self, suggestions: Vec<String>) -> Self {
         self.suggestions = suggestions;
         self
+    }
+
+    pub fn with_code(mut self, code: Option<String>) -> Self {
+        self.code = code;
+        self
+    }
+
+    pub fn with_tags(mut self, tags: Vec<DiagnosticTag>) -> Self {
+        self.tags = tags;
+        self
+    }
+
+    pub fn with_related(mut self, related: Vec<(String, Span)>) -> Self {
+        self.related = related;
+        self
+    }
+
+    pub fn has_tag(&self, tag: DiagnosticTag) -> bool {
+        self.tags.contains(&tag)
+    }
+
+    /// A one-line headline: `error[E0308]: mismatched types`.
+    ///
+    /// The code is what a user pastes into a search engine, so it belongs next
+    /// to the severity rather than buried in the message.
+    pub fn headline(&self) -> String {
+        let mut out = self.severity.label().to_string();
+        if let Some(code) = &self.code {
+            out.push('[');
+            out.push_str(code);
+            out.push(']');
+        }
+        out.push_str(": ");
+        out.push_str(&self.message);
+        out
     }
 }
 
@@ -154,5 +221,26 @@ mod tests {
         assert_eq!(count.summary(), "2e 1w");
         assert_eq!(count.total(), 3);
         assert!(DiagnosticCount::default().summary().is_empty());
+    }
+
+    #[test]
+    fn the_headline_carries_the_severity_and_the_code() {
+        let diagnostic = Diagnostic::new(
+            Span::point(0),
+            Severity::Error,
+            "mismatched types",
+            DiagnosticSource::Lsp,
+        )
+        .with_code(Some("E0308".into()));
+        assert_eq!(diagnostic.headline(), "error[E0308]: mismatched types");
+
+        // No code: the severity still leads, without an empty bracket pair.
+        let plain = Diagnostic::new(
+            Span::point(0),
+            Severity::Warning,
+            "unused variable",
+            DiagnosticSource::Lsp,
+        );
+        assert_eq!(plain.headline(), "warning: unused variable");
     }
 }

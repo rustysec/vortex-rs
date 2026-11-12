@@ -20,12 +20,12 @@ use ratatui::symbols::border;
 use crate::action::VisualKind;
 use crate::buffer::Buffer as TextBuffer;
 use crate::config::{BorderStyle, Config, LineNumber};
-use crate::diagnostic::{Diagnostic, Severity};
+use crate::diagnostic::{Diagnostic, DiagnosticTag, Severity};
 use crate::editor::Editor;
 use crate::prompt;
 use crate::selection::{Selection, Span};
 use crate::status::{self, Snapshot};
-use crate::syntax::{self, Hl};
+use crate::syntax;
 use crate::theme::Theme;
 
 /// The command line drawn on the message row.
@@ -58,6 +58,11 @@ pub struct CompletionView<'a> {
     pub completion: &'a crate::completion::Completion,
 }
 
+/// The full message of the diagnostic under the caret, shown on a card.
+pub struct DiagnosticFloat<'a> {
+    pub diagnostic: &'a Diagnostic,
+}
+
 /// Everything the renderer needs for one frame.
 pub struct Screen<'a> {
     pub editor: &'a Editor,
@@ -67,6 +72,7 @@ pub struct Screen<'a> {
     pub command_line: Option<CommandLine<'a>>,
     pub picker: Option<Picker<'a>>,
     pub completion: Option<CompletionView<'a>>,
+    pub diagnostic_float: Option<DiagnosticFloat<'a>>,
 }
 
 /// Split the terminal into status area, pane area and the message line.
@@ -158,6 +164,13 @@ pub fn draw(frame: &mut Frame, screen: &Screen) -> Option<Position> {
         // message rows.
         if let Some(anchor) = cursor {
             draw_completion(buf, pane_area, anchor, completion, screen.theme);
+        }
+    }
+    if let Some(float) = &screen.diagnostic_float {
+        // The float sits above the caret's line so it never covers the text the
+        // user is reading, and it is drawn last so it wins over the popup.
+        if let Some(anchor) = cursor {
+            draw_diagnostic_float(buf, pane_area, anchor, float, screen.theme);
         }
     }
     cursor
@@ -343,6 +356,25 @@ fn draw_pane(
         };
         render_chunk(buf, &paint, &text, slot.start, slot.end, &styles);
 
+        // The message for the line's worst diagnostic, dimmed after the text.
+        // Only on the last visual row of the line, so a wrapped line does not
+        // repeat it on every chunk.
+        if config.editor.inline_diagnostics && slot.end >= text.chars().count() {
+            if let Some(diagnostic) = inline_diagnostic(buffer, line) {
+                let column = display_column(&text, slot.start, slot.end, slot.end, tab_width);
+                let message = format!("  {}", diagnostic.message);
+                emit(
+                    buf,
+                    x,
+                    y,
+                    &message,
+                    theme.status_inactive,
+                    column,
+                    limit,
+                );
+            }
+        }
+
         if focused && line == cursor_line && cursor_in_row(buffer, &text, cursor_char, slot) {
             let column = display_column(&text, slot.start, slot.end, cursor_char, tab_width);
             if column < limit {
@@ -489,6 +521,27 @@ fn line_text(buffer: &TextBuffer, line: usize) -> String {
         .to_string()
 }
 
+/// The diagnostic whose message belongs at the end of `line`, if any.
+///
+/// A line can carry several; the worst one wins, so an error is never hidden
+/// behind a hint that happens to start earlier.  Ties go to the earliest span,
+/// which keeps the choice stable between frames.
+fn inline_diagnostic(buffer: &TextBuffer, line: usize) -> Option<&Diagnostic> {
+    let line_start = buffer.line_start(line);
+    let line_end = buffer.line_end(line);
+    buffer
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.range.start <= line_end && diagnostic.range.end >= line_start
+        })
+        .max_by(|a, b| {
+            a.severity
+                .cmp(&b.severity)
+                .then(b.range.start.cmp(&a.range.start))
+        })
+}
+
 /// One style per character of a logical line.
 fn line_styles(
     buffer: &TextBuffer,
@@ -554,7 +607,7 @@ fn line_styles(
     }
 
     for diagnostic in &buffer.diagnostics {
-        let style = diagnostic_style(diagnostic.severity, theme);
+        let style = diagnostic_style(diagnostic, theme);
         if diagnostic.range.end <= line_start || diagnostic.range.start > line_start + text.len() {
             continue;
         }
@@ -735,10 +788,7 @@ impl Gutter {
         if self.sign_width > 0 {
             let sign = self.signs.get(line).copied().flatten();
             let (symbol, style) = match sign {
-                Some(severity) => (
-                    severity_sign(severity),
-                    diagnostic_style(severity, theme),
-                ),
+                Some(severity) => (severity_sign(severity), severity_style(severity, theme)),
                 None => (' ', theme.gutter),
             };
             buf.set_stringn(x, y, symbol.to_string(), 1, style);
@@ -829,7 +879,29 @@ fn highlight_runs(
         .collect()
 }
 
-fn diagnostic_style(severity: Severity, theme: &Theme) -> Style {
+/// The style a diagnostic paints its span with.
+///
+/// The severity picks the colour; the tags change the shape of the mark, so an
+/// unused binding reads as "faded" and a deprecated one as "struck through"
+/// without having to read the message.
+fn diagnostic_style(diagnostic: &Diagnostic, theme: &Theme) -> Style {
+    let mut style = match diagnostic.severity {
+        Severity::Error => theme.diagnostic_error,
+        Severity::Warning => theme.diagnostic_warning,
+        Severity::Info => theme.diagnostic_info,
+        Severity::Hint => theme.diagnostic_hint,
+    };
+    if diagnostic.has_tag(DiagnosticTag::Unnecessary) {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if diagnostic.has_tag(DiagnosticTag::Deprecated) {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    style
+}
+
+/// The style for a severity alone, for the gutter sign column.
+fn severity_style(severity: Severity, theme: &Theme) -> Style {
     match severity {
         Severity::Error => theme.diagnostic_error,
         Severity::Warning => theme.diagnostic_warning,
@@ -1215,6 +1287,32 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
     })
 }
 
+/// Paint a solid bordered card and return the area inside it.
+///
+/// The card is opaque on purpose: text bleeding through an overlay is
+/// unreadable.  Shared by the completion popup and the diagnostic float so the
+/// two cannot drift apart.
+fn draw_card(buf: &mut Buffer, area: Rect, theme: &Theme) {
+    for row in area.top()..area.bottom() {
+        for column in area.left()..area.right() {
+            buf[(column, row)].set_symbol(" ").set_style(theme.overlay);
+        }
+    }
+    let set = border::ROUNDED;
+    for column in area.left()..area.right() {
+        buf[(column, area.y)].set_symbol(set.horizontal_top);
+        buf[(column, area.bottom() - 1)].set_symbol(set.horizontal_bottom);
+    }
+    for row in area.top()..area.bottom() {
+        buf[(area.x, row)].set_symbol(set.vertical_left);
+        buf[(area.right() - 1, row)].set_symbol(set.vertical_right);
+    }
+    buf[(area.x, area.y)].set_symbol(set.top_left);
+    buf[(area.right() - 1, area.y)].set_symbol(set.top_right);
+    buf[(area.x, area.bottom() - 1)].set_symbol(set.bottom_left);
+    buf[(area.right() - 1, area.bottom() - 1)].set_symbol(set.bottom_right);
+}
+
 /// Draw the completion popup hanging off the caret.
 ///
 /// It opens below the caret when there is room and above it otherwise, and is
@@ -1269,25 +1367,7 @@ fn draw_completion(
         return;
     }
 
-    // A solid card, like the picker: text bleeding through is unreadable.
-    for row in area.top()..area.bottom() {
-        for column in area.left()..area.right() {
-            buf[(column, row)].set_symbol(" ").set_style(theme.overlay);
-        }
-    }
-    let set = border::ROUNDED;
-    for column in area.left()..area.right() {
-        buf[(column, area.y)].set_symbol(set.horizontal_top);
-        buf[(column, area.bottom() - 1)].set_symbol(set.horizontal_bottom);
-    }
-    for row in area.top()..area.bottom() {
-        buf[(area.x, row)].set_symbol(set.vertical_left);
-        buf[(area.right() - 1, row)].set_symbol(set.vertical_right);
-    }
-    buf[(area.x, area.y)].set_symbol(set.top_left);
-    buf[(area.right() - 1, area.y)].set_symbol(set.top_right);
-    buf[(area.x, area.bottom() - 1)].set_symbol(set.bottom_left);
-    buf[(area.right() - 1, area.bottom() - 1)].set_symbol(set.bottom_right);
+    draw_card(buf, area, theme);
 
     // Scroll the list so the highlighted row is always drawn.
     let visible_rows = (area.height - 2) as usize;
@@ -1338,10 +1418,94 @@ fn draw_completion(
     }
 }
 
-#[allow(dead_code)]
-fn unused_hl(hl: Hl, diagnostic: &Diagnostic) {
-    let _ = (hl, diagnostic);
+/// Draw the full message of the diagnostic under the caret on a card.
+///
+/// It opens above the caret's line when there is room, so it never covers the
+/// text being read, and wraps long messages instead of clipping them.
+fn draw_diagnostic_float(
+    buf: &mut Buffer,
+    screen: Rect,
+    anchor: Position,
+    float: &DiagnosticFloat,
+    theme: &Theme,
+) {
+    if screen.width < 12 || screen.height < 5 {
+        return;
+    }
+    let diagnostic = float.diagnostic;
+    let headline = diagnostic.headline();
+    let width = (headline.chars().count() + 4)
+        .clamp(20, (screen.width as usize).saturating_sub(2))
+        .min(screen.width as usize) as u16;
+    let inner = width.saturating_sub(2) as usize;
+    let lines = wrap_text(&headline, inner);
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    if height < 3 {
+        return;
+    }
+
+    // Above the caret's line when it fits, below it otherwise.
+    let y = if anchor.y >= height {
+        anchor.y - height
+    } else {
+        (anchor.y + 1).min(screen.bottom().saturating_sub(height))
+    };
+    let x = anchor.x.min(screen.right().saturating_sub(width));
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+
+    draw_card(buf, area, theme);
+    let style = severity_style(diagnostic.severity, theme);
+    for (row, line) in lines.iter().enumerate() {
+        let y = area.y + 1 + row as u16;
+        if y >= area.bottom().saturating_sub(1) {
+            break;
+        }
+        emit(buf, area.x + 1, y, line, style, 0, inner);
+    }
 }
+
+/// Break `text` into lines of at most `width` characters, on word boundaries
+/// where possible.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+        // A single word longer than the line is hard-split so it stays visible.
+        while current.chars().count() > width {
+            let split = current
+                .char_indices()
+                .nth(width)
+                .map(|(index, _)| index)
+                .unwrap_or(current.len());
+            let rest = current.split_off(split);
+            lines.push(std::mem::take(&mut current));
+            current = rest;
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1363,21 +1527,30 @@ mod tests {
     }
 
     fn render_to(width: u16, height: u16, editor: &Editor) -> (Buffer, Option<Position>) {
+        render_with(width, height, editor, &Config::default())
+    }
+
+    fn render_with(
+        width: u16,
+        height: u16,
+        editor: &Editor,
+        config: &Config,
+    ) -> (Buffer, Option<Position>) {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
-        let config = Config::default();
         let theme = Theme::default();
         let snapshot = Snapshot::collect(editor, None, std::path::Path::new("/tmp"));
         let screen = Screen {
             editor,
-            config: &config,
+            config,
             theme: &theme,
             status: snapshot,
             command_line: None,
             picker: None,
             completion: None,
+            diagnostic_float: None,
         };
-        let (status_area, pane_area, message_area) = areas(area, &config);
+        let (status_area, pane_area, message_area) = areas(area, config);
         buffer.set_style(area, theme.text);
         let cursor = draw_panes(&mut buffer, pane_area, &screen);
         status::render(
@@ -1451,6 +1624,178 @@ mod tests {
         let text: Vec<String> = (0..6).map(|row| row_text(&buffer, row)).collect();
         // Row 0 is the pane border, row 1 the only line, row 2 the `~`.
         assert!(text.iter().skip(2).any(|row| row.contains('~')), "{text:?}");
+    }
+
+    #[test]
+    fn diagnostic_tags_change_the_shape_of_the_mark() {
+        use ratatui::style::Modifier;
+
+        let theme = Theme::default();
+        let plain = Diagnostic::new(
+            Span::point(0),
+            Severity::Warning,
+            "unused",
+            crate::diagnostic::DiagnosticSource::Lsp,
+        );
+        let unnecessary = plain.clone().with_tags(vec![DiagnosticTag::Unnecessary]);
+        let deprecated = plain.clone().with_tags(vec![DiagnosticTag::Deprecated]);
+
+        assert!(
+            !diagnostic_style(&plain, &theme)
+                .add_modifier
+                .contains(Modifier::DIM),
+            "an untagged diagnostic is not dimmed"
+        );
+        assert!(
+            diagnostic_style(&unnecessary, &theme)
+                .add_modifier
+                .contains(Modifier::DIM),
+            "an unnecessary span fades out"
+        );
+        assert!(
+            diagnostic_style(&deprecated, &theme)
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT),
+            "a deprecated span is struck through"
+        );
+        // The severity colour survives the tag, so a tagged error still reads
+        // as an error.
+        assert_eq!(
+            diagnostic_style(&unnecessary, &theme).fg,
+            diagnostic_style(&plain, &theme).fg
+        );
+    }
+
+    #[test]
+    fn the_float_wraps_long_messages_instead_of_clipping_them() {
+        let lines = wrap_text("the quick brown fox jumps over the lazy dog", 12);
+        assert!(lines.len() > 1, "{lines:?}");
+        for line in &lines {
+            assert!(line.chars().count() <= 12, "{line:?} is too wide");
+        }
+        // No words are lost in the wrap.
+        assert_eq!(
+            lines.join(" "),
+            "the quick brown fox jumps over the lazy dog"
+        );
+    }
+
+    #[test]
+    fn a_word_longer_than_the_line_is_hard_split() {
+        let lines = wrap_text("supercalifragilistic", 8);
+        assert_eq!(lines.concat(), "supercalifragilistic");
+        for line in &lines {
+            assert!(line.chars().count() <= 8, "{line:?} is too wide");
+        }
+    }
+
+    #[test]
+    fn the_diagnostic_float_draws_the_full_message() {
+        let mut editor = editor_with("let x = ;\n");
+        let id = editor.current_buffer_id().expect("a buffer");
+        let at = editor.buffer(id).expect("a buffer").line_start(0);
+        let diagnostic = Diagnostic::new(
+            Span::new(at + 8, at + 9),
+            Severity::Error,
+            "expected expression",
+            crate::diagnostic::DiagnosticSource::Lsp,
+        )
+        .with_code(Some("E0308".into()));
+        editor.set_diagnostics(
+            id,
+            crate::diagnostic::DiagnosticSource::Lsp,
+            vec![diagnostic],
+        );
+
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buffer = Buffer::empty(area);
+        let config = Config::default();
+        let theme = Theme::default();
+        let snapshot = Snapshot::collect(&editor, None, std::path::Path::new("/tmp"));
+        let diagnostic = &editor.current_buffer().expect("a buffer").diagnostics[0];
+        let screen = Screen {
+            editor: &editor,
+            config: &config,
+            theme: &theme,
+            status: snapshot,
+            command_line: None,
+            picker: None,
+            completion: None,
+            diagnostic_float: Some(DiagnosticFloat { diagnostic }),
+        };
+        let (_, pane_area, _) = areas(area, &config);
+        draw_panes(&mut buffer, pane_area, &screen);
+        // The float hangs off the caret, which the panes just placed.
+        let anchor = Position { x: 3, y: 1 };
+        draw_diagnostic_float(&mut buffer, pane_area, anchor, &screen.diagnostic_float.unwrap(), &theme);
+
+        let rendered = frame_text(&buffer);
+        assert!(rendered.contains("expected expression"), "{rendered}");
+        assert!(rendered.contains("E0308"), "the code is in the headline");
+    }
+
+    #[test]
+    fn inline_diagnostics_draw_the_message_after_the_line() {
+        let mut editor = editor_with("let x = ;\nsecond line\n");
+        let id = editor.current_buffer_id().expect("a buffer");
+        let at = editor.buffer(id).expect("a buffer").line_start(0);
+        editor.set_diagnostics(
+            id,
+            crate::diagnostic::DiagnosticSource::Lsp,
+            vec![Diagnostic::new(
+                Span::new(at + 8, at + 9),
+                Severity::Error,
+                "expected expression",
+                crate::diagnostic::DiagnosticSource::Lsp,
+            )],
+        );
+
+        // Off by default: the message costs horizontal space.
+        let (buffer, _) = render_to(60, 8, &editor);
+        assert!(
+            !row_text(&buffer, 1).contains("expected expression"),
+            "inline text is opt-in"
+        );
+
+        let mut config = Config::default();
+        config.editor.inline_diagnostics = true;
+        let (buffer, _) = render_with(60, 8, &editor, &config);
+        let row = row_text(&buffer, 1);
+        assert!(row.contains("expected expression"), "{row:?}");
+        // The line's own text is still there, ahead of the message.
+        assert!(row.contains("let x = ;"), "{row:?}");
+    }
+
+    #[test]
+    fn the_worst_diagnostic_on_a_line_wins_the_inline_slot() {
+        let mut editor = editor_with("let x = 1;\n");
+        let id = editor.current_buffer_id().expect("a buffer");
+        let at = editor.buffer(id).expect("a buffer").line_start(0);
+        editor.set_diagnostics(
+            id,
+            crate::diagnostic::DiagnosticSource::Lsp,
+            vec![
+                Diagnostic::new(
+                    Span::new(at, at + 3),
+                    Severity::Hint,
+                    "hint message",
+                    crate::diagnostic::DiagnosticSource::Lsp,
+                ),
+                Diagnostic::new(
+                    Span::new(at + 4, at + 5),
+                    Severity::Error,
+                    "error message",
+                    crate::diagnostic::DiagnosticSource::Lsp,
+                ),
+            ],
+        );
+
+        let mut config = Config::default();
+        config.editor.inline_diagnostics = true;
+        let (buffer, _) = render_with(60, 8, &editor, &config);
+        let row = row_text(&buffer, 1);
+        assert!(row.contains("error message"), "{row:?}");
+        assert!(!row.contains("hint message"), "{row:?}");
     }
 
     #[test]
@@ -1702,6 +2047,7 @@ mod tests {
             command_line: None,
             picker: None,
             completion: None,
+            diagnostic_float: None,
         };
         draw_panes(&mut buffer, area, &screen);
         let rendered = frame_text(&buffer);

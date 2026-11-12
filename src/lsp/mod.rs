@@ -29,7 +29,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::buffer::{Buffer, BufferId};
 use crate::config::Config;
-use crate::diagnostic::{Diagnostic, DiagnosticSource, Severity};
+use crate::diagnostic::{Diagnostic, DiagnosticSource, DiagnosticTag, Severity};
 use crate::event::{AsyncEvent, EventTx, JobId};
 use crate::selection::Span;
 
@@ -142,6 +142,12 @@ pub struct DiagnosticItem {
     pub severity: Severity,
     pub message: String,
     pub source: String,
+    /// `code` as the server sent it: a string, or a number rendered as one.
+    pub code: Option<String>,
+    /// Decoded `tags` (`unnecessary`, `deprecated`).
+    pub tags: Vec<DiagnosticTag>,
+    /// `relatedInformation`, as `(message, range)`.
+    pub related: Vec<(String, (usize, usize, usize, usize))>,
 }
 
 impl DiagnosticItem {
@@ -153,12 +159,24 @@ impl DiagnosticItem {
     pub fn to_diagnostic(&self, buffer: &Buffer) -> Diagnostic {
         let start = buffer.byte_at_utf16(self.range.0, self.range.1);
         let end = buffer.byte_at_utf16(self.range.2, self.range.3);
+        let related = self
+            .related
+            .iter()
+            .map(|(message, range)| {
+                let start = buffer.byte_at_utf16(range.0, range.1);
+                let end = buffer.byte_at_utf16(range.2, range.3);
+                (message.clone(), Span::new(start, end))
+            })
+            .collect();
         Diagnostic::new(
             Span::new(start, end),
             self.severity,
             format!("{}: {}", self.source, self.message),
             DiagnosticSource::Lsp,
         )
+        .with_code(self.code.clone())
+        .with_tags(self.tags.clone())
+        .with_related(related)
     }
 }
 
@@ -172,6 +190,41 @@ pub fn diagnostic_items(params: &Value) -> Vec<DiagnosticItem> {
         .filter_map(|item| {
             let start = position(item.pointer("/range/start")?)?;
             let end = position(item.pointer("/range/end")?)?;
+            // `code` is `string | number` in the protocol; both are shown as
+            // text, so a numeric code is stringified rather than dropped.
+            let code = item.get("code").and_then(|code| {
+                code.as_str()
+                    .map(str::to_string)
+                    .or_else(|| code.as_u64().map(|number| number.to_string()))
+            });
+            let tags = item
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(Value::as_u64)
+                        .filter_map(DiagnosticTag::from_lsp)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let related = item
+                .get("relatedInformation")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let message = entry
+                                .pointer("/message")
+                                .and_then(Value::as_str)?
+                                .to_string();
+                            let start = position(entry.pointer("/location/range/start")?)?;
+                            let end = position(entry.pointer("/location/range/end")?)?;
+                            Some((message, (start.0, start.1, end.0, end.1)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(DiagnosticItem {
                 range: (start.0, start.1, end.0, end.1),
                 severity: match item.get("severity").and_then(Value::as_u64) {
@@ -190,6 +243,9 @@ pub fn diagnostic_items(params: &Value) -> Vec<DiagnosticItem> {
                     .and_then(Value::as_str)
                     .unwrap_or("lsp")
                     .to_string(),
+                code,
+                tags,
+                related,
             })
         })
         .collect()
@@ -905,6 +961,78 @@ mod tests {
         assert_eq!(diagnostics[0].range, Span::new(8, 9));
         assert_eq!(diagnostics[1].range, Span::new(10, 16));
         assert_eq!(diagnostics[1].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn diagnostic_code_tags_and_related_information_survive_the_decode() {
+        let text = "let unused = 1;\nlet other = 2;\n";
+        let buffer = buffer_with(text);
+        let params = json!({
+            "uri": "file:///tmp/x.rs",
+            "diagnostics": [{
+                "range": { "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 10 } },
+                "severity": 2,
+                "code": "unused_variables",
+                "tags": [1],
+                "message": "unused variable: `unused`",
+                "source": "rust-analyzer",
+                "relatedInformation": [{
+                    "location": {
+                        "uri": "file:///tmp/x.rs",
+                        "range": {
+                            "start": { "line": 1, "character": 4 },
+                            "end": { "line": 1, "character": 9 }
+                        }
+                    },
+                    "message": "`other` is used here"
+                }]
+            }, {
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 3 } },
+                "severity": 1,
+                "code": 1234,
+                "tags": [2],
+                "message": "deprecated",
+                "source": "rustc"
+            }]
+        });
+        let items = diagnostic_items(&params);
+        let diagnostics: Vec<Diagnostic> = items
+            .iter()
+            .map(|item| item.to_diagnostic(&buffer))
+            .collect();
+
+        assert_eq!(diagnostics[0].code.as_deref(), Some("unused_variables"));
+        assert!(diagnostics[0].has_tag(DiagnosticTag::Unnecessary));
+        assert!(!diagnostics[0].has_tag(DiagnosticTag::Deprecated));
+        assert_eq!(diagnostics[0].related.len(), 1);
+        assert_eq!(diagnostics[0].related[0].0, "`other` is used here");
+        assert_eq!(diagnostics[0].related[0].1, Span::new(20, 25));
+
+        // A numeric `code` is stringified rather than dropped.
+        assert_eq!(diagnostics[1].code.as_deref(), Some("1234"));
+        assert!(diagnostics[1].has_tag(DiagnosticTag::Deprecated));
+        assert!(diagnostics[1].related.is_empty());
+    }
+
+    #[test]
+    fn unknown_tags_are_ignored_rather_than_failing_the_decode() {
+        let text = "x\n";
+        let buffer = buffer_with(text);
+        let params = json!({
+            "uri": "file:///tmp/x.rs",
+            "diagnostics": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                "severity": 1,
+                "tags": [1, 99],
+                "message": "x",
+                "source": "lsp"
+            }]
+        });
+        let diagnostics: Vec<Diagnostic> = diagnostic_items(&params)
+            .iter()
+            .map(|item| item.to_diagnostic(&buffer))
+            .collect();
+        assert_eq!(diagnostics[0].tags, vec![DiagnosticTag::Unnecessary]);
     }
 
     #[test]
