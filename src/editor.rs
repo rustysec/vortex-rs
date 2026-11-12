@@ -2905,16 +2905,29 @@ impl Editor {
         } else {
             ChangeGroup::Format
         };
-        // One buffer edit, not one per pane: applying per pane would rewrite
-        // the text again for every pane showing the buffer, duplicating the
-        // replacement's tail.  Each pane then maps *its own* caret through the
-        // edits it started from — taking the caret from whichever pane happens
-        // to be first would move the focused pane's caret to where an unfocused
-        // one was, and collapsing every selection to a point would throw away
-        // visual selections and extra cursors.
+        self.apply_rewrite(id, changes, group);
+        Ok(true)
+    }
+
+    /// Apply `changes` to `id` and put every pane's caret back where it belongs.
+    ///
+    /// One buffer edit, not one per pane: applying per pane would rewrite the
+    /// text again for every pane showing the buffer, duplicating the
+    /// replacement's tail.  Each pane then maps *its own* caret through the
+    /// edits it started from — taking the caret from whichever pane happens to
+    /// be first would move the focused pane's caret to where an unfocused one
+    /// was, and collapsing every selection to a point would throw away visual
+    /// selections and extra cursors.
+    ///
+    /// Shared by the external formatter and the language server's edits so the
+    /// two cannot disagree about where the caret lands.  Returns the number of
+    /// edits applied.
+    fn apply_rewrite(&mut self, id: BufferId, changes: Vec<Change>, group: ChangeGroup) -> usize {
         let panes = self.layout.panes_showing(id);
         let before: Vec<(PaneId, Selection, (usize, usize))> = {
-            let buffer = self.buffer(id).expect("checked above");
+            let Some(buffer) = self.buffer(id) else {
+                return 0;
+            };
             panes
                 .iter()
                 .filter_map(|pane_id| self.layout.pane(*pane_id))
@@ -2933,11 +2946,15 @@ impl Editor {
             .map(|pane| pane.selection.clone())
             .unwrap_or_else(|| Selection::point(0));
         let edits = {
-            let buffer = self.buffer_mut(id).expect("checked above");
+            let Some(buffer) = self.buffer_mut(id) else {
+                return 0;
+            };
             buffer.apply(changes, group, &mut selection)
         };
         let restored: Vec<(PaneId, Selection)> = {
-            let buffer = self.buffer(id).expect("applied above");
+            let Some(buffer) = self.buffer(id) else {
+                return 0;
+            };
             before
                 .iter()
                 .map(|(pane_id, selection, position)| {
@@ -2964,7 +2981,7 @@ impl Editor {
         if let Some(buffer) = self.buffer_mut(id) {
             buffer.break_undo_group();
         }
-        Ok(true)
+        edits.len()
     }
 
     /// Replace a span with `text` (the spelling picker).
@@ -2997,27 +3014,11 @@ impl Editor {
             .into_iter()
             .map(|edit| Change::replace(edit.range, edit.new_text.clone()))
             .collect();
-        // The focused pane's selection is the one that has to survive; other
-        // panes showing the same buffer keep their own cursors, which the
-        // buffer's edit mapping already moves.
-        let mut selection = self
-            .current_pane()
-            .map(|pane| pane.selection.clone())
-            .unwrap_or_else(|| Selection::point(0));
-        let applied = {
-            let Some(buffer) = self.buffer_mut(id) else {
-                return 0;
-            };
-            buffer.apply(changes, group, &mut selection)
-        };
-        if let Some(pane_id) = self.layout.focused()
-            && let Some(pane) = self.layout.pane_mut(pane_id)
-            && pane.buffer == id
-        {
-            pane.selection = selection;
-            pane.view.wanted_col = None;
-        }
-        applied.len()
+        // Every pane showing the buffer keeps its own caret, the same way a
+        // formatter run does: a server edit can move text under a pane the user
+        // is not looking at, and raw edit mapping would leave that caret on the
+        // wrong line.
+        self.apply_rewrite(id, changes, group)
     }
 
     /// Store diagnostics from a background job, replacing that source's set.
@@ -4269,6 +4270,52 @@ mod tests {
         assert_eq!(fixture.text(), "\n");
         fixture.feed("u");
         assert_eq!(fixture.text(), "let unused = 1;\n");
+    }
+
+    #[test]
+    fn a_server_edit_keeps_every_panes_caret() {
+        // Two panes on one buffer: a server edit has to move both carets the
+        // way a formatter run does.  Restoring only the focused pane left the
+        // other on a raw edit mapping, which lands on the wrong line as soon as
+        // the edit changes the line count above it.
+        let mut fixture = Fixture::new("fn  main() {}\n");
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.editor.set_last_area(fixture.area);
+        fixture
+            .editor
+            .show_in_pane(id, Some(Axis::Column))
+            .expect("a split");
+        let panes = fixture.editor.layout.panes_showing(id);
+        assert_eq!(panes.len(), 2, "the buffer is in two panes");
+        let unfocused = panes
+            .iter()
+            .copied()
+            .find(|pane| !fixture.editor.layout.is_focused(*pane))
+            .expect("an unfocused pane");
+        let end = fixture.editor.buffer(id).expect("a buffer").line_end(0);
+        fixture
+            .editor
+            .layout
+            .pane_mut(unfocused)
+            .expect("a pane")
+            .selection = Selection::point(end);
+
+        // Collapse the double space; the caret was at the end of the line and
+        // must still be at the end of the line.
+        fixture
+            .editor
+            .apply_edits(id, &[edit(2..4, " ")], ChangeGroup::Format);
+        assert_eq!(fixture.text(), "fn main() {}\n");
+        let caret = fixture
+            .editor
+            .layout
+            .pane(unfocused)
+            .expect("a pane")
+            .selection
+            .cursor();
+        let buffer = fixture.editor.buffer(id).expect("a buffer");
+        assert_eq!(buffer.line_of(caret), 0, "still on the only line");
+        assert_eq!(caret, buffer.line_end(0), "still at the end of the line");
     }
 
     // ------------------------------------------------------------- highlighting
