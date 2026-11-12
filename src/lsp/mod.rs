@@ -63,6 +63,33 @@ pub enum LspEvent {
         request: i64,
         items: Vec<CompletionItem>,
     },
+    /// What the server knows about a position, as plain text.
+    ///
+    /// `request` matches the id the app sent, so an answer for a caret that has
+    /// since moved is dropped rather than shown under the wrong symbol.
+    Hover {
+        uri: String,
+        request: i64,
+        text: String,
+    },
+    /// The server rewrote a document (or a range of one).
+    ///
+    /// `edits` are byte spans in the text the server was told about, which is
+    /// what the app resolves them against.  `error` is set when the server
+    /// refused the request, so the caller can fall back to the external
+    /// formatter instead of silently doing nothing.
+    Formatted {
+        uri: String,
+        request: i64,
+        edits: Vec<TextEdit>,
+        error: Option<String>,
+    },
+    /// Quick fixes the server offers for a range.
+    CodeActions {
+        uri: String,
+        request: i64,
+        actions: Vec<CodeAction>,
+    },
     /// A server exited; it will be restarted the next time it is needed.
     Closed { language: String, code: Option<i32> },
 }
@@ -399,6 +426,198 @@ pub fn completion_items(result: &Value, text: &str, line_starts: &[usize]) -> Ve
         .collect()
 }
 
+/// Decode a `textDocument/hover` result into plain text.
+///
+/// The result is `{ contents, range? }`, and `contents` is one of: a string, a
+/// `MarkupContent` (`{ kind, value }`), or an array of either.  Markdown is
+/// flattened to plain text — the status area and the float draw plain text, and
+/// a stray `**` reads worse than no emphasis at all.
+pub fn hover_text(result: &Value) -> String {
+    let contents = result.get("contents").unwrap_or(result);
+    let mut parts = Vec::new();
+    collect_hover(contents, &mut parts);
+    parts
+        .into_iter()
+        .map(|part| strip_markdown(&part))
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn collect_hover(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => out.push(text.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_hover(item, out);
+            }
+        }
+        Value::Object(_) => {
+            // `MarkupContent` carries the text in `value`; a `MarkedString`
+            // object carries it in `value` too, so one lookup covers both.
+            if let Some(text) = value.get("value").and_then(Value::as_str) {
+                out.push(text.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Flatten the markdown a server sends into readable plain text.
+///
+/// Only the constructs that actually show up in hover text are handled: code
+/// fences, inline code, emphasis and heading markers.  Anything else is left
+/// alone rather than mangled.
+fn strip_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            // A fence line carries no content of its own.
+            continue;
+        }
+        let line = trimmed.strip_prefix("# ").unwrap_or(trimmed);
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    let out = out.replace("**", "").replace("__", "");
+    // Inline code: drop the backticks, keep the code.
+    out.replace('`', "").trim_end().to_string()
+}
+
+/// Decode a `textDocument/formatting` (or `rangeFormatting`) result.
+///
+/// The result is an array of `TextEdit`s, or `null` when the server has nothing
+/// to change.  Ranges are resolved against the text the server was told about.
+pub fn text_edits(result: &Value, text: &str, line_starts: &[usize]) -> Vec<TextEdit> {
+    let Some(items) = result.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let start = position(item.pointer("/range/start")?)?;
+            let end = position(item.pointer("/range/end")?)?;
+            Some(TextEdit {
+                range: range_to_span(text, line_starts, start, end),
+                new_text: item
+                    .get("newText")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Decode a `textDocument/codeAction` result into applicable quick fixes.
+///
+/// A `CodeAction` may carry its edits directly or behind a `codeAction/resolve`
+/// round trip; only the direct form is used, because resolving would need a
+/// second request per action and the servers that matter send edits inline for
+/// quick fixes.  A bare `Command` has no edits and is skipped.
+pub fn code_actions(result: &Value, text: &str, line_starts: &[usize]) -> Vec<CodeAction> {
+    let Some(items) = result.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let title = item.get("title").and_then(Value::as_str)?.to_string();
+            let edits = item
+                .pointer("/edit/changes")
+                .and_then(|changes| changes.as_object())
+                .map(|changes| {
+                    changes
+                        .values()
+                        .filter_map(Value::as_array)
+                        .flatten()
+                        .filter_map(|edit| {
+                            let start = position(edit.pointer("/range/start")?)?;
+                            let end = position(edit.pointer("/range/end")?)?;
+                            Some(TextEdit {
+                                range: range_to_span(text, line_starts, start, end),
+                                new_text: edit
+                                    .get("newText")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (!edits.is_empty()).then_some(CodeAction { title, edits })
+        })
+        .collect()
+}
+
+/// Encode a diagnostic as the LSP `Diagnostic` object a `codeAction` context
+/// expects.
+///
+/// Servers key their quick fixes off these: rust-analyzer offers "remove unused
+/// binding" only when it is told which diagnostic is being fixed, so sending an
+/// empty list means an empty answer.
+pub fn diagnostic_json(buffer: &Buffer, diagnostic: &Diagnostic) -> Value {
+    let start = (
+        buffer.line_of(diagnostic.range.start),
+        buffer.utf16_col_in_line(diagnostic.range.start),
+    );
+    let end = (
+        buffer.line_of(diagnostic.range.end),
+        buffer.utf16_col_in_line(diagnostic.range.end),
+    );
+    let mut value = json!({
+        "range": {
+            "start": { "line": start.0, "character": start.1 },
+            "end": { "line": end.0, "character": end.1 }
+        },
+        "severity": diagnostic.severity.number(),
+        "message": diagnostic.message,
+        "source": "vortex",
+    });
+    if let Some(code) = &diagnostic.code {
+        value["code"] = json!(code);
+    }
+    value
+}
+
+/// What a request in flight is waiting for.
+///
+/// The answer to a request is decoded differently per kind, so the id alone is
+/// not enough: the multiplexer has to remember what it asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingKind {
+    Completion,
+    Hover,
+    Formatting,
+    RangeFormatting,
+    CodeAction,
+}
+
+/// A request in flight: what it is, and which document it is about.
+#[derive(Debug, Clone)]
+pub struct PendingRequest {
+    pub kind: PendingKind,
+    pub uri: String,
+}
+
+/// One text replacement the server asked for, as a byte span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextEdit {
+    pub range: Span,
+    pub new_text: String,
+}
+
+/// One code action the server offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeAction {
+    /// What the picker shows.
+    pub title: String,
+    /// The edits it applies, already resolved to byte spans.
+    pub edits: Vec<TextEdit>,
+}
+
 /// Outgoing messages the app can ask a running server to send.
 #[derive(Debug)]
 enum Outgoing {
@@ -424,6 +643,42 @@ enum Outgoing {
         line: usize,
         character: usize,
         trigger: Option<String>,
+    },
+    /// Ask what is at a position.
+    Hover {
+        uri: String,
+        request: i64,
+        line: usize,
+        character: usize,
+    },
+    /// Ask the server to format a whole document.
+    Format {
+        uri: String,
+        request: i64,
+        tab_size: usize,
+        insert_spaces: bool,
+    },
+    /// Ask the server to format one range.
+    RangeFormat {
+        uri: String,
+        request: i64,
+        start: (usize, usize),
+        end: (usize, usize),
+        tab_size: usize,
+        insert_spaces: bool,
+    },
+    /// Ask for quick fixes covering a range.
+    CodeAction {
+        uri: String,
+        request: i64,
+        start: (usize, usize),
+        end: (usize, usize),
+        /// The diagnostics the range covers, as LSP `Diagnostic` objects.
+        ///
+        /// Servers key their fixes off these: rust-analyzer offers "remove
+        /// unused binding" only when it is told which diagnostic is being
+        /// fixed, so an empty list here means an empty answer.
+        diagnostics: Vec<Value>,
     },
     Shutdown,
 }
@@ -520,6 +775,64 @@ impl ClientHandle {
         });
     }
 
+    /// Ask what is at a 0-based line/character position.
+    pub fn hover(&self, uri: String, request: i64, line: usize, character: usize) {
+        let _ = self.outgoing.send(Outgoing::Hover {
+            uri,
+            request,
+            line,
+            character,
+        });
+    }
+
+    /// Ask the server to format a whole document.
+    pub fn format(&self, uri: String, request: i64, tab_size: usize, insert_spaces: bool) {
+        let _ = self.outgoing.send(Outgoing::Format {
+            uri,
+            request,
+            tab_size,
+            insert_spaces,
+        });
+    }
+
+    /// Ask the server to format one range.
+    pub fn range_format(
+        &self,
+        uri: String,
+        request: i64,
+        start: (usize, usize),
+        end: (usize, usize),
+        tab_size: usize,
+        insert_spaces: bool,
+    ) {
+        let _ = self.outgoing.send(Outgoing::RangeFormat {
+            uri,
+            request,
+            start,
+            end,
+            tab_size,
+            insert_spaces,
+        });
+    }
+
+    /// Ask for quick fixes covering a range.
+    pub fn code_action(
+        &self,
+        uri: String,
+        request: i64,
+        start: (usize, usize),
+        end: (usize, usize),
+        diagnostics: Vec<Value>,
+    ) {
+        let _ = self.outgoing.send(Outgoing::CodeAction {
+            uri,
+            request,
+            start,
+            end,
+            diagnostics,
+        });
+    }
+
     pub fn shutdown(&self) {
         let _ = self.outgoing.send(Outgoing::Shutdown);
     }
@@ -608,8 +921,9 @@ async fn session(
     let mut reader = BufReader::new(stdout);
     let mut handshake = Handshake::default();
     let next_id: i64 = 2;
-    // Completion requests in flight, keyed by the id the answer will carry.
-    let mut pending: HashMap<i64, String> = HashMap::new();
+    // Requests in flight, keyed by the id the answer will carry.  The kind is
+    // remembered so the answer can be decoded as what it actually is.
+    let mut pending: HashMap<i64, PendingRequest> = HashMap::new();
     // The text the server has been told about, per URI.  Completion ranges are
     // resolved against it, so they line up with what the server actually saw.
     let mut synced: HashMap<String, String> = HashMap::new();
@@ -644,19 +958,44 @@ async fn session(
                             }
                             let id = value.get("id").and_then(Value::as_i64);
                             if let Some(id) = id
-                                && let Some(uri) = pending.remove(&id)
+                                && let Some(request) = pending.remove(&id)
                             {
-                                // An error response has no `result`; the app
-                                // treats an empty list as "nothing to offer".
+                                // An error response has no `result`; each
+                                // decoder treats a missing result as "nothing
+                                // to offer" rather than as a failure.
                                 let result = value.get("result").cloned().unwrap_or(Value::Null);
-                                let text = synced.get(&uri).cloned().unwrap_or_default();
+                                let error = value
+                                    .pointer("/error/message")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string);
+                                let text = synced.get(&request.uri).cloned().unwrap_or_default();
                                 let starts = line_starts(&text);
-                                let items = completion_items(&result, &text, &starts);
-                                tx.send_async(AsyncEvent::Lsp(LspEvent::Completions {
-                                    uri,
-                                    request: id,
-                                    items,
-                                }));
+                                let event = match request.kind {
+                                    PendingKind::Completion => LspEvent::Completions {
+                                        uri: request.uri,
+                                        request: id,
+                                        items: completion_items(&result, &text, &starts),
+                                    },
+                                    PendingKind::Hover => LspEvent::Hover {
+                                        uri: request.uri,
+                                        request: id,
+                                        text: hover_text(&result),
+                                    },
+                                    PendingKind::Formatting | PendingKind::RangeFormatting => {
+                                        LspEvent::Formatted {
+                                            uri: request.uri,
+                                            request: id,
+                                            edits: text_edits(&result, &text, &starts),
+                                            error,
+                                        }
+                                    }
+                                    PendingKind::CodeAction => LspEvent::CodeActions {
+                                        uri: request.uri,
+                                        request: id,
+                                        actions: code_actions(&result, &text, &starts),
+                                    },
+                                };
+                                tx.send_async(AsyncEvent::Lsp(event));
                             }
                             continue;
                         }
@@ -737,7 +1076,7 @@ async fn session(
 async fn send_outgoing(
     stdin: &Arc<Mutex<ChildStdin>>,
     message: Outgoing,
-    pending: &mut HashMap<i64, String>,
+    pending: &mut HashMap<i64, PendingRequest>,
     synced: &mut HashMap<String, String>,
 ) {
     match message {
@@ -783,7 +1122,13 @@ async fn send_outgoing(
             // be matched to the caret that asked for it.  A request that answers
             // a typed `:` or `.` reports it as a trigger character (kind 2):
             // servers key member and path lists off that context.
-            pending.insert(request, uri.clone());
+            pending.insert(
+                request,
+                PendingRequest {
+                    kind: PendingKind::Completion,
+                    uri: uri.clone(),
+                },
+            );
             let context = match trigger {
                 Some(character) => json!({ "triggerKind": 2, "triggerCharacter": character }),
                 None => json!({ "triggerKind": 1 }),
@@ -795,6 +1140,113 @@ async fn send_outgoing(
                     "textDocument": { "uri": uri },
                     "position": { "line": line, "character": character },
                     "context": context
+                })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
+        }
+        Outgoing::Hover {
+            uri,
+            request,
+            line,
+            character,
+        } => {
+            pending.insert(
+                request,
+                PendingRequest {
+                    kind: PendingKind::Hover,
+                    uri: uri.clone(),
+                },
+            );
+            let request_message = jsonrpc::request(
+                request,
+                "textDocument/hover",
+                Some(json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character }
+                })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
+        }
+        Outgoing::Format {
+            uri,
+            request,
+            tab_size,
+            insert_spaces,
+        } => {
+            pending.insert(
+                request,
+                PendingRequest {
+                    kind: PendingKind::Formatting,
+                    uri: uri.clone(),
+                },
+            );
+            let request_message = jsonrpc::request(
+                request,
+                "textDocument/formatting",
+                Some(json!({
+                    "textDocument": { "uri": uri },
+                    "options": { "tabSize": tab_size, "insertSpaces": insert_spaces }
+                })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
+        }
+        Outgoing::RangeFormat {
+            uri,
+            request,
+            start,
+            end,
+            tab_size,
+            insert_spaces,
+        } => {
+            pending.insert(
+                request,
+                PendingRequest {
+                    kind: PendingKind::RangeFormatting,
+                    uri: uri.clone(),
+                },
+            );
+            let request_message = jsonrpc::request(
+                request,
+                "textDocument/rangeFormatting",
+                Some(json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": start.0, "character": start.1 },
+                        "end": { "line": end.0, "character": end.1 }
+                    },
+                    "options": { "tabSize": tab_size, "insertSpaces": insert_spaces }
+                })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
+        }
+        Outgoing::CodeAction {
+            uri,
+            request,
+            start,
+            end,
+            diagnostics,
+        } => {
+            pending.insert(
+                request,
+                PendingRequest {
+                    kind: PendingKind::CodeAction,
+                    uri: uri.clone(),
+                },
+            );
+            let request_message = jsonrpc::request(
+                request,
+                "textDocument/codeAction",
+                Some(json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": start.0, "character": start.1 },
+                        "end": { "line": end.0, "character": end.1 }
+                    },
+                    // Only quick fixes: refactors and source actions need a
+                    // picker of their own and are not what a diagnostic offers.
+                    // The diagnostics are what the server keys its fixes off,
+                    // so an empty list here means an empty answer.
+                    "context": { "diagnostics": diagnostics, "only": ["quickfix"] }
                 })),
             );
             let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
@@ -1177,6 +1629,128 @@ mod tests {
         let starts = line_starts(text);
         assert!(completion_items(&Value::Null, text, &starts).is_empty());
         assert!(completion_items(&json!({ "items": [] }), text, &starts).is_empty());
+    }
+
+    #[test]
+    fn hover_text_decodes_every_contents_shape() {
+        // A plain string.
+        assert_eq!(
+            hover_text(&json!({ "contents": "fn main()" })),
+            "fn main()"
+        );
+        // A `MarkupContent` object.
+        assert_eq!(
+            hover_text(&json!({ "contents": { "kind": "plaintext", "value": "let x: u8" } })),
+            "let x: u8"
+        );
+        // An array of both, joined in order.
+        let result = json!({
+            "contents": [
+                { "language": "rust", "value": "fn f()" },
+                "does a thing"
+            ]
+        });
+        assert_eq!(hover_text(&result), "fn f()\ndoes a thing");
+        // Nothing at all.
+        assert_eq!(hover_text(&Value::Null), "");
+    }
+
+    #[test]
+    fn hover_markdown_is_flattened_to_plain_text() {
+        let result = json!({
+            "contents": {
+                "kind": "markdown",
+                "value": "```rust\nfn f() -> u8\n```\n\n**Docs** with `code`."
+            }
+        });
+        let text = hover_text(&result);
+        assert!(text.contains("fn f() -> u8"), "{text:?}");
+        assert!(text.contains("Docs with code."), "{text:?}");
+        assert!(!text.contains('`'), "backticks are stripped: {text:?}");
+        assert!(!text.contains("**"), "emphasis markers are stripped: {text:?}");
+    }
+
+    #[test]
+    fn formatting_edits_become_byte_spans() {
+        let text = "fn  main() {}\n";
+        let starts = line_starts(text);
+        let result = json!([{
+            "range": {
+                "start": { "line": 0, "character": 2 },
+                "end": { "line": 0, "character": 4 }
+            },
+            "newText": " "
+        }]);
+        let edits = text_edits(&result, text, &starts);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(&text[edits[0].range.start..edits[0].range.end], "  ");
+        assert_eq!(edits[0].new_text, " ");
+        // `null` means "nothing to change", not an error.
+        assert!(text_edits(&Value::Null, text, &starts).is_empty());
+    }
+
+    #[test]
+    fn code_actions_keep_only_the_ones_with_edits() {
+        let text = "let unused = 1;\n";
+        let starts = line_starts(text);
+        let result = json!([
+            {
+                "title": "remove unused binding",
+                "kind": "quickfix",
+                "edit": {
+                    "changes": {
+                        "file:///tmp/x.rs": [{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 15 }
+                            },
+                            "newText": ""
+                        }]
+                    }
+                }
+            },
+            // A bare `Command` has no edits and cannot be applied here.
+            { "title": "run a command", "command": "something" }
+        ]);
+        let actions = code_actions(&result, text, &starts);
+        assert_eq!(actions.len(), 1, "the command-only action is skipped");
+        assert_eq!(actions[0].title, "remove unused binding");
+        assert_eq!(actions[0].edits.len(), 1);
+        assert_eq!(actions[0].edits[0].new_text, "");
+    }
+
+    #[test]
+    fn a_diagnostic_is_encoded_as_utf16_positions() {
+        // `é` is one UTF-16 unit but two bytes, so a byte column would be wrong.
+        let buffer = buffer_with("let é = 1;\n");
+        let diagnostic = Diagnostic::new(
+            Span::new(4, 6),
+            Severity::Warning,
+            "unused",
+            DiagnosticSource::Lsp,
+        )
+        .with_code(Some("unused_variables".into()));
+        let value = diagnostic_json(&buffer, &diagnostic);
+        assert_eq!(value["range"]["start"]["line"], 0);
+        assert_eq!(value["range"]["start"]["character"], 4);
+        assert_eq!(value["range"]["end"]["character"], 5, "one UTF-16 unit");
+        assert_eq!(value["severity"], 2, "warning is LSP severity 2");
+        assert_eq!(value["message"], "unused");
+        assert_eq!(value["code"], "unused_variables");
+    }
+
+    #[test]
+    fn a_diagnostic_without_a_code_omits_it() {
+        let buffer = buffer_with("x\n");
+        let diagnostic = Diagnostic::new(
+            Span::new(0, 1),
+            Severity::Error,
+            "boom",
+            DiagnosticSource::Lsp,
+        );
+        let value = diagnostic_json(&buffer, &diagnostic);
+        assert!(value.get("code").is_none(), "{value}");
+        assert_eq!(value["severity"], 1, "error is LSP severity 1");
     }
 
     fn open(uri: &str) -> Outgoing {

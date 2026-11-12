@@ -33,6 +33,17 @@ impl Severity {
             Severity::Error => "error",
         }
     }
+
+    /// The LSP `DiagnosticSeverity` number, for sending a diagnostic back to a
+    /// server in a `codeAction` context.
+    pub fn number(self) -> u64 {
+        match self {
+            Severity::Error => 1,
+            Severity::Warning => 2,
+            Severity::Info => 3,
+            Severity::Hint => 4,
+        }
+    }
 }
 
 /// Where a diagnostic came from.

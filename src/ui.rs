@@ -73,6 +73,8 @@ pub struct Screen<'a> {
     pub picker: Option<Picker<'a>>,
     pub completion: Option<CompletionView<'a>>,
     pub diagnostic_float: Option<DiagnosticFloat<'a>>,
+    /// What the language server said about the symbol under the caret (`K`).
+    pub hover: Option<&'a str>,
 }
 
 /// Split the terminal into status area, pane area and the message line.
@@ -171,6 +173,13 @@ pub fn draw(frame: &mut Frame, screen: &Screen) -> Option<Position> {
         // user is reading, and it is drawn last so it wins over the popup.
         if let Some(anchor) = cursor {
             draw_diagnostic_float(buf, pane_area, anchor, float, screen.theme);
+        }
+    }
+    if let Some(hover) = screen.hover {
+        // Hover is asked for explicitly (`K`), so it is drawn over everything
+        // else: the user is waiting for this answer.
+        if let Some(anchor) = cursor {
+            draw_hover(buf, pane_area, anchor, hover, screen.theme);
         }
     }
     cursor
@@ -1472,6 +1481,64 @@ fn draw_diagnostic_float(
     }
 }
 
+/// Draw the language server's answer to `K` on a card.
+///
+/// Hover text is often several lines (a signature plus documentation), so the
+/// card is sized to the wrapped text and capped to the pane.  It opens above the
+/// caret when there is room, so it never covers the symbol being asked about.
+fn draw_hover(buf: &mut Buffer, screen: Rect, anchor: Position, text: &str, theme: &Theme) {
+    if screen.width < 12 || screen.height < 5 {
+        return;
+    }
+    let widest = text.lines().map(|line| line.chars().count()).max().unwrap_or(0);
+    let width = (widest + 4)
+        .clamp(20, (screen.width as usize).saturating_sub(2))
+        .min(screen.width as usize) as u16;
+    let inner = width.saturating_sub(2) as usize;
+    // Wrap each source line separately: a hover's own line breaks are
+    // meaningful (signature, then documentation).
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            lines.push(String::new());
+        } else {
+            lines.extend(wrap_text(line, inner));
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    if height < 3 {
+        return;
+    }
+
+    let y = if anchor.y >= height {
+        anchor.y - height
+    } else {
+        (anchor.y + 1).min(screen.bottom().saturating_sub(height))
+    };
+    let x = anchor.x.min(screen.right().saturating_sub(width));
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+
+    draw_card(buf, area, theme);
+    for (row, line) in lines.iter().enumerate() {
+        let y = area.y + 1 + row as u16;
+        if y >= area.bottom().saturating_sub(1) {
+            break;
+        }
+        emit(buf, area.x + 1, y, line, theme.text, 0, inner);
+    }
+}
+
 /// Break `text` into lines of at most `width` characters, on word boundaries
 /// where possible.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -1549,6 +1616,7 @@ mod tests {
             picker: None,
             completion: None,
             diagnostic_float: None,
+            hover: None,
         };
         let (status_area, pane_area, message_area) = areas(area, config);
         buffer.set_style(area, theme.text);
@@ -1722,6 +1790,7 @@ mod tests {
             picker: None,
             completion: None,
             diagnostic_float: Some(DiagnosticFloat { diagnostic }),
+            hover: None,
         };
         let (_, pane_area, _) = areas(area, &config);
         draw_panes(&mut buffer, pane_area, &screen);
@@ -2048,6 +2117,7 @@ mod tests {
             picker: None,
             completion: None,
             diagnostic_float: None,
+            hover: None,
         };
         draw_panes(&mut buffer, area, &screen);
         let rendered = frame_text(&buffer);

@@ -204,6 +204,10 @@ pub enum Cmd {
     /// Jump to the next (`]d`) or previous (`[d`) diagnostic in the buffer.
     DiagnosticNext,
     DiagnosticPrev,
+    /// Ask the language server what is at the caret (`K`).
+    Hover,
+    /// Ask the language server for quick fixes at the caret.
+    CodeAction,
     FormatBuffer,
     /// Run an ex command, used by keybindings such as `"bn" = "bnext"`.
     Ex(String),
@@ -966,6 +970,16 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
         "diagnostic-prev",
         Action::Cmd(Cmd::DiagnosticPrev),
         "jump to previous diagnostic",
+    ),
+    (
+        "hover",
+        Action::Cmd(Cmd::Hover),
+        "show what is under the cursor",
+    ),
+    (
+        "code-action",
+        Action::Cmd(Cmd::CodeAction),
+        "quick fixes at the cursor",
     ),
     (
         "format-buffer",

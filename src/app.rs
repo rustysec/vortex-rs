@@ -62,6 +62,8 @@ pub enum PromptKind {
     Palette,
     Spell { span: crate::selection::Span },
     Diagnostics,
+    /// Quick fixes offered by the language server.
+    CodeActions,
 }
 
 /// A hit picked from a search list.
@@ -89,6 +91,13 @@ pub struct CommandPayload(pub String);
 /// Payload of a spelling suggestion.
 #[derive(Debug, Clone)]
 pub struct WordPayload(pub String);
+
+/// Payload of a quick-fix row: which action in the pending list it is.
+#[derive(Debug, Clone, Copy)]
+pub struct CodeActionPayload {
+    pub buffer: BufferId,
+    pub index: usize,
+}
 
 pub struct App {
     pub editor: Editor,
@@ -118,12 +127,24 @@ pub struct App {
     spell_checked: HashMap<BufferId, u64>,
     /// The open completion popup, if any.
     pub completion: Option<crate::completion::Completion>,
-    /// The next completion request id, so a late answer can be matched.
-    next_completion_request: i64,
+    /// The next request id, shared by every kind of LSP request so a late
+    /// answer can be matched to the request that asked for it.
+    next_request: i64,
     /// The request we are waiting for: `(id, prefix start, buffer)`.
     completion_pending: Option<(i64, usize, BufferId)>,
     /// When the next completion request is due, for debouncing keystrokes.
     completion_due: Option<Instant>,
+    /// The hover text to show, and the request it answers.
+    pub hover: Option<String>,
+    /// The hover request in flight: `(id, buffer)`.
+    hover_pending: Option<(i64, BufferId)>,
+    /// The LSP format request in flight: `(id, buffer)`.
+    format_pending: Option<(i64, BufferId)>,
+    /// The code-action request in flight: `(id, buffer)`.
+    code_action_pending: Option<(i64, BufferId)>,
+    /// The quick fixes the last code-action answer offered, indexed by the
+    /// picker's payload.
+    code_actions: Vec<lsp::CodeAction>,
     /// When the caret came to rest on the diagnostic it is currently on, so the
     /// float only appears after a deliberate pause.
     diagnostic_hold: Option<(usize, Instant)>,
@@ -192,9 +213,14 @@ impl App {
             last_change: HashMap::new(),
             spell_checked: HashMap::new(),
             completion: None,
-            next_completion_request: 1,
+            next_request: 1,
             completion_pending: None,
             completion_due: None,
+            hover: None,
+            hover_pending: None,
+            format_pending: None,
+            code_action_pending: None,
+            code_actions: Vec::new(),
             diagnostic_hold: None,
             diagnostic_float_shown: false,
             last_frame: Rect::new(0, 0, 80, 24),
@@ -461,6 +487,11 @@ impl App {
             self.message = None;
             self.message_expiry = None;
         }
+        // A hover card is dismissed by the next key, the way a tooltip is: it
+        // is an answer to one question, not a mode.
+        if self.hover.take().is_some() {
+            self.needs_redraw = true;
+        }
 
         if self.prompt.is_some() {
             let kind = self
@@ -682,6 +713,9 @@ impl App {
                 }
                 Intent::Parse(id) => self.spawn_parse(id),
                 Intent::Format(id) => self.spawn_format(id),
+                Intent::RangeFormat(id, span) => self.spawn_range_format(id, span),
+                Intent::Hover => self.request_hover(),
+                Intent::CodeAction => self.request_code_actions(),
                 Intent::Spell(id) => self.spawn_spell(id),
                 Intent::FindFiles(query) => {
                     let kind = PromptKind::FindFiles;
@@ -862,7 +896,8 @@ impl App {
             | PromptKind::SwitchBuffer
             | PromptKind::Palette
             | PromptKind::Spell { .. }
-            | PromptKind::Diagnostics => {}
+            | PromptKind::Diagnostics
+            | PromptKind::CodeActions => {}
         }
         self.needs_redraw = true;
     }
@@ -984,8 +1019,39 @@ impl App {
                     None => self.set_message(StatusLevel::Warn, "no diagnostic selected"),
                 }
             }
+            PromptKind::CodeActions => {
+                let payload = item
+                    .and_then(|index| prompt.item(index))
+                    .and_then(|item| item.payload_as::<CodeActionPayload>())
+                    .copied();
+                match payload {
+                    Some(payload) => self.apply_code_action(payload),
+                    None => self.set_message(StatusLevel::Warn, "no quick fix selected"),
+                }
+            }
         }
         self.needs_redraw = true;
+    }
+
+    /// Apply the quick fix a picker row refers to.
+    fn apply_code_action(&mut self, payload: CodeActionPayload) {
+        let Some(action) = self.code_actions.get(payload.index) else {
+            self.set_message(StatusLevel::Warn, "that quick fix is gone");
+            return;
+        };
+        let title = action.title.clone();
+        let edits = action.edits.clone();
+        // A quick fix is a change the user chose, so it gets its own undo step
+        // rather than folding into whatever they typed before.
+        let applied = self
+            .editor
+            .apply_edits(payload.buffer, &edits, crate::buffer::ChangeGroup::Command);
+        if applied == 0 {
+            self.set_message(StatusLevel::Warn, "the quick fix changed nothing");
+            return;
+        }
+        self.set_message(StatusLevel::Info, title);
+        self.apply_intents(vec![Intent::EnsureVisible]);
     }
 
     fn prompt_index(&self, prompt: &Prompt) -> Option<usize> {
@@ -1384,7 +1450,20 @@ impl App {
         syntax::spawn_parse(self.events.sender(), id, version, language, text, slot);
     }
 
+    /// Format `id`, preferring the language server over the external formatter.
+    ///
+    /// The server knows the language's own rules and can format a range, so it
+    /// is asked first; the external formatter is the fallback for languages
+    /// with no server, and for a server that refuses the request.
     fn spawn_format(&mut self, id: BufferId) {
+        if self.request_lsp_format(id) {
+            return;
+        }
+        self.spawn_external_format(id);
+    }
+
+    /// Run the configured external formatter for `id`.
+    fn spawn_external_format(&mut self, id: BufferId) {
         let Some(buffer) = self.editor.buffer(id) else {
             return;
         };
@@ -1617,6 +1696,28 @@ impl App {
             } => {
                 self.on_completions(uri, request, items);
             }
+            LspEvent::Hover {
+                uri,
+                request,
+                text,
+            } => {
+                self.on_hover(uri, request, text);
+            }
+            LspEvent::Formatted {
+                uri,
+                request,
+                edits,
+                error,
+            } => {
+                self.on_formatted(uri, request, edits, error);
+            }
+            LspEvent::CodeActions {
+                uri,
+                request,
+                actions,
+            } => {
+                self.on_code_actions(uri, request, actions);
+            }
         }
     }
 
@@ -1704,9 +1805,10 @@ impl App {
         let root = search::project_root(Some(&path));
         let uri = lsp::uri_for(&path);
         let line = buffer.line_of(cursor);
-        let character = buffer.char_in_line(cursor);
-        let request = self.next_completion_request;
-        self.next_completion_request += 1;
+        // LSP positions are UTF-16 code units, not character indices.
+        let character = buffer.utf16_col_in_line(cursor);
+        let request = self.next_request;
+        self.next_request += 1;
         let sender = self.events.sender();
         if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
             client.complete(uri, request, line, character, trigger);
@@ -1753,6 +1855,303 @@ impl App {
         }
         self.completion = Some(completion);
         self.needs_redraw = true;
+    }
+
+    // ------------------------------------------------------- hover / format
+
+    /// Ask the server what is at the caret (`K`).
+    fn request_hover(&mut self) {
+        if !self.editor.config.lsp.enable {
+            return;
+        }
+        let Some(id) = self.editor.current_buffer_id() else {
+            return;
+        };
+        let Some(buffer) = self.editor.buffer(id) else {
+            return;
+        };
+        let Some(path) = buffer.path().map(|path| path.to_path_buf()) else {
+            return;
+        };
+        let language = buffer.language.id.to_string();
+        let Some(spec) = self.server_spec_for(&language) else {
+            return;
+        };
+        let cursor = self.editor.cursor();
+        let line = buffer.line_of(cursor);
+        // LSP positions are UTF-16 code units, not character indices.
+        let character = buffer.utf16_col_in_line(cursor);
+        let root = search::project_root(Some(&path));
+        let uri = lsp::uri_for(&path);
+        let request = self.next_request;
+        self.next_request += 1;
+        let sender = self.events.sender();
+        if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
+            client.hover(uri, request, line, character);
+            self.hover_pending = Some((request, id));
+        }
+    }
+
+    /// A server answered a hover request.
+    fn on_hover(&mut self, uri: String, request: i64, text: String) {
+        // Only the answer to the request we are waiting for is interesting: a
+        // slower answer for an older caret would describe the wrong symbol.
+        let Some((pending, buffer)) = self.hover_pending else {
+            return;
+        };
+        if pending != request {
+            return;
+        }
+        self.hover_pending = None;
+        let Some(path) = self.editor.buffer(buffer).and_then(|b| b.path()) else {
+            return;
+        };
+        if lsp::uri_for(path) != uri {
+            return;
+        }
+        if text.trim().is_empty() {
+            self.set_message(StatusLevel::Info, "no hover information");
+            return;
+        }
+        self.hover = Some(text);
+        self.needs_redraw = true;
+    }
+
+    /// Ask the server to format `id`, falling back to the external formatter.
+    ///
+    /// The server is preferred when one is configured: it knows the language's
+    /// own rules, and it can format a range rather than the whole buffer.
+    fn request_lsp_format(&mut self, id: BufferId) -> bool {
+        if !self.editor.config.lsp.enable {
+            return false;
+        }
+        let Some(buffer) = self.editor.buffer(id) else {
+            return false;
+        };
+        let Some(path) = buffer.path().map(|path| path.to_path_buf()) else {
+            return false;
+        };
+        let language = buffer.language.id.to_string();
+        let Some(spec) = self.server_spec_for(&language) else {
+            return false;
+        };
+        let tab_size = self.editor.config.editor.tab_width_for(&language);
+        let insert_spaces = self.editor.config.editor.expand_tab_for(&language);
+        let root = search::project_root(Some(&path));
+        let uri = lsp::uri_for(&path);
+        let request = self.next_request;
+        self.next_request += 1;
+        let sender = self.events.sender();
+        if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
+            client.format(uri, request, tab_size, insert_spaces);
+            self.format_pending = Some((request, id));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ask the server to format one range of `id` (`=` on a motion).
+    ///
+    /// Falls back to the whole-buffer formatter when no server is configured:
+    /// an external formatter has no way to be told about a range.
+    fn spawn_range_format(&mut self, id: BufferId, span: crate::selection::Span) {
+        if !self.editor.config.lsp.enable {
+            self.spawn_external_format(id);
+            return;
+        }
+        let Some(buffer) = self.editor.buffer(id) else {
+            return;
+        };
+        let Some(path) = buffer.path().map(|path| path.to_path_buf()) else {
+            self.spawn_external_format(id);
+            return;
+        };
+        let language = buffer.language.id.to_string();
+        let Some(spec) = self.server_spec_for(&language) else {
+            self.spawn_external_format(id);
+            return;
+        };
+        let tab_size = self.editor.config.editor.tab_width_for(&language);
+        let insert_spaces = self.editor.config.editor.expand_tab_for(&language);
+        // LSP ranges are line/UTF-16-column pairs, so the byte span is
+        // converted back through the buffer's own line table.
+        let start = (
+            buffer.line_of(span.start),
+            buffer.utf16_col_in_line(span.start),
+        );
+        let end = (
+            buffer.line_of(span.end),
+            buffer.utf16_col_in_line(span.end),
+        );
+        let root = search::project_root(Some(&path));
+        let uri = lsp::uri_for(&path);
+        let request = self.next_request;
+        self.next_request += 1;
+        let sender = self.events.sender();
+        if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
+            client.range_format(uri, request, start, end, tab_size, insert_spaces);
+            self.format_pending = Some((request, id));
+        } else {
+            self.spawn_external_format(id);
+        }
+    }
+
+    /// A server answered a formatting request.
+    fn on_formatted(
+        &mut self,
+        uri: String,
+        request: i64,
+        edits: Vec<lsp::TextEdit>,
+        error: Option<String>,
+    ) {
+        let Some((pending, buffer)) = self.format_pending else {
+            return;
+        };
+        if pending != request {
+            return;
+        }
+        self.format_pending = None;
+        let Some(path) = self.editor.buffer(buffer).and_then(|b| b.path()) else {
+            return;
+        };
+        if lsp::uri_for(path) != uri {
+            return;
+        }
+        if let Some(error) = error {
+            // The server refused the request.  Fall back to the external
+            // formatter rather than leaving the buffer unformatted with no
+            // explanation.
+            self.set_message(
+                StatusLevel::Warn,
+                format!("language server could not format: {error}"),
+            );
+            self.spawn_external_format(buffer);
+            return;
+        }
+        if edits.is_empty() {
+            // The server had nothing to change; that is not an error.
+            return;
+        }
+        // `:format` is something the user asked for, so it gets its own undo
+        // step; an automatic run folds into the edit it followed.
+        let asked = self.editor.format_requested == Some(buffer);
+        self.editor.format_requested = None;
+        let group = if asked {
+            crate::buffer::ChangeGroup::Command
+        } else {
+            crate::buffer::ChangeGroup::Format
+        };
+        let applied = self.editor.apply_edits(buffer, &edits, group);
+        if applied > 0 {
+            self.set_message(
+                StatusLevel::Info,
+                format!("formatted with the language server ({applied} edit(s))"),
+            );
+        }
+        self.needs_redraw = true;
+    }
+
+    // ---------------------------------------------------------- code actions
+
+    /// Ask for quick fixes covering the caret's line.
+    ///
+    /// Every early exit says why: a key that silently does nothing reads as a
+    /// broken key, and the usual cause is a switch that is off rather than a
+    /// server with nothing to offer.
+    fn request_code_actions(&mut self) {
+        if !self.editor.config.lsp.enable {
+            self.set_message(
+                StatusLevel::Info,
+                "quick fixes need [lsp] enable = true",
+            );
+            return;
+        }
+        let Some(id) = self.editor.current_buffer_id() else {
+            return;
+        };
+        let Some(buffer) = self.editor.buffer(id) else {
+            return;
+        };
+        let Some(path) = buffer.path().map(|path| path.to_path_buf()) else {
+            self.set_message(
+                StatusLevel::Info,
+                "quick fixes need a file on disk (the server keys documents by path)",
+            );
+            return;
+        };
+        let language = buffer.language.id.to_string();
+        let Some(spec) = self.server_spec_for(&language) else {
+            self.set_message(
+                StatusLevel::Info,
+                format!("no language server configured for {language}"),
+            );
+            return;
+        };
+        // The whole line, not just the caret: a quick fix for an unused binding
+        // covers the binding, and the caret may sit anywhere on it.
+        let cursor = self.editor.cursor();
+        let line = buffer.line_of(cursor);
+        let line_start = buffer.line_start(line);
+        let line_end = buffer.line_end(line);
+        // LSP positions are UTF-16 code units, so the byte offsets are converted
+        // rather than sent as character indices.
+        let start = (line, buffer.utf16_col_in_line(line_start));
+        let end = (line, buffer.utf16_col_in_line(line_end));
+        // The diagnostics on this line are what the server keys its fixes off;
+        // sending an empty list means an empty answer.
+        let diagnostics: Vec<serde_json::Value> = buffer
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.range.start <= line_end && diagnostic.range.end >= line_start
+            })
+            .map(|diagnostic| lsp::diagnostic_json(buffer, diagnostic))
+            .collect();
+        let root = search::project_root(Some(&path));
+        let uri = lsp::uri_for(&path);
+        let request = self.next_request;
+        self.next_request += 1;
+        let sender = self.events.sender();
+        if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
+            client.code_action(uri, request, start, end, diagnostics);
+            self.code_action_pending = Some((request, id));
+        }
+    }
+
+    /// A server answered a code-action request.
+    fn on_code_actions(&mut self, uri: String, request: i64, actions: Vec<lsp::CodeAction>) {
+        let Some((pending, buffer)) = self.code_action_pending else {
+            return;
+        };
+        if pending != request {
+            return;
+        }
+        self.code_action_pending = None;
+        let Some(path) = self.editor.buffer(buffer).and_then(|b| b.path()) else {
+            return;
+        };
+        if lsp::uri_for(path) != uri {
+            return;
+        }
+        if actions.is_empty() {
+            self.set_message(StatusLevel::Info, "no quick fixes here");
+            return;
+        }
+        let items: Vec<prompt::Item> = actions
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                prompt::Item::new(action.title.clone())
+                    .detail(format!("{} edit(s)", action.edits.len()))
+                    .payload(CodeActionPayload {
+                        buffer,
+                        index,
+                    })
+            })
+            .collect();
+        self.code_actions = actions;
+        self.open_picker(PromptKind::CodeActions, "quick fixes", "", items);
     }
 
     /// Handle a key while the completion popup is open.
@@ -2056,6 +2455,7 @@ impl App {
                         | PromptKind::Palette
                         | PromptKind::Spell { .. }
                         | PromptKind::Diagnostics
+                        | PromptKind::CodeActions
                 )
             })
             .map(|(_, prompt)| CommandLine {
@@ -2114,6 +2514,7 @@ impl App {
             picker,
             completion,
             diagnostic_float,
+            hover: self.hover.as_deref(),
         };
 
         let terminal = &mut self.terminal;

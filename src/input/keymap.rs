@@ -422,6 +422,8 @@ fn cmd_name(command: &Cmd) -> String {
         Cmd::ShowDiagnostics => "show-diagnostics",
         Cmd::DiagnosticNext => "diagnostic-next",
         Cmd::DiagnosticPrev => "diagnostic-prev",
+        Cmd::Hover => "hover",
+        Cmd::CodeAction => "code-action",
         Cmd::FormatBuffer => "format-buffer",
         Cmd::Ex(command) => return command.clone(),
         Cmd::ForceQuitAll => "force-quit-all",

@@ -729,6 +729,21 @@ impl Buffer {
         self.rope.byte_to_char(byte) - self.rope.byte_to_char(start)
     }
 
+    /// UTF-16 column of `byte` within its line, the inverse of
+    /// [`Buffer::byte_at_utf16`].
+    ///
+    /// LSP positions are UTF-16 code units, so a byte offset has to be converted
+    /// before it can be sent to a server.
+    pub fn utf16_col_in_line(&self, byte: usize) -> usize {
+        let byte = self.floor_byte(byte);
+        let line = self.line_of(byte);
+        let start = self.line_start(line);
+        self.slice(Span::new(start, byte))
+            .chars()
+            .map(char::len_utf16)
+            .sum()
+    }
+
     /// `byte`, moved back to the start of the character containing it.
     ///
     /// ropey panics when handed an offset inside a character, and callers pass

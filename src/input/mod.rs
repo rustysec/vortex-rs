@@ -388,6 +388,9 @@ pub const DEFAULT_BINDINGS: &[(&str, &[(&str, &str)])] = &[
             ("space d", "show-diagnostics"),
             ("]d", "diagnostic-next"),
             ("[d", "diagnostic-prev"),
+            // vim's `K` keyword lookup, answered by the language server.
+            ("K", "hover"),
+            ("space a", "code-action"),
             ("space e", "spell-suggest"),
             // vim's spelling suggestion key.
             ("z=", "spell-suggest"),

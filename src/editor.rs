@@ -40,6 +40,12 @@ pub enum Intent {
     Parse(BufferId),
     /// Run the formatter for `buffer`.
     Format(BufferId),
+    /// Ask the language server to format one byte range of `buffer`.
+    RangeFormat(BufferId, crate::selection::Span),
+    /// Ask the language server what is at the caret.
+    Hover,
+    /// Ask the language server for quick fixes at the caret.
+    CodeAction,
     /// Spell check `buffer`.
     Spell(BufferId),
     /// Start a file-name search.
@@ -1258,16 +1264,21 @@ impl Editor {
                 };
                 self.apply(changes, ChangeGroup::Operator);
                 self.set_cursor(self.indent_of_line_at(start));
-                // A configured external formatter handles the whole buffer.
+                // A whole-buffer formatter handles the rest: the language
+                // server when one is configured (it can format just this
+                // range), otherwise the external formatter.
                 let language = self
                     .current_buffer()
                     .map(|buffer| buffer.language.id)
                     .unwrap_or("text");
-                if region.linewise && crate::format::formatter_for(language, &self.config).is_some()
-                {
-                    intents.push(Intent::Format(
-                        self.current_buffer_id().expect("focused buffer"),
-                    ));
+                let has_formatter = crate::format::formatter_for(language, &self.config).is_some();
+                if region.linewise && (has_formatter || self.config.lsp.enable) {
+                    let id = self.current_buffer_id().expect("focused buffer");
+                    if self.config.lsp.enable {
+                        intents.push(Intent::RangeFormat(id, region.extent()));
+                    } else {
+                        intents.push(Intent::Format(id));
+                    }
                 }
             }
             Operator::SwapCase | Operator::Upper | Operator::Lower => {
@@ -1649,6 +1660,8 @@ impl Editor {
             Cmd::ShowDiagnostics => intents.push(Intent::OpenPrompt(PromptSpec::Diagnostics)),
             Cmd::DiagnosticNext => intents.extend(self.diagnostic_jump(true, area)),
             Cmd::DiagnosticPrev => intents.extend(self.diagnostic_jump(false, area)),
+            Cmd::Hover => intents.push(Intent::Hover),
+            Cmd::CodeAction => intents.push(Intent::CodeAction),
             Cmd::SpellSuggest => intents.extend(self.spell_suggest()),
             Cmd::FormatBuffer => {
                 if let Some(id) = self.current_buffer_id() {
@@ -2962,6 +2975,51 @@ impl Editor {
         vec![Intent::EnsureVisible]
     }
 
+    /// Apply a set of server-supplied edits to `id` as one undo step.
+    ///
+    /// The edits arrive as byte spans in the text the server was told about, so
+    /// they are applied back-to-front: applying them in order would shift every
+    /// later span by the length of the earlier replacement.  Returns how many
+    /// edits landed, so the caller can say "nothing to do" when the server sent
+    /// an empty list.
+    pub fn apply_edits(
+        &mut self,
+        id: BufferId,
+        edits: &[crate::lsp::TextEdit],
+        group: ChangeGroup,
+    ) -> usize {
+        if edits.is_empty() || self.buffer(id).is_none_or(|buffer| buffer.read_only) {
+            return 0;
+        }
+        let mut ordered: Vec<&crate::lsp::TextEdit> = edits.iter().collect();
+        ordered.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+        let changes: Vec<Change> = ordered
+            .into_iter()
+            .map(|edit| Change::replace(edit.range, edit.new_text.clone()))
+            .collect();
+        // The focused pane's selection is the one that has to survive; other
+        // panes showing the same buffer keep their own cursors, which the
+        // buffer's edit mapping already moves.
+        let mut selection = self
+            .current_pane()
+            .map(|pane| pane.selection.clone())
+            .unwrap_or_else(|| Selection::point(0));
+        let applied = {
+            let Some(buffer) = self.buffer_mut(id) else {
+                return 0;
+            };
+            buffer.apply(changes, group, &mut selection)
+        };
+        if let Some(pane_id) = self.layout.focused()
+            && let Some(pane) = self.layout.pane_mut(pane_id)
+            && pane.buffer == id
+        {
+            pane.selection = selection;
+            pane.view.wanted_col = None;
+        }
+        applied.len()
+    }
+
     /// Store diagnostics from a background job, replacing that source's set.
     pub fn set_diagnostics(
         &mut self,
@@ -4151,6 +4209,66 @@ mod tests {
         fixture.feed("A");
         fixture.editor.paste_text(" + 2");
         assert_eq!(fixture.text(), "    let a = 1; + 2\n");
+    }
+
+    // ------------------------------------------------------------ lsp edits
+
+    fn edit(range: std::ops::Range<usize>, text: &str) -> crate::lsp::TextEdit {
+        crate::lsp::TextEdit {
+            range: crate::selection::Span::new(range.start, range.end),
+            new_text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn server_edits_apply_back_to_front() {
+        // Two edits on one line: applying them in order would shift the second
+        // span by the length of the first replacement.
+        let mut fixture = Fixture::new("fn  main( ) {}\n");
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        let applied = fixture.editor.apply_edits(
+            id,
+            &[edit(2..4, " "), edit(9..10, "")],
+            ChangeGroup::Format,
+        );
+        assert_eq!(applied, 2);
+        assert_eq!(fixture.text(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn an_empty_edit_list_changes_nothing() {
+        let mut fixture = Fixture::new("let a = 1;\n");
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        assert_eq!(
+            fixture.editor.apply_edits(id, &[], ChangeGroup::Format),
+            0
+        );
+        assert_eq!(fixture.text(), "let a = 1;\n");
+    }
+
+    #[test]
+    fn a_read_only_buffer_refuses_server_edits() {
+        let mut fixture = Fixture::new("let a = 1;\n");
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.editor.buffer_mut(id).expect("a buffer").read_only = true;
+        assert_eq!(
+            fixture.editor.apply_edits(id, &[edit(0..3, "const")], ChangeGroup::Format),
+            0
+        );
+        assert_eq!(fixture.text(), "let a = 1;\n");
+    }
+
+    #[test]
+    fn a_quick_fix_is_one_undo_step() {
+        // A code action is a change the user chose, so one `u` takes it back.
+        let mut fixture = Fixture::new("let unused = 1;\n");
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture
+            .editor
+            .apply_edits(id, &[edit(0..15, "")], ChangeGroup::Command);
+        assert_eq!(fixture.text(), "\n");
+        fixture.feed("u");
+        assert_eq!(fixture.text(), "let unused = 1;\n");
     }
 
     // ------------------------------------------------------------- highlighting
