@@ -1511,20 +1511,30 @@ impl App {
             LspEvent::Progress { language, message } => {
                 self.set_message(StatusLevel::Info, format!("{language}: {message}"));
             }
-            LspEvent::Diagnostics { uri, items } => {
+            LspEvent::Diagnostics {
+                uri,
+                version,
+                items,
+            } => {
                 let Some(path) = lsp::path_for_uri(&uri) else {
                     return;
                 };
                 let Some(id) = self.editor.buffer_by_path(&path) else {
                     return;
                 };
-                let (starts, length) = match self.editor.buffer(id) {
-                    Some(buffer) => (lsp::line_starts(&buffer.text()), buffer.len_bytes()),
-                    None => return,
+                let Some(buffer) = self.editor.buffer(id) else {
+                    return;
                 };
+                // A publish for a version the buffer has already moved past
+                // describes text that no longer exists; its ranges would land
+                // on the wrong characters.  Servers that omit the version are
+                // trusted, since there is nothing to compare against.
+                if version.is_some_and(|version| version < buffer.version as i64) {
+                    return;
+                }
                 let diagnostics: Vec<_> = items
                     .iter()
-                    .map(|item| item.to_diagnostic(&starts, length))
+                    .map(|item| item.to_diagnostic(buffer))
                     .collect();
                 self.editor
                     .set_diagnostics(id, DiagnosticSource::Lsp, diagnostics);

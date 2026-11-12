@@ -1647,6 +1647,8 @@ impl Editor {
                 intents.push(Intent::OpenPrompt(PromptSpec::Palette(String::new())))
             }
             Cmd::ShowDiagnostics => intents.push(Intent::OpenPrompt(PromptSpec::Diagnostics)),
+            Cmd::DiagnosticNext => intents.extend(self.diagnostic_jump(true, area)),
+            Cmd::DiagnosticPrev => intents.extend(self.diagnostic_jump(false, area)),
             Cmd::SpellSuggest => intents.extend(self.spell_suggest()),
             Cmd::FormatBuffer => {
                 if let Some(id) = self.current_buffer_id() {
@@ -2650,6 +2652,68 @@ impl Editor {
             pane.view.scroll_line = scroll;
         }
         Some(Intent::EnsureVisible)
+    }
+
+    /// `]d` / `[d`: move to the next or previous diagnostic, wrapping around.
+    ///
+    /// Diagnostics are ordered by position so the jump follows the text rather
+    /// than the order the servers happened to publish them in.  The target line
+    /// is centred, which is what makes a jump read as "take me there" instead of
+    /// "nudge the caret".
+    fn diagnostic_jump(&mut self, forward: bool, area: Rect) -> Vec<Intent> {
+        let Some(buffer) = self.current_buffer() else {
+            return Vec::new();
+        };
+        let cursor = self.cursor();
+        let mut starts: Vec<usize> = buffer
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.range.start)
+            .collect();
+        if starts.is_empty() {
+            return vec![Intent::Message(
+                StatusLevel::Info,
+                "no diagnostics".into(),
+            )];
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        let target = if forward {
+            starts
+                .iter()
+                .find(|start| **start > cursor)
+                .copied()
+                .unwrap_or(starts[0])
+        } else {
+            starts
+                .iter()
+                .rev()
+                .find(|start| **start < cursor)
+                .copied()
+                .unwrap_or(*starts.last().unwrap())
+        };
+        let message = buffer
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.range.start == target)
+            .map(|diagnostic| {
+                format!(
+                    "{}: {}",
+                    diagnostic.severity.label(),
+                    diagnostic.message
+                )
+            })
+            .unwrap_or_default();
+        self.set_cursor(target);
+        let height = self.text_height(area);
+        let line = self.line_at(target);
+        if let Some(pane) = self.layout.focused_pane_mut() {
+            pane.view.scroll_line = line.saturating_sub(height / 2);
+        }
+        vec![
+            Intent::EnsureVisible,
+            Intent::Message(StatusLevel::Info, message),
+        ]
     }
 
     fn scroll_to_edge(&mut self, top: bool, area: Rect) -> Option<Intent> {
@@ -3662,6 +3726,67 @@ mod tests {
         fixture.feed("jO");
         assert_eq!(fixture.text(), "fn main() {\n    \n    let a = 1;\n}\n");
         assert_eq!(caret_at(&fixture), (1, 4));
+    }
+
+    /// Give the fixture's buffer a diagnostic at each of `lines` (0-based).
+    fn mark_lines(fixture: &mut Fixture, lines: &[usize]) {
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        let diagnostics = {
+            let buffer = fixture.editor.buffer(id).expect("a buffer");
+            lines
+                .iter()
+                .map(|line| {
+                    let at = buffer.line_start(*line);
+                    Diagnostic::new(
+                        crate::selection::Span::new(at, at + 1),
+                        crate::diagnostic::Severity::Error,
+                        format!("problem on line {line}"),
+                        DiagnosticSource::Lsp,
+                    )
+                })
+                .collect()
+        };
+        fixture
+            .editor
+            .set_diagnostics(id, DiagnosticSource::Lsp, diagnostics);
+    }
+
+    #[test]
+    fn bracket_d_jumps_to_the_next_diagnostic_and_wraps() {
+        let mut fixture = Fixture::new("one\ntwo\nthree\nfour\n");
+        mark_lines(&mut fixture, &[1, 3]);
+        fixture.feed("]d");
+        assert_eq!(caret_at(&fixture).0, 1, "first jump lands on line 1");
+        fixture.feed("]d");
+        assert_eq!(caret_at(&fixture).0, 3, "second jump lands on line 3");
+        fixture.feed("]d");
+        assert_eq!(caret_at(&fixture).0, 1, "past the last one wraps around");
+    }
+
+    #[test]
+    fn bracket_d_back_jumps_to_the_previous_diagnostic_and_wraps() {
+        let mut fixture = Fixture::new("one\ntwo\nthree\nfour\n");
+        mark_lines(&mut fixture, &[1, 3]);
+        fixture.feed("G");
+        // `G` lands on line 3, which is itself flagged: `[d` steps back to the
+        // previous diagnostic rather than staying put.
+        fixture.feed("[d");
+        assert_eq!(caret_at(&fixture).0, 1, "back from the end finds line 1");
+        fixture.feed("[d");
+        assert_eq!(caret_at(&fixture).0, 3, "before the first one wraps");
+    }
+
+    #[test]
+    fn bracket_d_with_no_diagnostics_says_so() {
+        let mut fixture = Fixture::new("clean\n");
+        let intents = fixture.feed("]d");
+        assert!(
+            intents.iter().any(|intent| matches!(
+                intent,
+                Intent::Message(StatusLevel::Info, text) if text.contains("no diagnostics")
+            )),
+            "expected a message, got {intents:?}"
+        );
     }
 
     #[test]

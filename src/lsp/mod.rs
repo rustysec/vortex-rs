@@ -27,7 +27,7 @@ use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::buffer::BufferId;
+use crate::buffer::{Buffer, BufferId};
 use crate::config::Config;
 use crate::diagnostic::{Diagnostic, DiagnosticSource, Severity};
 use crate::event::{AsyncEvent, EventTx, JobId};
@@ -43,9 +43,13 @@ pub enum LspEvent {
     /// Diagnostics for one file.
     ///
     /// Ranges arrive as LSP line/character positions: only the editor owns the
-    /// buffer, so it converts them to byte offsets.
+    /// buffer, so it converts them to byte offsets.  `version` is the document
+    /// version the server analysed; a publish for a version the buffer has
+    /// already moved past is stale and must be dropped, or its ranges land on
+    /// text that has since changed.
     Diagnostics {
         uri: String,
+        version: Option<i64>,
         items: Vec<DiagnosticItem>,
     },
     /// A progress or status message worth showing in the status area.
@@ -141,15 +145,16 @@ pub struct DiagnosticItem {
 }
 
 impl DiagnosticItem {
-    /// Resolve to buffer byte offsets using the buffer's line table.
-    pub fn to_diagnostic(&self, line_starts: &[usize], content_len: usize) -> Diagnostic {
+    /// Resolve to buffer byte offsets.
+    ///
+    /// LSP columns are UTF-16 code units, so the buffer does the conversion —
+    /// treating them as bytes puts every diagnostic after a non-ASCII character
+    /// on the wrong span.
+    pub fn to_diagnostic(&self, buffer: &Buffer) -> Diagnostic {
+        let start = buffer.byte_at_utf16(self.range.0, self.range.1);
+        let end = buffer.byte_at_utf16(self.range.2, self.range.3);
         Diagnostic::new(
-            range_to_span(
-                line_starts,
-                content_len,
-                (self.range.0, self.range.1),
-                (self.range.2, self.range.3),
-            ),
+            Span::new(start, end),
             self.severity,
             format!("{}: {}", self.source, self.message),
             DiagnosticSource::Lsp,
@@ -192,12 +197,11 @@ pub fn diagnostic_items(params: &Value) -> Vec<DiagnosticItem> {
 
 /// Turn an LSP `{start,end}{line,character}` range into a byte span.
 ///
-/// `line_starts` are the buffer's line start offsets; `character` counts UTF-16
-/// code units in LSP, which is close enough for ASCII source and clamped
-/// otherwise.
+/// `line_starts` are the line start offsets of `text`; `character` counts
+/// UTF-16 code units, which is what LSP positions are measured in.
 pub fn range_to_span(
+    text: &str,
     line_starts: &[usize],
-    content_len: usize,
     start: (usize, usize),
     end: (usize, usize),
 ) -> Span {
@@ -206,12 +210,19 @@ pub fn range_to_span(
             .get(line.min(line_starts.len().saturating_sub(1)))
             .unwrap_or(&0)
     };
-    let start_byte = line_start(start.0) + start.1.min(4096);
-    let end_byte = line_start(end.0) + end.1.min(4096);
-    Span::new(
-        start_byte.min(content_len),
-        end_byte.clamp(start_byte.min(content_len), content_len),
-    )
+    let byte_at = |(line, character): (usize, usize)| {
+        let start = line_start(line);
+        let end = line_starts
+            .get(line + 1)
+            .copied()
+            .unwrap_or(text.len())
+            .min(text.len());
+        let slice = text.get(start..end).unwrap_or_default();
+        start + crate::buffer::utf16_col_to_byte(slice, character)
+    };
+    let start_byte = byte_at(start).min(text.len());
+    let end_byte = byte_at(end).clamp(start_byte, text.len());
+    Span::new(start_byte, end_byte)
 }
 
 fn position(value: &Value) -> Option<(usize, usize)> {
@@ -277,13 +288,9 @@ impl CompletionItem {
 /// Decode a `textDocument/completion` result.
 ///
 /// The result is either a bare array or a `CompletionList` with an `items`
-/// array; both shapes are legal and servers use both.  `line_starts` and
-/// `content_len` resolve a `textEdit`'s range to a byte span.
-pub fn completion_items(
-    result: &Value,
-    line_starts: &[usize],
-    content_len: usize,
-) -> Vec<CompletionItem> {
+/// array; both shapes are legal and servers use both.  `text` and its
+/// `line_starts` resolve a `textEdit`'s range to a byte span.
+pub fn completion_items(result: &Value, text: &str, line_starts: &[usize]) -> Vec<CompletionItem> {
     let items = result
         .get("items")
         .and_then(Value::as_array)
@@ -310,7 +317,7 @@ pub fn completion_items(
             let replace = item.pointer("/textEdit/range").and_then(|range| {
                 let start = position(range.get("start")?)?;
                 let end = position(range.get("end")?)?;
-                Some(range_to_span(line_starts, content_len, start, end))
+                Some(range_to_span(text, line_starts, start, end))
             });
             let documentation = item.get("documentation").and_then(|value| {
                 value.as_str().map(str::to_string).or_else(|| {
@@ -588,7 +595,7 @@ async fn session(
                                 let result = value.get("result").cloned().unwrap_or(Value::Null);
                                 let text = synced.get(&uri).cloned().unwrap_or_default();
                                 let starts = line_starts(&text);
-                                let items = completion_items(&result, &starts, text.len());
+                                let items = completion_items(&result, &text, &starts);
                                 tx.send_async(AsyncEvent::Lsp(LspEvent::Completions {
                                     uri,
                                     request: id,
@@ -604,8 +611,12 @@ async fn session(
                                     .and_then(Value::as_str)
                                     .unwrap_or_default()
                                     .to_string();
+                                let version = value
+                                    .pointer("/params/version")
+                                    .and_then(Value::as_i64);
                                 tx.send_async(AsyncEvent::Lsp(LspEvent::Diagnostics {
                                     uri,
+                                    version,
                                     items: diagnostic_items(&value),
                                 }));
                             }
@@ -829,7 +840,7 @@ mod tests {
     fn ranges_map_to_byte_offsets() {
         let text = "first\nsecond line\nthird\n";
         let starts = line_starts(text);
-        let span = range_to_span(&starts, text.len(), (1, 7), (1, 11));
+        let span = range_to_span(text, &starts, (1, 7), (1, 11));
         assert_eq!((&text[span.start..span.end]), "line");
     }
 
@@ -837,15 +848,38 @@ mod tests {
     fn ranges_are_clamped_to_the_buffer() {
         let text = "short\n";
         let starts = line_starts(text);
-        let span = range_to_span(&starts, text.len(), (0, 2), (9, 40));
+        let span = range_to_span(text, &starts, (0, 2), (9, 40));
         assert_eq!(span.start, 2);
         assert_eq!(span.end, text.len());
     }
 
     #[test]
+    fn lsp_columns_are_utf16_code_units() {
+        // `é` is one UTF-16 unit but two bytes; `😀` is two units and four
+        // bytes.  A column counted in bytes would land in the wrong place.
+        let text = "let é = 1;\nlet 😀 = 2;\n";
+        let starts = line_starts(text);
+        // `1` sits at UTF-16 column 8 on line 0.
+        let span = range_to_span(text, &starts, (0, 8), (0, 9));
+        assert_eq!(&text[span.start..span.end], "1");
+        // On line 1 the emoji occupies columns 4..6, so `2` is at column 9.
+        let span = range_to_span(text, &starts, (1, 9), (1, 10));
+        assert_eq!(&text[span.start..span.end], "2");
+    }
+
+    fn buffer_with(text: &str) -> Buffer {
+        Buffer::new(
+            BufferId(1),
+            None,
+            text.to_string(),
+            &crate::config::EditorConfig::default(),
+        )
+    }
+
+    #[test]
     fn diagnostics_decode_then_map_to_bytes() {
         let text = "let x = ;\nsecond line\n";
-        let starts = line_starts(text);
+        let buffer = buffer_with(text);
         let params = json!({
             "uri": "file:///tmp/x.rs",
             "diagnostics": [{
@@ -864,7 +898,7 @@ mod tests {
         assert_eq!(items.len(), 2);
         let diagnostics: Vec<Diagnostic> = items
             .iter()
-            .map(|item| item.to_diagnostic(&starts, text.len()))
+            .map(|item| item.to_diagnostic(&buffer))
             .collect();
         assert_eq!(diagnostics[0].severity, Severity::Error);
         assert!(diagnostics[0].message.contains("expected expression"));
@@ -930,7 +964,7 @@ mod tests {
             { "label": "print", "kind": 3, "detail": "fn(&str)" },
             { "label": "println", "insertText": "println!" }
         ]);
-        let items = completion_items(&result, &starts, text.len());
+        let items = completion_items(&result, text, &starts);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "print");
         assert_eq!(items[0].kind_label(), "fn");
@@ -951,7 +985,7 @@ mod tests {
             "isIncomplete": false,
             "items": [{ "label": "len", "kind": 2 }]
         });
-        let items = completion_items(&result, &starts, text.len());
+        let items = completion_items(&result, text, &starts);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "len");
     }
@@ -970,7 +1004,7 @@ mod tests {
                 "newText": "print"
             }
         }]);
-        let items = completion_items(&result, &starts, text.len());
+        let items = completion_items(&result, text, &starts);
         let span = items[0].replace.expect("a replace range");
         assert_eq!(&text[span.start..span.end], "pri");
     }
@@ -992,7 +1026,7 @@ mod tests {
                 "newText": "std::io"
             }
         }]);
-        let items = completion_items(&result, &starts, text.len());
+        let items = completion_items(&result, text, &starts);
         assert_eq!(items[0].text(), "std::io", "the newText is authoritative");
     }
 
@@ -1004,7 +1038,7 @@ mod tests {
             { "label": "main()", "insertTextFormat": 2, "insertText": "main($0)" },
             { "label": "plain", "insertTextFormat": 1, "insertText": "plain" }
         ]);
-        let items = completion_items(&result, &starts, text.len());
+        let items = completion_items(&result, text, &starts);
         assert!(items[0].snippet, "insertTextFormat 2 is a snippet");
         assert!(!items[1].snippet);
     }
@@ -1013,8 +1047,8 @@ mod tests {
     fn an_empty_or_error_result_offers_nothing() {
         let text = "x\n";
         let starts = line_starts(text);
-        assert!(completion_items(&Value::Null, &starts, text.len()).is_empty());
-        assert!(completion_items(&json!({ "items": [] }), &starts, text.len()).is_empty());
+        assert!(completion_items(&Value::Null, text, &starts).is_empty());
+        assert!(completion_items(&json!({ "items": [] }), text, &starts).is_empty());
     }
 
     fn open(uri: &str) -> Outgoing {

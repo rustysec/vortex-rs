@@ -420,6 +420,8 @@ fn cmd_name(command: &Cmd) -> String {
         Cmd::ToggleOption(option) => return format!("toggle-{}", option.key()),
         Cmd::SpellSuggest => "spell-suggest",
         Cmd::ShowDiagnostics => "show-diagnostics",
+        Cmd::DiagnosticNext => "diagnostic-next",
+        Cmd::DiagnosticPrev => "diagnostic-prev",
         Cmd::FormatBuffer => "format-buffer",
         Cmd::Ex(command) => return command.clone(),
         Cmd::ForceQuitAll => "force-quit-all",

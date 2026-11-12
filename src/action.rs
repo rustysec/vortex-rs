@@ -201,6 +201,9 @@ pub enum Cmd {
     ToggleOption(ToggleOption),
     SpellSuggest,
     ShowDiagnostics,
+    /// Jump to the next (`]d`) or previous (`[d`) diagnostic in the buffer.
+    DiagnosticNext,
+    DiagnosticPrev,
     FormatBuffer,
     /// Run an ex command, used by keybindings such as `"bn" = "bnext"`.
     Ex(String),
@@ -953,6 +956,16 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
         "show-diagnostics",
         Action::Cmd(Cmd::ShowDiagnostics),
         "list diagnostics",
+    ),
+    (
+        "diagnostic-next",
+        Action::Cmd(Cmd::DiagnosticNext),
+        "jump to next diagnostic",
+    ),
+    (
+        "diagnostic-prev",
+        Action::Cmd(Cmd::DiagnosticPrev),
+        "jump to previous diagnostic",
     ),
     (
         "format-buffer",

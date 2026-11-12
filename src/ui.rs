@@ -276,7 +276,7 @@ fn draw_pane(
     let cursor_line = buffer.line_of(cursor);
     let cursor_char = buffer.char_in_line(cursor);
 
-    let gutter = Gutter::new(config, line_count, cursor_line, focused);
+    let gutter = Gutter::new(config, buffer, cursor_line, focused);
     let text_width = content.width.saturating_sub(gutter.width as u16).max(1) as usize;
 
     let highlights = highlight_runs(
@@ -670,11 +670,15 @@ struct Gutter {
     width: usize,
     kind: LineNumber,
     cursor_line: usize,
+    /// One entry per line: the worst diagnostic on it, if any.
+    signs: Vec<Option<Severity>>,
+    /// Columns reserved to the left of the numbers for the sign column.
+    sign_width: usize,
 }
 
 impl Gutter {
     /// A gutter with `width == 0` means "no line numbers at all".
-    fn new(config: &Config, total_lines: usize, cursor_line: usize, focused: bool) -> Self {
+    fn new(config: &Config, buffer: &TextBuffer, cursor_line: usize, focused: bool) -> Self {
         let kind = match config.editor.line_number {
             LineNumber::None => LineNumber::None,
             // Relative numbers only make sense in the focused pane; others show
@@ -682,15 +686,26 @@ impl Gutter {
             LineNumber::Relative if !focused => LineNumber::Absolute,
             other => other,
         };
-        let width = if kind == LineNumber::None {
-            0
+        let total_lines = buffer.display_line_count();
+        let signs = if config.editor.diagnostic_signs {
+            sign_map(buffer)
         } else {
-            digits(total_lines) + 1
+            Vec::new()
+        };
+        // Only reserve the column when something is actually marked, so a clean
+        // buffer keeps the full text width.
+        let sign_width = usize::from(signs.iter().any(Option::is_some));
+        let width = if kind == LineNumber::None {
+            sign_width
+        } else {
+            digits(total_lines) + 1 + sign_width
         };
         Self {
             width,
             kind,
             cursor_line,
+            signs,
+            sign_width,
         }
     }
 
@@ -711,12 +726,26 @@ impl Gutter {
     }
 
     fn render(&self, buf: &mut Buffer, x: u16, y: u16, line: Option<usize>, theme: &Theme) {
-        if self.kind == LineNumber::None {
+        if self.width == 0 {
             return;
         }
         let Some(line) = line else {
             return;
         };
+        if self.sign_width > 0 {
+            let sign = self.signs.get(line).copied().flatten();
+            let (symbol, style) = match sign {
+                Some(severity) => (
+                    severity_sign(severity),
+                    diagnostic_style(severity, theme),
+                ),
+                None => (' ', theme.gutter),
+            };
+            buf.set_stringn(x, y, symbol.to_string(), 1, style);
+        }
+        if self.kind == LineNumber::None {
+            return;
+        }
         let text = self.number_for(line);
         let style = if line == self.cursor_line {
             theme.gutter_active
@@ -728,9 +757,39 @@ impl Gutter {
             right.saturating_sub(text.chars().count() as u16),
             y,
             text,
-            self.width,
+            self.width - self.sign_width,
             style,
         );
+    }
+}
+
+/// The worst diagnostic severity on each line, for the sign column.
+///
+/// A diagnostic that spans several lines marks every line it covers, so a
+/// multi-line error is visible wherever the user scrolls to.
+fn sign_map(buffer: &TextBuffer) -> Vec<Option<Severity>> {
+    let mut signs: Vec<Option<Severity>> = vec![None; buffer.display_line_count()];
+    for diagnostic in &buffer.diagnostics {
+        let first = buffer.line_of(diagnostic.range.start);
+        let last = buffer.line_of(diagnostic.range.end);
+        for line in first..=last.min(signs.len().saturating_sub(1)) {
+            let slot = &mut signs[line];
+            *slot = Some(match *slot {
+                Some(existing) => existing.max(diagnostic.severity),
+                None => diagnostic.severity,
+            });
+        }
+    }
+    signs
+}
+
+/// The one-character marker for a severity in the sign column.
+fn severity_sign(severity: Severity) -> char {
+    match severity {
+        Severity::Error => '●',
+        Severity::Warning => '▲',
+        Severity::Info => '■',
+        Severity::Hint => '○',
     }
 }
 
@@ -944,7 +1003,7 @@ pub fn byte_at(
     let line_count = buffer.display_line_count();
     let scroll = view.scroll_line.min(line_count.saturating_sub(1));
     let cursor_line = buffer.line_of(selection.cursor());
-    let gutter = Gutter::new(config, line_count, cursor_line, true);
+    let gutter = Gutter::new(config, buffer, cursor_line, true);
     let text_width = content.width.saturating_sub(gutter.width as u16).max(1) as usize;
     let line_row = usize::from(row.checked_sub(content.y)?);
 

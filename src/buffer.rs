@@ -745,6 +745,20 @@ impl Buffer {
         self.rope.char_to_byte(target)
     }
 
+    /// Byte offset of an LSP position: `line` is 0-based, `character` counts
+    /// UTF-16 code units from the start of the line.
+    ///
+    /// LSP measures columns in UTF-16 units, not bytes or chars, so a line with
+    /// any non-ASCII text puts every later column at a different byte offset.
+    /// A `character` that lands inside a surrogate pair clamps to the start of
+    /// that character.
+    pub fn byte_at_utf16(&self, line: usize, character: usize) -> usize {
+        let line = line.min(self.line_count().saturating_sub(1));
+        let start = self.line_start(line);
+        let end = self.line_end(line);
+        start + utf16_col_to_byte(&self.slice(Span::new(start, end)), character)
+    }
+
     /// Column of `byte` on its line, counting tabs and wide characters.
     pub fn display_col(&self, byte: usize) -> usize {
         let byte = self.clamp_byte(byte);
@@ -1121,6 +1135,25 @@ impl WordClass {
 /// `big word` classes: whitespace separated only.
 pub fn is_big_word_char(c: char) -> bool {
     !c.is_whitespace()
+}
+
+/// Byte offset of UTF-16 column `character` within `text`.
+///
+/// A column inside a surrogate pair clamps to the start of that character; a
+/// column past the end clamps to the end of the text.
+pub fn utf16_col_to_byte(text: &str, character: usize) -> usize {
+    let mut units = 0usize;
+    for (offset, ch) in text.char_indices() {
+        if units >= character {
+            return offset;
+        }
+        let next = units + ch.len_utf16();
+        if next > character {
+            return offset;
+        }
+        units = next;
+    }
+    text.len()
 }
 
 /// Display width of a string, expanding tabs to `tab_width` stops.

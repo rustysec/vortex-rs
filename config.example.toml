@@ -26,6 +26,7 @@ clipboard = true              # copy yanks to the terminal clipboard (OSC-52)
 undo-limit = 1000             # undo steps kept per buffer
 undo-group-timeout = "500ms"  # idle time that closes an undo group
 large-file-threshold = 2000000 # bytes; bigger files skip background work
+diagnostic-signs = true       # mark flagged lines in the gutter (● error, ▲ warning)
 
 # ---------------------------------------------------------------------------
 # status area

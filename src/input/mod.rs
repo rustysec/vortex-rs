@@ -386,6 +386,8 @@ pub const DEFAULT_BINDINGS: &[(&str, &[(&str, &str)])] = &[
             ("space w", "save"),
             ("space q", "quit"),
             ("space d", "show-diagnostics"),
+            ("]d", "diagnostic-next"),
+            ("[d", "diagnostic-prev"),
             ("space e", "spell-suggest"),
             // vim's spelling suggestion key.
             ("z=", "spell-suggest"),
