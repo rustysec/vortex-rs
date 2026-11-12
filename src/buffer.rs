@@ -8,7 +8,7 @@ use ropey::Rope;
 use crate::config::EditorConfig;
 use crate::error::{Error, Result};
 use crate::lang::{self, LanguageInfo};
-use crate::selection::{Edit, Selection, Span};
+use crate::selection::{Assoc, Edit, Selection, Span};
 use crate::syntax::SyntaxState;
 
 /// How many applied changes a buffer tracks before it gives up and asks the
@@ -410,6 +410,11 @@ impl Buffer {
             let end = utf16_position(&self.rope, change.range.end);
             let removed = slice_bytes(&self.rope, change.range);
             replace(&mut self.rope, change.range, &change.text);
+            // Diagnostics are byte spans too.  Mapping them here, one edit at a
+            // time, keeps them on the text they describe: without this, deleting
+            // the line a diagnostic points at leaves the mark on whatever line
+            // moved up into its old offset, until a save pushes a fresh set.
+            self.map_diagnostics(change.range, change.text.len());
             undo_changes.push(UndoChange {
                 at: change.range.start,
                 removed,
@@ -543,6 +548,8 @@ impl Buffer {
             for change in item.changes.iter().rev() {
                 let range = Span::new(change.at, change.at + change.inserted.len());
                 replace(&mut self.rope, range, &change.removed);
+                // Diagnostics are byte spans too; shift them back with the text.
+                self.map_diagnostics(range, change.removed.len());
             }
         }
         self.version += 1;
@@ -575,6 +582,8 @@ impl Buffer {
             for change in item.changes.iter() {
                 let range = Span::new(change.at, change.at + change.removed.len());
                 replace(&mut self.rope, range, &change.inserted);
+                // Diagnostics are byte spans too; shift them forward with the text.
+                self.map_diagnostics(range, change.inserted.len());
             }
         }
         self.version += 1;
@@ -1042,6 +1051,39 @@ impl Buffer {
         crate::diagnostic::DiagnosticCount::from_diagnostics(&self.diagnostics)
     }
 
+    /// Move diagnostics through one resolved edit, dropping any it destroys.
+    ///
+    /// Diagnostics are byte spans into the buffer, so an edit invalidates them
+    /// exactly as it invalidates the cursor.  A diagnostic stays anchored to its
+    /// text: text deleted under a span removes the diagnostic, and text inserted
+    /// before it shifts it.  Without this a stale mark lingers on whichever line
+    /// inherits its old offset until the next publish replaces the set.
+    ///
+    /// Only the primary range is remapped.  Related locations can point at other
+    /// files, so shifting them with this buffer's edits would move a reference
+    /// that is not here onto the wrong line.
+    fn map_diagnostics(&mut self, range: Span, text_len: usize) {
+        let edit = Edit::new(range, text_len);
+        // Deleting text snaps the surviving edges to the deletion point;
+        // inserting snaps them past the new text so a span does not swallow it.
+        let assoc = if text_len == 0 {
+            Assoc::Before
+        } else {
+            Assoc::After
+        };
+        self.diagnostics.retain_mut(|diagnostic| {
+            let start = edit.map(diagnostic.range.start, assoc);
+            let end = edit.map(diagnostic.range.end, assoc);
+            // A span the edit collapses leaves no text to mark: the diagnostic
+            // described text that is gone.
+            if end <= start && !diagnostic.range.is_empty() {
+                return false;
+            }
+            diagnostic.range = Span::new(start, end);
+            true
+        });
+    }
+
     /// Parse the buffer on this thread.  Used by tests and one-shot queries;
     /// the app parses asynchronously instead.
     pub fn reparse_now(&mut self) -> bool {
@@ -1345,6 +1387,16 @@ mod tests {
         )
     }
 
+    /// A LSP diagnostic covering `[start, end)`, for the remapping tests.
+    fn diagnostic(start: usize, end: usize, message: &str) -> crate::diagnostic::Diagnostic {
+        crate::diagnostic::Diagnostic::new(
+            Span::new(start, end),
+            crate::diagnostic::Severity::Warning,
+            message,
+            crate::diagnostic::DiagnosticSource::Lsp,
+        )
+    }
+
     #[test]
     fn editing_at_every_byte_offset_of_multibyte_text_round_trips() {
         // Byte offsets inside `é`, `…` and `漢` used to be applied at the wrong
@@ -1414,6 +1466,90 @@ mod tests {
         buffer.redo().expect("redo the delete");
         buffer.redo().expect("redo the insert");
         assert_eq!(buffer.text(), "alpha  beta ok 漢字\n");
+    }
+
+    #[test]
+    fn deleting_the_line_under_a_diagnostic_removes_it() {
+        // The reported bug: an unused-variable diagnostic stayed on the line
+        // that moved up into its old offset, because nothing moved the stored
+        // byte span when the rope changed.  Deleting the text a diagnostic
+        // covers must remove it, not strand it on a neighbouring line.
+        let mut buffer = buffer_with("one\ntwo\nthree\nfour\n");
+        let two = buffer.text().find("two").unwrap();
+        let three = buffer.text().find("three").unwrap();
+        buffer.diagnostics = vec![
+            diagnostic(two, two + 3, "unused variable"),
+            diagnostic(three, three + 5, "another problem"),
+        ];
+
+        let mut selection = Selection::point(0);
+        // Delete the whole `two` line, newline included.
+        let line_start = two;
+        let line_end = three;
+        buffer.apply(
+            vec![Change::delete(line_start..line_end)],
+            ChangeGroup::Operator,
+            &mut selection,
+        );
+        assert_eq!(buffer.text(), "one\nthree\nfour\n");
+
+        // The diagnostic on the deleted text is gone.
+        assert!(
+            !buffer
+                .diagnostics
+                .iter()
+                .any(|d| d.message == "unused variable"),
+            "the diagnostic for deleted text lingered: {:?}",
+            buffer.diagnostics
+        );
+        // The one below it moved up with its line, so it still points at
+        // `three` rather than at the wrong offset.
+        let remaining = buffer
+            .diagnostics
+            .iter()
+            .find(|d| d.message == "another problem")
+            .expect("the surviving diagnostic is still there");
+        assert_eq!(
+            buffer.slice(remaining.range),
+            "three",
+            "the surviving diagnostic must follow its text"
+        );
+    }
+
+    #[test]
+    fn inserting_above_a_diagnostic_shifts_it_down() {
+        let mut buffer = buffer_with("one\ntwo\n");
+        let two = buffer.text().find("two").unwrap();
+        buffer.diagnostics = vec![diagnostic(two, two + 3, "problem")];
+
+        let mut selection = Selection::point(0);
+        buffer.apply(
+            vec![Change::insert(0, "zero\n")],
+            ChangeGroup::Insert,
+            &mut selection,
+        );
+        assert_eq!(buffer.text(), "zero\none\ntwo\n");
+        let shifted = &buffer.diagnostics[0];
+        assert_eq!(shifted.range.start, two + 5);
+        assert_eq!(buffer.slice(shifted.range), "two");
+    }
+
+    #[test]
+    fn undo_restores_diagnostic_positions() {
+        let mut buffer = buffer_with("one\ntwo\n");
+        let two = buffer.text().find("two").unwrap();
+        buffer.diagnostics = vec![diagnostic(two, two + 3, "problem")];
+
+        let mut selection = Selection::point(0);
+        buffer.apply(
+            vec![Change::insert(0, "zero\n")],
+            ChangeGroup::Insert,
+            &mut selection,
+        );
+        buffer.undo().expect("undo the insert");
+        assert_eq!(buffer.text(), "one\ntwo\n");
+        let restored = &buffer.diagnostics[0];
+        assert_eq!(buffer.slice(restored.range), "two", "undo re-aligns it");
     }
 
     #[test]

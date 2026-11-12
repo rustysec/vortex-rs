@@ -49,7 +49,13 @@ impl Severity {
 /// Where a diagnostic came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiagnosticSource {
+    /// Pushed by the server (`textDocument/publishDiagnostics`), usually the
+    /// compiler's view of the saved file.
     Lsp,
+    /// Pulled from the server (`textDocument/diagnostic`), its own analysis of
+    /// the buffer as edited.  Kept apart from [`DiagnosticSource::Lsp`] so the
+    /// two sets replace only their own kind instead of wiping each other.
+    LspPull,
     Spell,
     Format,
 }

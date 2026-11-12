@@ -1514,6 +1514,32 @@ impl App {
         };
         let version = buffer.version;
         let text = buffer.text();
+        // `only-comments` means the checker may look only at comments and
+        // strings.  The spans come from the syntax tree, which belongs to the
+        // buffer and cannot cross into the blocking task, so they are resolved
+        // here.
+        let prose = if self.editor.config.spell.only_comments {
+            if buffer.language.has_tree_sitter() {
+                // A code language: wait for a tree that matches the buffer.
+                // Falling back to the whole buffer while a parse is pending
+                // would report every identifier as a misspelling, which is the
+                // noise this setting exists to suppress.  Leaving `spell_checked`
+                // alone means the idle timer retries once the parse lands.
+                if !buffer.syntax.is_current(buffer.version) {
+                    return;
+                }
+                Some(crate::syntax::comment_and_string_spans(
+                    buffer,
+                    crate::selection::Span::new(0, buffer.len_bytes()),
+                ))
+            } else {
+                // Markdown, plain text and the like are all prose; there is no
+                // code to exclude.
+                None
+            }
+        } else {
+            None
+        };
         self.spell_checked.insert(id, version);
         self.editor.job_started(
             id,
@@ -1525,6 +1551,7 @@ impl App {
             id,
             version,
             text,
+            prose,
             self.editor.config.spell.clone(),
         );
     }
@@ -1678,10 +1705,18 @@ impl App {
             LspEvent::Progress { language, message } => {
                 self.set_message(StatusLevel::Info, format!("{language}: {message}"));
             }
+            LspEvent::DiagnosticsRefresh { language } => {
+                // The server's own analysis changed.  Pull it for every open
+                // document this server owns; a push-only client would never see
+                // an unsaved error at all.
+                self.pull_diagnostics_for(&language);
+            }
             LspEvent::Diagnostics {
                 uri,
                 version,
                 items,
+                origin,
+                unchanged,
             } => {
                 let Some(path) = lsp::path_for_uri(&uri) else {
                     return;
@@ -1699,12 +1734,27 @@ impl App {
                 if version.is_some_and(|version| version < buffer.version as i64) {
                     return;
                 }
+                // An `unchanged` pull answer means the previous set still
+                // stands; replacing it with nothing would erase live errors.
+                if unchanged {
+                    return;
+                }
+                // Push and pull describe different text cuts (saved file vs.
+                // edited buffer), so each replaces only its own set.  Merging
+                // them is what makes an unsaved error show up next to the
+                // compiler's view of what is on disk.  The source is also what
+                // `set_diagnostics` retains by, so the items must carry it —
+                // storing a pull under `Lsp` would leave the previous pull in
+                // place and the list would grow on every keystroke.
+                let source = match origin {
+                    lsp::DiagnosticOrigin::Push => DiagnosticSource::Lsp,
+                    lsp::DiagnosticOrigin::Pull => DiagnosticSource::LspPull,
+                };
                 let diagnostics: Vec<_> = items
                     .iter()
-                    .map(|item| item.to_diagnostic(buffer))
+                    .map(|item| item.to_diagnostic(buffer, source))
                     .collect();
-                self.editor
-                    .set_diagnostics(id, DiagnosticSource::Lsp, diagnostics);
+                self.editor.set_diagnostics(id, source, diagnostics);
                 self.needs_redraw = true;
             }
             LspEvent::Completions {
@@ -2411,6 +2461,48 @@ impl App {
         let uri = lsp::uri_for(path);
         if let Some(client) = self.clients.get(&root) {
             client.did_save(uri);
+        }
+    }
+
+    /// Pull the server's own diagnostics for every open document it owns.
+    ///
+    /// rust-analyzer pushes the compiler's view of the saved file but serves
+    /// its analysis of the edited buffer only through `textDocument/diagnostic`.
+    /// It signals that the analysis changed with `workspace/diagnostic/refresh`,
+    /// which is what calls this.  Only documents whose language matches the
+    /// server that asked are pulled: a Python buffer must not be sent to the
+    /// Rust server.
+    fn pull_diagnostics_for(&mut self, language: &str) {
+        if !self.editor.config.lsp.enable {
+            return;
+        }
+        let targets: Vec<(BufferId, PathBuf, String, i64)> = self
+            .editor
+            .buffers()
+            .iter()
+            .filter(|buffer| buffer.language.id == language)
+            .filter_map(|buffer| {
+                let path = buffer.path()?.to_path_buf();
+                Some((
+                    buffer.id,
+                    path,
+                    buffer.language.id.to_string(),
+                    buffer.version as i64,
+                ))
+            })
+            .collect();
+        for (_id, path, language, version) in targets {
+            let Some(spec) = self.server_spec_for(&language) else {
+                continue;
+            };
+            let root = search::project_root(Some(&path));
+            let uri = lsp::uri_for(&path);
+            let request = self.next_request;
+            self.next_request += 1;
+            let sender = self.events.sender();
+            if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
+                client.pull_diagnostics(uri, request, version);
+            }
         }
     }
 

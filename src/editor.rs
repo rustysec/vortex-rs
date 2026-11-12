@@ -3909,6 +3909,49 @@ mod tests {
     }
 
     #[test]
+    fn replacing_a_source_does_not_accumulate_diagnostics() {
+        // `set_diagnostics` replaces one source's set.  If the items were stored
+        // under a source the caller never passes back, the retain matched nothing
+        // and every update appended: errors piled up as the user typed and only
+        // went away when a differently-sourced set happened to wipe the buffer.
+        let mut fixture = Fixture::new("one\ntwo\n");
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        let at = fixture
+            .editor
+            .buffer(id)
+            .expect("a buffer")
+            .line_start(0);
+
+        for count in 1..=5 {
+            let pulled: Vec<_> = (0..count)
+                .map(|line| {
+                    Diagnostic::new(
+                        crate::selection::Span::new(at + line, at + line + 1),
+                        crate::diagnostic::Severity::Error,
+                        format!("problem {line}"),
+                        DiagnosticSource::LspPull,
+                    )
+                })
+                .collect();
+            fixture
+                .editor
+                .set_diagnostics(id, DiagnosticSource::LspPull, pulled);
+            let stored = fixture
+                .editor
+                .buffer(id)
+                .expect("a buffer")
+                .diagnostics
+                .iter()
+                .filter(|d| d.source == DiagnosticSource::LspPull)
+                .count();
+            assert_eq!(
+                stored, count,
+                "each pull must replace the last, not stack on it"
+            );
+        }
+    }
+
+    #[test]
     fn o_on_a_line_that_opens_a_block_indents_inside_it() {
         // `o` on `fn main() {` must land inside the block, not at column 0.
         let mut fixture = Fixture::new("fn main() {\n}\n");

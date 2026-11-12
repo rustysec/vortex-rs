@@ -34,16 +34,22 @@ pub struct SpellResult {
 
 /// Kick off a spell check.  `text` is a snapshot of the buffer, so the offsets
 /// in the resulting diagnostics are buffer offsets.
+///
+/// `prose` is the comment and string regions the checker is allowed to look at,
+/// when `[spell] only-comments` is on.  `None` checks the whole buffer.  The
+/// spans are computed on the main thread from the buffer's tree, because the
+/// tree is not `Send` and the blocking task only has the text.
 pub fn spawn_spell(
     tx: EventTx,
     buffer: BufferId,
     version: u64,
     text: String,
+    prose: Option<Vec<crate::selection::Span>>,
     config: SpellConfig,
 ) -> JobId {
     let job = next_job_id();
     tokio::task::spawn_blocking(move || {
-        let diagnostics = check(&text, &config);
+        let diagnostics = check_scoped(&text, &config, prose.as_deref());
         tx.send_async(AsyncEvent::Spelled(SpellResult {
             buffer,
             version,
@@ -154,7 +160,24 @@ const SCHEMES: &[&str] = &[
 const MAX_DIAGNOSTICS: usize = 2_000;
 
 /// Spell check `text`, producing diagnostics addressed by byte offset.
+///
+/// This checks the whole buffer.  The editor uses [`check_scoped`] instead when
+/// `[spell] only-comments` is on, so code identifiers are not reported.
 pub fn check(text: &str, config: &SpellConfig) -> Vec<Diagnostic> {
+    check_scoped(text, config, None)
+}
+
+/// Spell check the parts of `text` that fall inside `prose`.
+///
+/// `prose` is the comment and string regions from the syntax tree; a word is
+/// checked only when its start lies inside one of them.  `None` checks the whole
+/// buffer, which is what prose files (markdown, plain text) and the un-scoped
+/// setting want.
+pub fn check_scoped(
+    text: &str,
+    config: &SpellConfig,
+    prose: Option<&[crate::selection::Span]>,
+) -> Vec<Diagnostic> {
     let base = dictionary();
     let extras = load_user_words();
     let with_extras = WordList {
@@ -172,6 +195,14 @@ pub fn check(text: &str, config: &SpellConfig) -> Vec<Diagnostic> {
     for (word, byte, _length) in words(text).into_iter() {
         if diagnostics.len() >= MAX_DIAGNOSTICS {
             break;
+        }
+        // Only look at prose the syntax tree marked as a comment or a string.
+        // Checking the rest is what reported every identifier and macro as a
+        // misspelling, which `only-comments` exists to prevent.
+        if let Some(spans) = prose
+            && !spans.iter().any(|span| span.contains(byte))
+        {
+            continue;
         }
         let start = byte;
         let end = byte + word.len();
@@ -2315,5 +2346,34 @@ mod tests {
             .map(|(word, _, _)| word)
             .collect();
         assert_eq!(tokens, ["don't", "stop", "here"]);
+    }
+
+    #[test]
+    fn scoped_checking_ignores_words_outside_the_prose_spans() {
+        // `only-comments` means a word is checked only when it starts inside a
+        // comment or string.  The code identifier `vlue` sits outside the span
+        // and must be skipped; the misspelling inside the comment must not.
+        let config = SpellConfig {
+            min_len: 2,
+            ..SpellConfig::default()
+        };
+        let text = "let vlue = 1; // the vlue is here\n";
+        let comment = text.find("//").unwrap();
+        let prose = [crate::selection::Span::new(comment, text.len())];
+        let diagnostics = check_scoped(text, &config, Some(&prose));
+        assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
+        assert_eq!(diagnostics[0].range.start, comment + "// the ".len());
+    }
+
+    #[test]
+    fn unscoped_checking_still_sees_the_whole_buffer() {
+        // `None` is the "check everything" path, for markdown and plain text.
+        let config = SpellConfig {
+            min_len: 2,
+            ..SpellConfig::default()
+        };
+        let text = "let vlue = 1;\n";
+        let diagnostics = check_scoped(text, &config, None);
+        assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
     }
 }

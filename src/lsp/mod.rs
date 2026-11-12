@@ -5,7 +5,11 @@
 //! * the `initialize` / `initialized` handshake and `textDocument/didOpen` /
 //!   `didChange` / `didSave` for buffers in that root;
 //! * `textDocument/publishDiagnostics`, turned into [`crate::diagnostic::Diagnostic`]
-//!   values that the status area and `ui` render like spell-check hints.
+//!   values that the status area and `ui` render like spell-check hints;
+//! * pull diagnostics (`textDocument/diagnostic`), requested when the server
+//!   sends `workspace/diagnostic/refresh`.  rust-analyzer pushes only the
+//!   compiler's view of the *saved* file, so without the pull an unsaved error
+//!   never shows a diagnostic.
 //!
 //! What is deliberately not implemented: requests that need an answer to be
 //! useful (hover, completion, code actions, formatting).  Those need a request
@@ -33,6 +37,22 @@ use crate::diagnostic::{Diagnostic, DiagnosticSource, DiagnosticTag, Severity};
 use crate::event::{AsyncEvent, EventTx, JobId};
 use crate::selection::Span;
 
+/// Which stream a diagnostic set came from.
+///
+/// rust-analyzer pushes the compiler's view of the *saved* file (its flycheck
+/// results, `source: "rustc"`) but serves its own analysis of the buffer as
+/// edited only through pull requests (`textDocument/diagnostic`).  A client that
+/// listens to pushes alone therefore sees a clean file that is full of unsaved
+/// type errors.  The two sets describe different text cuts, so they are tracked
+/// separately and merged for display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiagnosticOrigin {
+    /// `textDocument/publishDiagnostics`, pushed by the server.
+    Push,
+    /// An answer to `textDocument/diagnostic`, pulled on request.
+    Pull,
+}
+
 /// Traffic from a language server, reported to the editor.
 #[derive(Debug, Clone)]
 pub enum LspEvent {
@@ -51,9 +71,25 @@ pub enum LspEvent {
         uri: String,
         version: Option<i64>,
         items: Vec<DiagnosticItem>,
+        /// Which stream this set came from.  The two are kept apart because
+        /// they describe different text: a push usually reports the compiler's
+        /// view of what is on disk, while a pull reports the server's own view
+        /// of the buffer as edited.  Merging them keeps both.
+        origin: DiagnosticOrigin,
+        /// A pull answered `unchanged`: the previous set still stands, so the
+        /// receiver must keep what it has instead of replacing it with nothing.
+        /// Always false for a push.
+        unchanged: bool,
     },
     /// A progress or status message worth showing in the status area.
     Progress { language: String, message: String },
+    /// The server says its own diagnostics changed and should be pulled again.
+    ///
+    /// rust-analyzer never pushes its native analysis of an edited buffer; it
+    /// sends `workspace/diagnostic/refresh` and expects the client to re-issue
+    /// `textDocument/diagnostic`.  The app answers by pulling for every open
+    /// document this server owns.
+    DiagnosticsRefresh { language: String },
     /// Completion candidates for one file, in answer to a request.
     ///
     /// `request` is the id the app sent, so a slow answer for a caret that has
@@ -187,7 +223,13 @@ impl DiagnosticItem {
     /// LSP columns are UTF-16 code units, so the buffer does the conversion —
     /// treating them as bytes puts every diagnostic after a non-ASCII character
     /// on the wrong span.
-    pub fn to_diagnostic(&self, buffer: &Buffer) -> Diagnostic {
+    ///
+    /// `source` is the storage bucket the caller wants this in.  It must match
+    /// what the caller will later pass to `set_diagnostics`: the two streams are
+    /// replaced independently, and a pulled set stored under the pushed source
+    /// would never be cleared on the next pull, so the list would grow on every
+    /// keystroke.
+    pub fn to_diagnostic(&self, buffer: &Buffer, source: DiagnosticSource) -> Diagnostic {
         let start = buffer.byte_at_utf16(self.range.0, self.range.1);
         let end = buffer.byte_at_utf16(self.range.2, self.range.3);
         let related = self
@@ -203,7 +245,7 @@ impl DiagnosticItem {
             Span::new(start, end),
             self.severity,
             format!("{}: {}", self.source, self.message),
-            DiagnosticSource::Lsp,
+            source,
         )
         .with_code(self.code.clone())
         .with_tags(self.tags.clone())
@@ -227,78 +269,99 @@ pub fn diagnostics_event(notification: &Value) -> Option<LspEvent> {
             .to_string(),
         version: params.get("version").and_then(Value::as_i64),
         items: diagnostic_items(params),
+        origin: DiagnosticOrigin::Push,
+        unchanged: false,
     })
 }
 
 /// Decode `publishDiagnostics` parameters.
 pub fn diagnostic_items(params: &Value) -> Vec<DiagnosticItem> {
-    let Some(items) = params.get("diagnostics").and_then(Value::as_array) else {
+    decode_diagnostic_list(params.get("diagnostics"))
+}
+
+/// Decode the `items` of a pull-diagnostics report (`textDocument/diagnostic`).
+///
+/// The report may be `full` (a whole set) or `unchanged` (nothing has changed
+/// since the `resultId` we last saw).  An `unchanged` report carries no items
+/// and must not be mistaken for "this file is clean": the caller keeps whatever
+/// it already had.
+pub fn pull_diagnostic_items(result: &Value) -> Option<Vec<DiagnosticItem>> {
+    match result.get("kind").and_then(Value::as_str) {
+        // `unchanged` means the previous report still stands; `None` tells the
+        // caller to leave its copy alone instead of replacing it with nothing.
+        Some("unchanged") => None,
+        _ => Some(decode_diagnostic_list(result.get("items"))),
+    }
+}
+
+/// Decode an array of LSP `Diagnostic` objects.
+fn decode_diagnostic_list(list: Option<&Value>) -> Vec<DiagnosticItem> {
+    let Some(items) = list.and_then(Value::as_array) else {
         return Vec::new();
     };
-    items
-        .iter()
-        .filter_map(|item| {
-            let start = position(item.pointer("/range/start")?)?;
-            let end = position(item.pointer("/range/end")?)?;
-            // `code` is `string | number` in the protocol; both are shown as
-            // text, so a numeric code is stringified rather than dropped.
-            let code = item.get("code").and_then(|code| {
-                code.as_str()
-                    .map(str::to_string)
-                    .or_else(|| code.as_u64().map(|number| number.to_string()))
-            });
-            let tags = item
-                .get("tags")
-                .and_then(Value::as_array)
-                .map(|tags| {
-                    tags.iter()
-                        .filter_map(Value::as_u64)
-                        .filter_map(DiagnosticTag::from_lsp)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let related = item
-                .get("relatedInformation")
-                .and_then(Value::as_array)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|entry| {
-                            let message = entry
-                                .pointer("/message")
-                                .and_then(Value::as_str)?
-                                .to_string();
-                            let start = position(entry.pointer("/location/range/start")?)?;
-                            let end = position(entry.pointer("/location/range/end")?)?;
-                            Some((message, (start.0, start.1, end.0, end.1)))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(DiagnosticItem {
-                range: (start.0, start.1, end.0, end.1),
-                severity: match item.get("severity").and_then(Value::as_u64) {
-                    Some(1) => Severity::Error,
-                    Some(2) => Severity::Warning,
-                    Some(3) => Severity::Info,
-                    _ => Severity::Hint,
-                },
-                message: item
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("diagnostic")
-                    .to_string(),
-                source: item
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .unwrap_or("lsp")
-                    .to_string(),
-                code,
-                tags,
-                related,
-            })
+    items.iter().filter_map(decode_diagnostic_item).collect()
+}
+
+fn decode_diagnostic_item(item: &Value) -> Option<DiagnosticItem> {
+    let start = position(item.pointer("/range/start")?)?;
+    let end = position(item.pointer("/range/end")?)?;
+    // `code` is `string | number` in the protocol; both are shown as text, so
+    // a numeric code is stringified rather than dropped.
+    let code = item.get("code").and_then(|code| {
+        code.as_str()
+            .map(str::to_string)
+            .or_else(|| code.as_u64().map(|number| number.to_string()))
+    });
+    let tags = item
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(Value::as_u64)
+                .filter_map(DiagnosticTag::from_lsp)
+                .collect()
         })
-        .collect()
+        .unwrap_or_default();
+    let related = item
+        .get("relatedInformation")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let message = entry
+                        .pointer("/message")
+                        .and_then(Value::as_str)?
+                        .to_string();
+                    let start = position(entry.pointer("/location/range/start")?)?;
+                    let end = position(entry.pointer("/location/range/end")?)?;
+                    Some((message, (start.0, start.1, end.0, end.1)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(DiagnosticItem {
+        range: (start.0, start.1, end.0, end.1),
+        severity: match item.get("severity").and_then(Value::as_u64) {
+            Some(1) => Severity::Error,
+            Some(2) => Severity::Warning,
+            Some(3) => Severity::Info,
+            _ => Severity::Hint,
+        },
+        message: item
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("diagnostic")
+            .to_string(),
+        source: item
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("lsp")
+            .to_string(),
+        code,
+        tags,
+        related,
+    })
 }
 
 /// Turn an LSP `{start,end}{line,character}` range into a byte span.
@@ -616,6 +679,9 @@ pub enum PendingKind {
     Formatting,
     RangeFormatting,
     CodeAction,
+    /// A `textDocument/diagnostic` pull, whose answer is a whole set for the
+    /// document rather than something tied to the caret.
+    PullDiagnostics,
 }
 
 /// A request in flight: what it is, and which document it is about.
@@ -623,6 +689,11 @@ pub enum PendingKind {
 pub struct PendingRequest {
     pub kind: PendingKind,
     pub uri: String,
+    /// The buffer version the request was made against, for the kinds that
+    /// describe a document snapshot.  A pull-diagnostics answer carries no
+    /// version of its own, so the version recorded here is what lets the editor
+    /// drop an answer that arrived after the buffer moved on.
+    pub version: Option<i64>,
 }
 
 /// One text replacement the server asked for, as a byte span.
@@ -716,6 +787,18 @@ enum Outgoing {
         /// unused binding" only when it is told which diagnostic is being
         /// fixed, so an empty list here means an empty answer.
         diagnostics: Vec<Value>,
+    },
+    /// Ask the server for its own analysis of a document.
+    ///
+    /// rust-analyzer publishes the compiler's view of the *saved* file, but
+    /// answers `textDocument/diagnostic` from its in-memory view of the edited
+    /// buffer.  Without this pull, an unsaved error shows no diagnostic at all.
+    /// `version` is the buffer version the request describes, carried so a slow
+    /// answer can be dropped once the buffer has moved on.
+    PullDiagnostics {
+        uri: String,
+        request: i64,
+        version: i64,
     },
     Shutdown,
 }
@@ -888,6 +971,18 @@ impl ClientHandle {
     pub fn shutdown(&self) {
         let _ = self.outgoing.send(Outgoing::Shutdown);
     }
+
+    /// Ask the server for its own analysis of a document.
+    ///
+    /// `version` is the buffer version the request describes; the answer is
+    /// dropped by the editor if the buffer has moved on by the time it lands.
+    pub fn pull_diagnostics(&self, uri: String, request: i64, version: i64) {
+        let _ = self.outgoing.send(Outgoing::PullDiagnostics {
+            uri,
+            request,
+            version,
+        });
+    }
 }
 
 /// Start a server process and drive one LSP session.
@@ -963,11 +1058,30 @@ async fn session(
                             "documentationFormat": ["plaintext", "markdown"]
                         },
                         "contextSupport": true
-                    }
+                    },
+                    // Pull diagnostics.  Declaring `diagnostic` here is not
+                    // optional: rust-analyzer checks it before sending
+                    // `workspace/diagnostic/refresh`.  Without it the only
+                    // refresh is the one at startup, so an error typed into the
+                    // buffer is never pulled and stays invisible until a save
+                    // makes flycheck push it.
+                    "diagnostic": { "dynamicRegistration": false }
                 },
-                "window": { "workDoneProgress": false }
+                "window": { "workDoneProgress": false },
+                // Ask for the pull-diagnostics refresh notification.  The spec
+                // gates `workspace/diagnostic/refresh` on this, and
+                // rust-analyzer honours it: without it the server announces its
+                // analysis once and never again as the buffer changes.
+                "workspace": { "diagnostics": { "refreshSupport": true } }
             },
-            "workspaceFolders": [{ "uri": uri_for(&root), "name": root.display().to_string() }]
+            "workspaceFolders": [{ "uri": uri_for(&root), "name": root.display().to_string() }],
+            // rust-analyzer gates its own analysis behind this flag: without it
+            // `textDocument/diagnostic` answers an empty set, so the only
+            // diagnostics a client ever sees are the flycheck results for the
+            // saved file.  Unsaved errors would then never appear.
+            "initializationOptions": {
+                "diagnostics": { "experimental": { "enable": true } }
+            }
         })),
     );
     jsonrpc::write_message(&mut *stdin.lock().await, &initialize)
@@ -1076,6 +1190,20 @@ async fn session(
                                         request: id,
                                         actions: code_actions(&result, &text, &starts),
                                     },
+                                    PendingKind::PullDiagnostics => {
+                                        // `unchanged` carries no items: the
+                                        // previous set still stands, so the
+                                        // editor keeps what it has.  A `full`
+                                        // report replaces the pulled set.
+                                        let items = pull_diagnostic_items(&result);
+                                        LspEvent::Diagnostics {
+                                            uri: request.uri,
+                                            version: request.version,
+                                            items: items.clone().unwrap_or_default(),
+                                            origin: DiagnosticOrigin::Pull,
+                                            unchanged: items.is_none(),
+                                        }
+                                    }
                                 };
                                 tx.send_async(AsyncEvent::Lsp(event));
                             }
@@ -1086,6 +1214,26 @@ async fn session(
                                 if let Some(event) = diagnostics_event(&value) {
                                     tx.send_async(AsyncEvent::Lsp(event));
                                 }
+                            }
+                            // The server says its own diagnostics changed and
+                            // wants them pulled again.  rust-analyzer sends
+                            // this after it re-analyses an edited buffer, and
+                            // it is the only signal that native diagnostics are
+                            // ready — they are never pushed.  Answer the request
+                            // so the server does not stall, then tell the app to
+                            // pull for its open documents.
+                            Some("workspace/diagnostic/refresh") => {
+                                if let Some(id) = value.get("id") {
+                                    let response = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": Value::Null
+                                    });
+                                    let _ = jsonrpc::write_message(&mut *stdin.lock().await, &response).await;
+                                }
+                                tx.send_async(AsyncEvent::Lsp(LspEvent::DiagnosticsRefresh {
+                                    language: spec.language.clone(),
+                                }));
                             }
                             Some("window/showMessage") | Some("window/logMessage") => {
                                 let message = value
@@ -1293,6 +1441,7 @@ async fn send_outgoing(
                 PendingRequest {
                     kind: PendingKind::Completion,
                     uri: uri.clone(),
+                    version: None,
                 },
             );
             let context = match trigger {
@@ -1321,6 +1470,7 @@ async fn send_outgoing(
                 PendingRequest {
                     kind: PendingKind::Hover,
                     uri: uri.clone(),
+                    version: None,
                 },
             );
             let request_message = jsonrpc::request(
@@ -1344,6 +1494,7 @@ async fn send_outgoing(
                 PendingRequest {
                     kind: PendingKind::Formatting,
                     uri: uri.clone(),
+                    version: None,
                 },
             );
             let request_message = jsonrpc::request(
@@ -1369,6 +1520,7 @@ async fn send_outgoing(
                 PendingRequest {
                     kind: PendingKind::RangeFormatting,
                     uri: uri.clone(),
+                    version: None,
                 },
             );
             let request_message = jsonrpc::request(
@@ -1397,6 +1549,7 @@ async fn send_outgoing(
                 PendingRequest {
                     kind: PendingKind::CodeAction,
                     uri: uri.clone(),
+                    version: None,
                 },
             );
             let request_message = jsonrpc::request(
@@ -1414,6 +1567,26 @@ async fn send_outgoing(
                     // so an empty list here means an empty answer.
                     "context": { "diagnostics": diagnostics, "only": ["quickfix"] }
                 })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
+        }
+        Outgoing::PullDiagnostics {
+            uri,
+            request,
+            version,
+        } => {
+            pending.insert(
+                request,
+                PendingRequest {
+                    kind: PendingKind::PullDiagnostics,
+                    uri: uri.clone(),
+                    version: Some(version),
+                },
+            );
+            let request_message = jsonrpc::request(
+                request,
+                "textDocument/diagnostic",
+                Some(json!({ "textDocument": { "uri": uri } })),
             );
             let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
         }
@@ -1578,12 +1751,16 @@ mod tests {
             uri,
             version,
             items,
+            origin,
+            unchanged,
         }) = diagnostics_event(&notification)
         else {
             panic!("no diagnostics event from a publish notification");
         };
         assert_eq!(uri, "file:///tmp/x.rs");
         assert_eq!(version, Some(7));
+        assert_eq!(origin, DiagnosticOrigin::Push);
+        assert!(!unchanged, "a push is never an unchanged report");
         assert_eq!(items.len(), 1, "the diagnostic must survive the envelope");
         assert_eq!(items[0].message, "cannot find value `foo`");
         assert_eq!(items[0].severity, Severity::Error);
@@ -1617,13 +1794,74 @@ mod tests {
         assert_eq!(items.len(), 2);
         let diagnostics: Vec<Diagnostic> = items
             .iter()
-            .map(|item| item.to_diagnostic(&buffer))
+            .map(|item| item.to_diagnostic(&buffer, DiagnosticSource::Lsp))
             .collect();
         assert_eq!(diagnostics[0].severity, Severity::Error);
         assert!(diagnostics[0].message.contains("expected expression"));
         assert_eq!(diagnostics[0].range, Span::new(8, 9));
         assert_eq!(diagnostics[1].range, Span::new(10, 16));
         assert_eq!(diagnostics[1].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn a_diagnostic_carries_the_source_it_is_stored_under() {
+        // `set_diagnostics` replaces a buffer's diagnostics by matching on the
+        // source it is given.  A pulled item stored under the pushed source was
+        // never retained away, so every pull appended to the pile and errors
+        // accumulated as the user typed — only a save (a fresh pushed set) wiped
+        // them.  The source has to travel with the item.
+        let buffer = buffer_with("let x = 1;\n");
+        let params = json!({
+            "diagnostics": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } },
+                "severity": 1,
+                "message": "problem",
+                "source": "rust-analyzer"
+            }]
+        });
+        let item = &diagnostic_items(&params)[0];
+        assert_eq!(
+            item.to_diagnostic(&buffer, DiagnosticSource::LspPull)
+                .source,
+            DiagnosticSource::LspPull
+        );
+        assert_eq!(
+            item.to_diagnostic(&buffer, DiagnosticSource::Lsp).source,
+            DiagnosticSource::Lsp
+        );
+    }
+
+    #[test]
+    fn a_pull_report_decodes_like_a_push_but_carries_its_own_origin() {
+        // The answer to `textDocument/diagnostic` is a report with an `items`
+        // array, not a `diagnostics` array.  Decoding it through the push
+        // decoder found nothing, which is exactly how an unsaved error would
+        // stay invisible.
+        let result = json!({
+            "kind": "full",
+            "items": [{
+                "range": { "start": { "line": 1, "character": 12 }, "end": { "line": 1, "character": 26 } },
+                "severity": 1,
+                "message": "no such value in this scope",
+                "source": "rust-analyzer"
+            }]
+        });
+        let items = pull_diagnostic_items(&result).expect("a full report is a whole set");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].message, "no such value in this scope");
+        assert_eq!(items[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn an_unchanged_pull_report_is_not_mistaken_for_clean() {
+        // `unchanged` means the previous set still stands.  Treating its empty
+        // `items` as "nothing wrong" would erase live errors on every no-op
+        // refresh.
+        let result = json!({ "kind": "unchanged", "resultId": "rust-analyzer" });
+        assert!(
+            pull_diagnostic_items(&result).is_none(),
+            "an unchanged report must leave the existing set alone"
+        );
     }
 
     #[test]
@@ -1661,7 +1899,7 @@ mod tests {
         let items = diagnostic_items(&params);
         let diagnostics: Vec<Diagnostic> = items
             .iter()
-            .map(|item| item.to_diagnostic(&buffer))
+            .map(|item| item.to_diagnostic(&buffer, DiagnosticSource::Lsp))
             .collect();
 
         assert_eq!(diagnostics[0].code.as_deref(), Some("unused_variables"));
@@ -1693,7 +1931,7 @@ mod tests {
         });
         let diagnostics: Vec<Diagnostic> = diagnostic_items(&params)
             .iter()
-            .map(|item| item.to_diagnostic(&buffer))
+            .map(|item| item.to_diagnostic(&buffer, DiagnosticSource::Lsp))
             .collect();
         assert_eq!(diagnostics[0].tags, vec![DiagnosticTag::Unnecessary]);
     }
@@ -1845,10 +2083,7 @@ mod tests {
     #[test]
     fn hover_text_decodes_every_contents_shape() {
         // A plain string.
-        assert_eq!(
-            hover_text(&json!({ "contents": "fn main()" })),
-            "fn main()"
-        );
+        assert_eq!(hover_text(&json!({ "contents": "fn main()" })), "fn main()");
         // A `MarkupContent` object.
         assert_eq!(
             hover_text(&json!({ "contents": { "kind": "plaintext", "value": "let x: u8" } })),
@@ -1878,7 +2113,10 @@ mod tests {
         assert!(text.contains("fn f() -> u8"), "{text:?}");
         assert!(text.contains("Docs with code."), "{text:?}");
         assert!(!text.contains('`'), "backticks are stripped: {text:?}");
-        assert!(!text.contains("**"), "emphasis markers are stripped: {text:?}");
+        assert!(
+            !text.contains("**"),
+            "emphasis markers are stripped: {text:?}"
+        );
     }
 
     #[test]
@@ -1969,13 +2207,11 @@ mod tests {
         // The stored copy has to track the server's view: completion ranges are
         // resolved against it, so a stale copy puts later answers on wrong text.
         let mut text = String::from("fn  main() {}\n");
-        let changes = vec![
-            crate::buffer::RecordedChange {
-                start: (0, 2),
-                end: (0, 4),
-                text: " ".into(),
-            },
-        ];
+        let changes = vec![crate::buffer::RecordedChange {
+            start: (0, 2),
+            end: (0, 4),
+            text: " ".into(),
+        }];
         apply_recorded(&mut text, &changes);
         assert_eq!(text, "fn main() {}\n");
     }

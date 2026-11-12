@@ -126,9 +126,9 @@ on-save = true                # format before writing
 # language servers (diagnostics and insert-mode completion)
 # ---------------------------------------------------------------------------
 [lsp]
-# Language server support: initialize handshake, document sync, published
-# diagnostics and `textDocument/completion`.  Formatting stays external (see
-# [format.command]).
+# Language server support: initialize handshake, document sync, diagnostics
+# (both pushed and pulled) and `textDocument/completion`.  Formatting stays
+# external (see [format.command]).
 # Turning this on also implies well-known servers (rust-analyzer, pylsp, gopls,
 # clangd) when those binaries are installed, which is why it is off by default.
 enable = false

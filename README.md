@@ -249,9 +249,12 @@ line) at the working directory.
   implies well-known servers (rust-analyzer, pylsp, gopls, clangd) when those
   binaries are installed, or name your own under `[lsp.servers.<language>]`.
   One server per project root, `initialize` handshake,
-  `didOpen`/`didChange`/`didSave` sync, published diagnostics in the gutter and
-  status line, and insert-mode completion: typing pauses, the server is asked
-  for candidates at the caret, and a popup opens next to it. `Tab`/`Enter`
+  `didOpen`/`didChange`/`didSave` sync, diagnostics in the gutter and status
+  line, and insert-mode completion: typing pauses, the server is asked for
+  candidates at the caret, and a popup opens next to it. Diagnostics arrive both
+  pushed (the compiler's view of the saved file) and pulled
+  (`textDocument/diagnostic`, the server's view of the edited buffer, refreshed
+  when the server asks), so an unsaved error shows up without a save. `Tab`/`Enter`
   accept, the arrows move, `Esc` closes it, and typing narrows the list with a
   fuzzy filter. A slow answer for a caret that has since moved is dropped, and
   `[lsp] completion = false` turns the popup off while keeping diagnostics.
@@ -314,8 +317,8 @@ the bug is "the file was empty" or "the leader key did nothing".
 
 ## Limitations worth knowing
 
-* LSP covers diagnostics and insert-mode completion; hover, rename and
-  formatting are not wired up (formatting is external on purpose).
+* LSP covers diagnostics (pushed and pulled) and insert-mode completion; hover,
+  rename and formatting are not wired up (formatting is external on purpose).
 * The spell dictionary is embedded and modest. It favours false negatives over
   nagging; add words to `.vortex-words` when it matters.
 * No tab page concept — buffers, not tabs.
