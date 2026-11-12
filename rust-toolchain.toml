@@ -1,0 +1,9 @@
+# Pinned so formatting, clippy and test results do not move when a new stable
+# release lands.  The components are the ones CI needs; `cargo fmt` and
+# `cargo clippy` both run against this toolchain locally too.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+
+# edition 2024 is required by the crate; `rust-version` in Cargo.toml documents
+# the minimum a downstream consumer needs.

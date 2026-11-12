@@ -1,0 +1,11 @@
+# Formatting is checked in CI (`cargo fmt --all --check`), so these are the
+# settings the tree is held to.  They are rustfmt's defaults, spelled out so a
+# rustfmt upgrade cannot quietly change the style out from under the code.
+#
+# Only stable options belong here: an unstable one would be ignored by the
+# stable toolchain the project pins, and the check would pass on one machine and
+# fail on another.
+edition = "2024"
+max_width = 100
+use_small_heuristics = "Default"
+newline_style = "Unix"
