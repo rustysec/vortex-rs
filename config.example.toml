@@ -159,6 +159,7 @@ command = "auto"              # "auto" | "aspell" | "hunspell" | "off"
 only-comments = true          # only check comments and strings
 min-len = 4                   # ignore short words
 ignore-camel-case = true      # ignore IdentifiersLikeThis
+case-sensitive = false        # true: "Hello" is checked as typed, not as "hello"
 
 # ---------------------------------------------------------------------------
 # colours

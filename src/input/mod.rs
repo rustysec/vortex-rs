@@ -378,8 +378,6 @@ pub const DEFAULT_BINDINGS: &[(&str, &[(&str, &str)])] = &[
             // files & panes (space is the leader)
             ("ctrl-s", "save"),
             ("space p", "command-palette"),
-            // The message line advertises ctrl-p, so it has to work.
-            ("ctrl-p", "command-palette"),
             ("space f", "find-files"),
             ("space s", "grep-project"),
             ("space b", "switch-buffer"),

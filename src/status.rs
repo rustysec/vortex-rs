@@ -390,7 +390,7 @@ pub fn render_message(
     let hint = if snapshot.insert {
         "esc to normal".to_string()
     } else {
-        ":  commands   /  search   ctrl-p  palette".to_string()
+        ":  commands   /  search   space p  palette".to_string()
     };
     let _ = buf.set_stringn(0, y, hint, area.width as usize, theme.status_inactive);
 }

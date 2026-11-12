@@ -230,7 +230,7 @@ fn draw_welcome(buf: &mut Buffer, area: Rect, screen: &Screen) {
         "a modal, async code editor",
         "",
         ":edit <file>    open a file",
-        "ctrl-p          find a file in the project",
+        "space f         find a file in the project",
         ":grep <text>    search the project",
         ":help           list commands",
     ];

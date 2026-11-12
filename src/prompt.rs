@@ -2,8 +2,8 @@
 //!
 //! A [`Prompt`] is an editable line plus an optional candidate list.  The same
 //! machinery serves `:` (with command and path completion), `/` (with search
-//! history) and the `ctrl-p` style pickers, so key handling stays consistent
-//! everywhere text is typed.
+//! history) and the fuzzy pickers, so key handling stays consistent everywhere
+//! text is typed.
 
 use std::any::Any;
 

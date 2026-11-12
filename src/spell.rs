@@ -210,10 +210,19 @@ pub fn check_scoped(
         if text[end..].starts_with("://") || SCHEMES.contains(&word.to_lowercase().as_str()) {
             continue;
         }
-        if skip(&word, config) || list.contains(&word.to_lowercase()) {
+        // Case-sensitive mode keeps the word as typed; otherwise everything is
+        // compared lowercased so `The` matches `the`.  The dictionary itself is
+        // all lowercase.
+        let folded = word.to_lowercase();
+        let lookup = if config.case_sensitive {
+            word.as_str()
+        } else {
+            folded.as_str()
+        };
+        if skip(&word, config) || list.contains(lookup) {
             continue;
         }
-        let suggestions = list.suggestions(&word.to_lowercase(), 6);
+        let suggestions = list.suggestions(lookup, 6);
         let message = if suggestions.is_empty() {
             format!("possible misspelling: {word}")
         } else {
@@ -2375,5 +2384,41 @@ mod tests {
         let text = "let vlue = 1;\n";
         let diagnostics = check_scoped(text, &config, None);
         assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
+    }
+
+    #[test]
+    fn case_sensitivity_changes_which_words_are_flagged() {
+        // `ignore-camel-case` also skips capitalised words, so it is off here:
+        // the point is what case sensitivity does on its own.
+        let base = SpellConfig {
+            min_len: 2,
+            only_comments: false,
+            ignore_camel_case: false,
+            ..SpellConfig::default()
+        };
+        // `World` is the dictionary word `world` capitalised.  Lowercasing
+        // before the lookup (the default) accepts it; matching case-sensitively
+        // rejects it, since the dictionary is all lowercase.
+        let text = "World world\n";
+        let lenient = check_scoped(text, &base, None);
+        assert!(
+            lenient.is_empty(),
+            "case-insensitive checking accepts a capitalised word: {lenient:?}"
+        );
+
+        let strict = SpellConfig {
+            case_sensitive: true,
+            ..base
+        };
+        let diagnostics = check_scoped(text, &strict, None);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "only `World` is rejected: {diagnostics:?}"
+        );
+        assert_eq!(
+            &text[diagnostics[0].range.start..diagnostics[0].range.end],
+            "World"
+        );
     }
 }

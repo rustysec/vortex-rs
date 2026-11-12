@@ -63,7 +63,7 @@ The bindings you are most likely to reach for:
 | Keys | Action |
 | --- | --- |
 | `i` `a` `o` `O` `v` `V` `Ctrl-V` `Esc` | enter modes |
-| `Space p` or `Ctrl-P` | command palette |
+| `Space p` | command palette |
 | `Space f` | fuzzy file picker |
 | `Space s` | grep the project's contents |
 | `Space b` | buffer picker (`:bn`/`:bp` cycle, `:ls` lists) |
@@ -111,10 +111,11 @@ to scroll, and click inside a picker to choose an item.
 :fo[rmat]                                          run the language formatter
 :conf[ig] path|source|write [path]                   configuration
 :cd <dir>  :pwd  :hl[search] clear                   misc
+:pal[ette]  :help                                    open the command palette
 ```
 
-`:help` itself opens the palette with the command list, and `:map` prints the
-active bindings.
+`:palette` (also `Space p`) opens the command palette, and `:help`
+does the same with the command list. `:map` prints the active bindings.
 
 ## Dark or light
 
@@ -189,6 +190,7 @@ on-idle = "500ms"             # format once typing pauses (never mid-insert); "o
 enable = true
 only-comments = true
 min-len = 4
+case-sensitive = false        # check "Hello" as typed rather than as "hello"
 
 [theme]
 background = "auto"           # ask the terminal; or "dark" / "light"

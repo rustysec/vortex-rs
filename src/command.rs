@@ -265,6 +265,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: ":hlsearch clear",
     },
     CommandSpec {
+        name: "palette",
+        abbreviation: "pal",
+        help: "list commands in the palette",
+        usage: ":palette",
+    },
+    CommandSpec {
         name: "help",
         abbreviation: "h",
         help: "list commands",
@@ -435,7 +441,7 @@ pub fn parse(input: &str) -> Command {
                 Command::Message(StatusLevel::Error, "usage: :hlsearch clear".into())
             }
         }
-        Some("help") => Command::Editor(Cmd::CommandPalette),
+        Some("help") | Some("palette") => Command::Editor(Cmd::CommandPalette),
         Some(_) => Command::Noop, // unreachable: command_for returns a known name
         None => match action_command(head) {
             // Every bindable action is also a `:` command, so the two lists
@@ -684,6 +690,8 @@ pub fn option_summary(editor: &Editor) -> String {
         "status.position",
         "status.height",
         "spell.enable",
+        "spell.only-comments",
+        "spell.case-sensitive",
         "search.ignore-case",
         "search.smart-case",
         "search.ripgrep",
@@ -775,6 +783,7 @@ fn vim_option(name: &str) -> Option<&'static str> {
         "only-comments" => "spell.only-comments",
         "min-len" => "spell.min-len",
         "ignore-camel-case" => "spell.ignore-camel-case",
+        "case-sensitive" | "spell-case-sensitive" => "spell.case-sensitive",
         "ignorecase" | "ic" => "search.ignore-case",
         "smartcase" | "scs" => "search.smart-case",
         "hlsearch" | "hls" => "search.highlight",
@@ -801,6 +810,7 @@ const BOOLEAN_OPTIONS: &[&str] = &[
     "spell.enable",
     "spell.only-comments",
     "spell.ignore-camel-case",
+    "spell.case-sensitive",
     "search.ignore-case",
     "search.smart-case",
     "search.highlight",
@@ -938,6 +948,10 @@ mod tests {
                 split: None
             }
         );
+        // `:palette` opens the command palette, the same list `Space p` shows.
+        assert_eq!(parse("palette"), Command::Editor(Cmd::CommandPalette));
+        assert_eq!(parse("pal"), Command::Editor(Cmd::CommandPalette));
+        assert_eq!(parse("help"), Command::Editor(Cmd::CommandPalette));
     }
 
     #[test]

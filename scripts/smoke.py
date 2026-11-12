@@ -179,10 +179,11 @@ def main():
     check("an unknown option is refused", "unknown option" in body, body)
 
     # Fuzzy file picker.
-    app.keys(b"\x10", 0.6)  # ctrl-p palette
+    app.keys(b" ", 0.3)
+    app.keys(b"p", 0.6)  # space p opens the palette
     body = app.repaint().dump()
     # The overlay reports how many actions match, which only a live picker does.
-    check("ctrl-p opens the palette", re.search(r"\d+/\d+ match", body) is not None, body)
+    check("space p opens the palette", re.search(r"\d+/\d+ match", body) is not None, body)
     app.keys(b"\x1b")
     # The leader is a key of its own: send it apart from the key it modifies.
     app.keys(b" ", 0.3)

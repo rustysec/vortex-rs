@@ -525,6 +525,11 @@ pub struct SpellConfig {
     pub min_len: usize,
     /// Ignore `CamelCase` / `SCREAMING_CASE` identifiers.
     pub ignore_camel_case: bool,
+    /// Match dictionary words case-sensitively.  Off by default, so `The` and
+    /// `teh` are compared against the lowercase list; turning it on makes
+    /// `Hello` a misspelling while `hello` is not, which is what a document
+    /// that cares about capitalisation wants.
+    pub case_sensitive: bool,
 }
 
 impl Default for SpellConfig {
@@ -535,6 +540,7 @@ impl Default for SpellConfig {
             only_comments: true,
             min_len: 4,
             ignore_camel_case: true,
+            case_sensitive: false,
         }
     }
 }
@@ -855,6 +861,7 @@ impl Config {
             "spell.only-comments" => self.spell.only_comments = boolean(key, value)?,
             "spell.min-len" => self.spell.min_len = number(key, value)?,
             "spell.ignore-camel-case" => self.spell.ignore_camel_case = boolean(key, value)?,
+            "spell.case-sensitive" => self.spell.case_sensitive = boolean(key, value)?,
             "lsp.enable" => self.lsp.enable = boolean(key, value)?,
             "lsp.completion" => self.lsp.completion = boolean(key, value)?,
             "lsp.sync" => self.lsp.sync = text(key, value)?.parse::<LspSync>()?,
@@ -928,6 +935,7 @@ impl Config {
             "spell.only-comments" => on_off(self.spell.only_comments),
             "spell.min-len" => self.spell.min_len.to_string(),
             "spell.ignore-camel-case" => on_off(self.spell.ignore_camel_case),
+            "spell.case-sensitive" => on_off(self.spell.case_sensitive),
             "lsp.enable" => on_off(self.lsp.enable),
             "lsp.completion" => on_off(self.lsp.completion),
             "lsp.sync" => self.lsp.sync.to_string(),
