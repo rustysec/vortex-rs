@@ -53,14 +53,18 @@ const DIAGNOSTIC_HOLD: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptKind {
     Command,
-    Search { forward: bool },
+    Search {
+        forward: bool,
+    },
     Path,
     GotoLine,
     FindFiles,
     Grep,
     SwitchBuffer,
     Palette,
-    Spell { span: crate::selection::Span },
+    Spell {
+        span: crate::selection::Span,
+    },
     Diagnostics,
     /// Quick fixes offered by the language server.
     CodeActions,
@@ -1047,9 +1051,9 @@ impl App {
         let edits = action.edits.clone();
         // A quick fix is a change the user chose, so it gets its own undo step
         // rather than folding into whatever they typed before.
-        let applied = self
-            .editor
-            .apply_edits(payload.buffer, &edits, crate::buffer::ChangeGroup::Command);
+        let applied =
+            self.editor
+                .apply_edits(payload.buffer, &edits, crate::buffer::ChangeGroup::Command);
         if applied == 0 {
             self.set_message(StatusLevel::Warn, "the quick fix changed nothing");
             return;
@@ -1764,11 +1768,7 @@ impl App {
             } => {
                 self.on_completions(uri, request, items);
             }
-            LspEvent::Hover {
-                uri,
-                request,
-                text,
-            } => {
+            LspEvent::Hover { uri, request, text } => {
                 self.on_hover(uri, request, text);
             }
             LspEvent::Formatted {
@@ -2049,10 +2049,7 @@ impl App {
             buffer.line_of(span.start),
             buffer.utf16_col_in_line(span.start),
         );
-        let end = (
-            buffer.line_of(span.end),
-            buffer.utf16_col_in_line(span.end),
-        );
+        let end = (buffer.line_of(span.end), buffer.utf16_col_in_line(span.end));
         let version = buffer.version;
         let root = search::project_root(Some(&path));
         let uri = lsp::uri_for(&path);
@@ -2144,10 +2141,7 @@ impl App {
     /// server with nothing to offer.
     fn request_code_actions(&mut self) {
         if !self.editor.config.lsp.enable {
-            self.set_message(
-                StatusLevel::Info,
-                "quick fixes need [lsp] enable = true",
-            );
+            self.set_message(StatusLevel::Info, "quick fixes need [lsp] enable = true");
             return;
         }
         let Some(id) = self.editor.current_buffer_id() else {
@@ -2227,10 +2221,7 @@ impl App {
             .map(|(index, action)| {
                 prompt::Item::new(action.title.clone())
                     .detail(format!("{} edit(s)", action.edits.len()))
-                    .payload(CodeActionPayload {
-                        buffer,
-                        index,
-                    })
+                    .payload(CodeActionPayload { buffer, index })
             })
             .collect();
         self.code_actions = actions;

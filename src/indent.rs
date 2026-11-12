@@ -527,19 +527,28 @@ mod tests {
     fn a_brace_is_a_block_not_a_continuation() {
         // `{` opens a block; only `(` and `[` hang.
         let buffer = buffer("fn main() {");
-        assert_eq!(continuation_indent(&buffer, buffer.len_bytes(), true, 4), None);
+        assert_eq!(
+            continuation_indent(&buffer, buffer.len_bytes(), true, 4),
+            None
+        );
     }
 
     #[test]
     fn a_closed_bracket_is_not_a_continuation() {
         let buffer = buffer("foo(a)");
-        assert_eq!(continuation_indent(&buffer, buffer.len_bytes(), true, 4), None);
+        assert_eq!(
+            continuation_indent(&buffer, buffer.len_bytes(), true, 4),
+            None
+        );
     }
 
     #[test]
     fn a_bracket_inside_a_string_does_not_start_a_continuation() {
         let buffer = buffer("let s = \"(\";");
-        assert_eq!(continuation_indent(&buffer, buffer.len_bytes(), true, 4), None);
+        assert_eq!(
+            continuation_indent(&buffer, buffer.len_bytes(), true, 4),
+            None
+        );
     }
 
     #[test]
@@ -636,10 +645,7 @@ mod tests {
         // amount, shifted to the caret's depth.
         let text = "fn f() {\n    body();\n}\n";
         let shifted = reindent_paste(text, "        ");
-        assert_eq!(
-            shifted,
-            "fn f() {\n            body();\n        }\n"
-        );
+        assert_eq!(shifted, "fn f() {\n            body();\n        }\n");
     }
 
     #[test]

@@ -2018,12 +2018,7 @@ impl Editor {
         // closing bracket that was already there keeps its own line.
         let plan = self.current_buffer().map(|buffer| {
             if self.config.editor.auto_indent {
-                crate::indent::newline(
-                    buffer,
-                    self.cursor(),
-                    self.expand_tab(),
-                    self.tab_width(),
-                )
+                crate::indent::newline(buffer, self.cursor(), self.expand_tab(), self.tab_width())
             } else {
                 crate::indent::Newline {
                     text: "\n".to_string(),
@@ -2717,10 +2712,7 @@ impl Editor {
             .map(|diagnostic| diagnostic.range.start)
             .collect();
         if starts.is_empty() {
-            return vec![Intent::Message(
-                StatusLevel::Info,
-                "no diagnostics".into(),
-            )];
+            return vec![Intent::Message(StatusLevel::Info, "no diagnostics".into())];
         }
         starts.sort_unstable();
         starts.dedup();
@@ -2742,13 +2734,7 @@ impl Editor {
             .diagnostics
             .iter()
             .find(|diagnostic| diagnostic.range.start == target)
-            .map(|diagnostic| {
-                format!(
-                    "{}: {}",
-                    diagnostic.severity.label(),
-                    diagnostic.message
-                )
-            })
+            .map(|diagnostic| format!("{}: {}", diagnostic.severity.label(), diagnostic.message))
             .unwrap_or_default();
         self.set_cursor(target);
         let height = self.text_height(area);
@@ -3916,11 +3902,7 @@ mod tests {
         // went away when a differently-sourced set happened to wipe the buffer.
         let mut fixture = Fixture::new("one\ntwo\n");
         let id = fixture.editor.current_buffer_id().expect("a buffer");
-        let at = fixture
-            .editor
-            .buffer(id)
-            .expect("a buffer")
-            .line_start(0);
+        let at = fixture.editor.buffer(id).expect("a buffer").line_start(0);
 
         for count in 1..=5 {
             let pulled: Vec<_> = (0..count)
@@ -4296,7 +4278,9 @@ mod tests {
         // a blank line — the same as pasting in vim.
         let mut fixture = Fixture::new("fn main() {\n    \n}\n");
         fixture.feed("jA");
-        fixture.editor.paste_text("let a = 1;\nif a {\n    b();\n}\n");
+        fixture
+            .editor
+            .paste_text("let a = 1;\nif a {\n    b();\n}\n");
         assert_eq!(
             fixture.text(),
             "fn main() {\n    let a = 1;\n    if a {\n        b();\n    }\n\n}\n"
@@ -4341,10 +4325,7 @@ mod tests {
     fn an_empty_edit_list_changes_nothing() {
         let mut fixture = Fixture::new("let a = 1;\n");
         let id = fixture.editor.current_buffer_id().expect("a buffer");
-        assert_eq!(
-            fixture.editor.apply_edits(id, &[], ChangeGroup::Format),
-            0
-        );
+        assert_eq!(fixture.editor.apply_edits(id, &[], ChangeGroup::Format), 0);
         assert_eq!(fixture.text(), "let a = 1;\n");
     }
 
@@ -4354,7 +4335,9 @@ mod tests {
         let id = fixture.editor.current_buffer_id().expect("a buffer");
         fixture.editor.buffer_mut(id).expect("a buffer").read_only = true;
         assert_eq!(
-            fixture.editor.apply_edits(id, &[edit(0..3, "const")], ChangeGroup::Format),
+            fixture
+                .editor
+                .apply_edits(id, &[edit(0..3, "const")], ChangeGroup::Format),
             0
         );
         assert_eq!(fixture.text(), "let a = 1;\n");

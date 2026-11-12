@@ -377,15 +377,7 @@ fn draw_pane(
             if let Some(diagnostic) = inline_diagnostic(buffer, line) {
                 let column = display_column(&text, slot.start, slot.end, slot.end, tab_width);
                 let message = format!("  {}", diagnostic.message);
-                emit(
-                    buf,
-                    x,
-                    y,
-                    &message,
-                    theme.status_inactive,
-                    column,
-                    limit,
-                );
+                emit(buf, x, y, &message, theme.status_inactive, column, limit);
             }
         }
 
@@ -1539,7 +1531,11 @@ fn draw_hover(buf: &mut Buffer, screen: Rect, anchor: Position, text: &str, them
     if screen.width < 12 || screen.height < 5 {
         return;
     }
-    let widest = text.lines().map(|line| line.chars().count()).max().unwrap_or(0);
+    let widest = text
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
     let width = (widest + 4)
         .clamp(20, (screen.width as usize).saturating_sub(2))
         .min(screen.width as usize) as u16;
@@ -1658,7 +1654,6 @@ fn wrap_preview(text: &str, width: usize, max_rows: usize) -> Vec<String> {
     }
     lines
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1882,7 +1877,13 @@ mod tests {
         draw_panes(&mut buffer, pane_area, &screen);
         // The float hangs off the caret, which the panes just placed.
         let anchor = Position { x: 3, y: 1 };
-        draw_diagnostic_float(&mut buffer, pane_area, anchor, &screen.diagnostic_float.unwrap(), &theme);
+        draw_diagnostic_float(
+            &mut buffer,
+            pane_area,
+            anchor,
+            &screen.diagnostic_float.unwrap(),
+            &theme,
+        );
 
         let rendered = frame_text(&buffer);
         assert!(rendered.contains("expected expression"), "{rendered}");
