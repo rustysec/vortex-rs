@@ -286,6 +286,13 @@ pub fn opened_line_indent(
 /// Only applies when the caret is alone on its line: a `}` typed after code
 /// belongs where the code is, not where the block started.
 pub fn dedent_for_close(buffer: &Buffer, at: usize, close: char) -> Option<String> {
+    // Only a closing bracket may move a line.  Without this guard the
+    // tree-sitter path below answers for *every* character — it never looks at
+    // `close` — so typing the first letter on a freshly opened line snapped it
+    // back to the enclosing block's column.
+    if !matches!(close, '}' | ')' | ']') {
+        return None;
+    }
     let at = buffer.clamp_byte(at);
     let line = buffer.line_of(at);
     let line_start = buffer.line_start(line);
@@ -638,6 +645,24 @@ mod tests {
     #[test]
     fn an_empty_paste_stays_empty() {
         assert_eq!(reindent_paste("", "    "), "");
+    }
+
+    #[test]
+    fn a_plain_character_never_dedents_a_line() {
+        // The tree-sitter path in `dedent_for_close` ignores the `close`
+        // argument, so on a *parsed* buffer it answered for every character:
+        // typing `x` on a freshly opened line snapped it back to the block's
+        // column.  Only a closing bracket may move the line.
+        let buffer = parsed("fn main() {\n    \n}\n");
+        let at = buffer.line_start(1) + 4;
+        assert_eq!(
+            dedent_for_close(&buffer, at, 'x'),
+            None,
+            "a letter must not dedent"
+        );
+        assert_eq!(dedent_for_close(&buffer, at, ' '), None);
+        // The bracket still does.
+        assert_eq!(dedent_for_close(&buffer, at, '}'), Some(String::new()));
     }
 
     #[test]

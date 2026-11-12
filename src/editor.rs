@@ -421,9 +421,29 @@ impl Editor {
     }
 
     pub fn buffer_by_path(&self, path: &Path) -> Option<BufferId> {
-        self.buffers
+        // Exact match first: the common case, and cheap.
+        if let Some(id) = self
+            .buffers
             .iter()
             .find(|buffer| buffer.path() == Some(path))
+            .map(|buffer| buffer.id)
+        {
+            return Some(id);
+        }
+        // A buffer opened from a relative command-line argument stores a
+        // relative path, but a language server echoes back an absolute
+        // `file://` URI.  Comparing the two directly never matches, so every
+        // diagnostic for such a file was dropped as "no such buffer".  Both
+        // sides are absolutized before the second attempt.
+        let wanted = std::path::absolute(path).ok()?;
+        self.buffers
+            .iter()
+            .find(|buffer| {
+                buffer
+                    .path()
+                    .and_then(|stored| std::path::absolute(stored).ok())
+                    .is_some_and(|stored| stored == wanted)
+            })
             .map(|buffer| buffer.id)
     }
 
@@ -3902,6 +3922,44 @@ mod tests {
     }
 
     #[test]
+    fn typing_on_an_opened_line_keeps_its_indentation() {
+        // `o` on `if true {` opens an indented line.  Typing the first
+        // character must not dedent it back to the `if`'s column: only a
+        // closing bracket is allowed to move the line.
+        let mut fixture = Fixture::new("if true {\n}\n");
+        fixture.feed("o");
+        assert_eq!(caret_at(&fixture), (1, 4), "opened inside the block");
+        fixture.feed("x");
+        assert_eq!(
+            fixture.text(),
+            "if true {\n    x\n}\n",
+            "typing keeps the indentation the opened line had"
+        );
+        assert_eq!(caret_at(&fixture), (1, 5));
+    }
+
+    #[test]
+    fn typing_on_an_opened_line_keeps_its_indentation_when_parsed() {
+        // The real session has a parsed buffer, and the parse lands while the
+        // user pauses after `o`.  That is the case the tree-sitter dedent path
+        // sees, and the one the unparsed fixture above cannot reach.
+        let mut fixture = Fixture::new("if true {\n}\n");
+        as_rust(&mut fixture);
+        fixture.editor.buffers[0].reparse_now();
+        fixture.feed("o");
+        // The async parse completes before the next keystroke.
+        fixture.editor.buffers[0].reparse_now();
+        assert_eq!(caret_at(&fixture), (1, 4), "opened inside the block");
+        fixture.feed("x");
+        assert_eq!(
+            fixture.text(),
+            "if true {\n    x\n}\n",
+            "typing keeps the indentation the opened line had"
+        );
+        assert_eq!(caret_at(&fixture), (1, 5));
+    }
+
+    #[test]
     fn o_on_a_nested_block_indents_one_level_deeper() {
         let mut fixture = Fixture::new("fn main() {\n    if x {\n    }\n}\n");
         fixture.feed("jo");
@@ -4316,6 +4374,31 @@ mod tests {
         let buffer = fixture.editor.buffer(id).expect("a buffer");
         assert_eq!(buffer.line_of(caret), 0, "still on the only line");
         assert_eq!(caret, buffer.line_end(0), "still at the end of the line");
+    }
+
+    #[test]
+    fn a_buffer_is_found_by_its_absolute_path_too() {
+        // A buffer opened from a relative command-line argument stores a
+        // relative path, but a language server echoes back an absolute
+        // `file://` URI.  Comparing the two directly never matched, so every
+        // diagnostic for such a file was dropped as "no such buffer".
+        let mut fixture = Fixture::new("fn main() {}\n");
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.editor.buffers[0].set_path(std::path::PathBuf::from("src/probe.rs"));
+
+        // The stored (relative) path still matches exactly.
+        assert_eq!(
+            fixture.editor.buffer_by_path(Path::new("src/probe.rs")),
+            Some(id)
+        );
+        // And the absolute form the server reports resolves to the same buffer.
+        let absolute = std::path::absolute("src/probe.rs").expect("absolute");
+        assert_eq!(fixture.editor.buffer_by_path(&absolute), Some(id));
+        // A different file is still not found.
+        assert_eq!(
+            fixture.editor.buffer_by_path(Path::new("src/other.rs")),
+            None
+        );
     }
 
     // ------------------------------------------------------------- highlighting

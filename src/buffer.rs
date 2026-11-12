@@ -11,6 +11,14 @@ use crate::lang::{self, LanguageInfo};
 use crate::selection::{Edit, Selection, Span};
 use crate::syntax::SyntaxState;
 
+/// How many applied changes a buffer tracks before it gives up and asks the
+/// language client to resync the whole document.
+///
+/// A buffer nobody drains — LSP off, or a long run of edits between ticks —
+/// must not grow this without bound.  The cap is generous: a tick is 30ms, so
+/// reaching it means something is wrong rather than that the user typed fast.
+const MAX_PENDING_CHANGES: usize = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BufferId(pub u32);
 
@@ -40,6 +48,39 @@ impl ChangeGroup {
 pub struct Change {
     pub range: Span,
     pub text: String,
+}
+
+/// One applied change, as LSP positions in the document *before* it landed.
+///
+/// Byte offsets cannot be replayed later: by the time the language client drains
+/// them the rope has moved on, and an offset that was valid then may now be
+/// inside a different line.  Positions are captured at apply time instead, which
+/// is also exactly what `contentChanges` wants — each entry is applied to the
+/// document the previous one produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedChange {
+    /// `(line, UTF-16 column)` of the start, 0-based.
+    pub start: (usize, usize),
+    /// `(line, UTF-16 column)` of the end, 0-based.
+    pub end: (usize, usize),
+    pub text: String,
+}
+
+/// `(line, UTF-16 column)` of a byte offset, the way LSP counts positions.
+fn utf16_position(rope: &Rope, byte: usize) -> (usize, usize) {
+    let byte = floor_boundary(rope, byte.min(rope.len_bytes()));
+    let line = if rope.len_bytes() == 0 {
+        0
+    } else {
+        rope.byte_to_line(byte)
+    };
+    let line_start = rope.line_to_byte(line);
+    let column = rope
+        .slice(rope.byte_to_char(line_start)..rope.byte_to_char(byte))
+        .chars()
+        .map(char::len_utf16)
+        .sum();
+    (line, column)
 }
 
 impl Change {
@@ -181,6 +222,17 @@ pub struct Buffer {
     /// mtime of the file the last time the buffer matched it, so `:write` can
     /// tell an outside edit from nothing at all.
     disk_mtime: Option<std::time::SystemTime>,
+    /// Changes applied since the last [`Buffer::take_changes`], in the order
+    /// they were applied.
+    ///
+    /// The language client needs the edits themselves, not just the fact that
+    /// the version moved: incremental sync sends a range per change, and the
+    /// version number alone cannot say where the text went.  Positions are
+    /// captured at apply time because byte offsets do not survive the edit.
+    pending_changes: Vec<RecordedChange>,
+    /// Set when `pending_changes` overflowed, so the next drain reports "send
+    /// the whole document" instead of a partial list of edits.
+    changes_overflowed: bool,
 }
 
 impl Buffer {
@@ -214,6 +266,8 @@ impl Buffer {
             last_group_at: None,
             last_change_pos: None,
             disk_mtime,
+            pending_changes: Vec::new(),
+            changes_overflowed: false,
         }
     }
 
@@ -349,6 +403,11 @@ impl Buffer {
 
         // Apply back to front so earlier byte offsets stay valid.
         for change in changes.iter().rev() {
+            // Positions are captured *before* the rope moves: a byte offset
+            // recorded now would point somewhere else by the time the language
+            // client drains it.
+            let start = utf16_position(&self.rope, change.range.start);
+            let end = utf16_position(&self.rope, change.range.end);
             let removed = slice_bytes(&self.rope, change.range);
             replace(&mut self.rope, change.range, &change.text);
             undo_changes.push(UndoChange {
@@ -357,9 +416,26 @@ impl Buffer {
                 inserted: change.text.clone(),
             });
             edits.push(Edit::new(change.range, change.text.len()));
+            // Recorded in application order (highest offset first), which is
+            // also the order LSP wants: each `contentChanges` entry is applied
+            // to the document the previous one produced, so a range at a lower
+            // offset stays valid only after the higher ones have landed.
+            self.pending_changes.push(RecordedChange {
+                start,
+                end,
+                text: change.text.clone(),
+            });
         }
         undo_changes.reverse();
         edits.reverse();
+
+        // A buffer nobody drains (LSP off, or a long run of edits) must not grow
+        // this without bound.  Past the cap the ranges are dropped and the
+        // client is told to resync the whole document instead.
+        if self.pending_changes.len() > MAX_PENDING_CHANGES {
+            self.pending_changes.clear();
+            self.changes_overflowed = true;
+        }
 
         self.version += 1;
         self.last_change_pos = Some(changes[0].range.start);
@@ -368,6 +444,23 @@ impl Buffer {
         self.record(group, undo_changes, before, after.clone());
         *selection = after;
         edits
+    }
+
+    /// Take the changes applied since the last call, for incremental sync.
+    ///
+    /// `None` means the changes were dropped because there were too many to
+    /// track: the caller has to send the whole document instead.  An empty
+    /// vector means nothing changed.
+    ///
+    /// The changes come back in the order they were applied, which is the order
+    /// LSP applies a `contentChanges` array.
+    pub fn take_changes(&mut self) -> Option<Vec<RecordedChange>> {
+        if self.changes_overflowed {
+            self.changes_overflowed = false;
+            self.pending_changes.clear();
+            return None;
+        }
+        Some(std::mem::take(&mut self.pending_changes))
     }
 
     fn record(
@@ -1444,6 +1537,70 @@ mod tests {
             &mut selection,
         );
         buffer.break_undo_group();
+    }
+
+    #[test]
+    fn applied_changes_are_recorded_for_incremental_sync() {
+        let mut buffer = buffer_with("alpha\n");
+        insert(&mut buffer, 5, " beta", ChangeGroup::Insert);
+        assert_eq!(buffer.text(), "alpha beta\n");
+
+        let changes = buffer.take_changes().expect("changes were tracked");
+        assert_eq!(changes.len(), 1);
+        // Positions, not byte offsets: an offset recorded here would point
+        // somewhere else by the time the client drains it.
+        assert_eq!(changes[0].start, (0, 5));
+        assert_eq!(changes[0].end, (0, 5));
+        assert_eq!(changes[0].text, " beta");
+
+        // Draining clears them: the next tick must not resend the same edit.
+        assert_eq!(buffer.take_changes().expect("tracked"), Vec::new());
+    }
+
+    #[test]
+    fn changes_come_back_in_application_order() {
+        // LSP applies a `contentChanges` array in order, each entry against the
+        // document the previous one produced.  A multi-cursor edit applies
+        // highest-offset first, and that is the order the server needs.
+        let mut buffer = buffer_with("one two three\n");
+        let mut selection = Selection::point(0);
+        buffer.apply(
+            vec![
+                Change::replace(Span::new(0, 3), "ONE"),
+                Change::replace(Span::new(8, 13), "THREE"),
+            ],
+            ChangeGroup::Command,
+            &mut selection,
+        );
+        assert_eq!(buffer.text(), "ONE two THREE\n");
+
+        let changes = buffer.take_changes().expect("tracked");
+        assert_eq!(changes.len(), 2);
+        assert!(
+            changes[0].start.1 > changes[1].start.1,
+            "highest offset first, got {changes:?}"
+        );
+        assert_eq!(changes[0].start, (0, 8));
+        assert_eq!(changes[0].end, (0, 13));
+        assert_eq!(changes[1].start, (0, 0));
+        assert_eq!(changes[1].end, (0, 3));
+    }
+
+    #[test]
+    fn an_overflowing_change_log_asks_for_a_full_resync() {
+        // A buffer nobody drains must not grow without bound; past the cap the
+        // client is told to send the whole document instead of a partial list.
+        let mut buffer = buffer_with("");
+        for index in 0..(MAX_PENDING_CHANGES + 1) {
+            insert(&mut buffer, index, "x", ChangeGroup::Insert);
+        }
+        assert_eq!(
+            buffer.take_changes(),
+            None,
+            "an overflow reports None, not a truncated list"
+        );
+        // The flag is consumed, so the next drain is a normal empty one.
+        assert_eq!(buffer.take_changes().expect("tracked"), Vec::new());
     }
 
     #[test]

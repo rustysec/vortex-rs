@@ -138,8 +138,12 @@ pub struct App {
     pub hover: Option<String>,
     /// The hover request in flight: `(id, buffer)`.
     hover_pending: Option<(i64, BufferId)>,
-    /// The LSP format request in flight: `(id, buffer)`.
-    format_pending: Option<(i64, BufferId)>,
+    /// The LSP format request in flight: `(request, buffer, version)`.
+    ///
+    /// The version is what the server was asked about.  A format answer that
+    /// lands after the buffer has moved on describes text that no longer
+    /// exists, and applying it would rewrite the user's typing.
+    format_pending: Option<(i64, BufferId, u64)>,
     /// The code-action request in flight: `(id, buffer)`.
     code_action_pending: Option<(i64, BufferId)>,
     /// The quick fixes the last code-action answer offered, indexed by the
@@ -1249,6 +1253,20 @@ impl App {
                             self.editor.config.value_of(&key).unwrap_or_default()
                         ),
                     );
+                    // Turning LSP on has to start the servers: the switch alone
+                    // changes nothing until something asks for a client, and
+                    // nothing does until the next edit.
+                    if key == "lsp.enable" && self.editor.config.lsp.enable {
+                        let ids: Vec<BufferId> = self
+                            .editor
+                            .buffers()
+                            .iter()
+                            .map(|buffer| buffer.id)
+                            .collect();
+                        for id in ids {
+                            self.notify_lsp_open(id);
+                        }
+                    }
                     // `:set` is session-scoped, exactly like vim: writing the
                     // config file is an explicit `:config write`.
                 }
@@ -1937,6 +1955,7 @@ impl App {
         };
         let tab_size = self.editor.config.editor.tab_width_for(&language);
         let insert_spaces = self.editor.config.editor.expand_tab_for(&language);
+        let version = buffer.version;
         let root = search::project_root(Some(&path));
         let uri = lsp::uri_for(&path);
         let request = self.next_request;
@@ -1944,7 +1963,7 @@ impl App {
         let sender = self.events.sender();
         if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
             client.format(uri, request, tab_size, insert_spaces);
-            self.format_pending = Some((request, id));
+            self.format_pending = Some((request, id, version));
             true
         } else {
             false
@@ -1984,6 +2003,7 @@ impl App {
             buffer.line_of(span.end),
             buffer.utf16_col_in_line(span.end),
         );
+        let version = buffer.version;
         let root = search::project_root(Some(&path));
         let uri = lsp::uri_for(&path);
         let request = self.next_request;
@@ -1991,7 +2011,7 @@ impl App {
         let sender = self.events.sender();
         if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
             client.range_format(uri, request, start, end, tab_size, insert_spaces);
-            self.format_pending = Some((request, id));
+            self.format_pending = Some((request, id, version));
         } else {
             self.spawn_external_format(id);
         }
@@ -2005,7 +2025,7 @@ impl App {
         edits: Vec<lsp::TextEdit>,
         error: Option<String>,
     ) {
-        let Some((pending, buffer)) = self.format_pending else {
+        let Some((pending, buffer, version)) = self.format_pending else {
             return;
         };
         if pending != request {
@@ -2016,6 +2036,19 @@ impl App {
             return;
         };
         if lsp::uri_for(path) != uri {
+            return;
+        }
+        // The server formatted the text it was told about.  If the buffer has
+        // moved on since, those edits describe text that no longer exists, and
+        // applying them would rewrite whatever the user typed in the meantime.
+        // Insert mode is the same hazard in slow motion: a rewrite under the
+        // caret is exactly what the external formatter is held back for.
+        let stale = self
+            .editor
+            .buffer(buffer)
+            .is_none_or(|buffer| buffer.version != version);
+        if stale || self.editor.mode == Mode::Insert {
+            self.editor.schedule_auto_format(buffer);
             return;
         }
         if let Some(error) = error {
@@ -2335,30 +2368,35 @@ impl App {
     // ------------------------------------------------------------------ lsp
 
     fn notify_lsp_open(&mut self, id: BufferId) {
-        if !self.editor.config.lsp.enable {
+        let enabled = self.editor.config.lsp.enable;
+        // `didOpen` sends the whole document, so any changes recorded before it
+        // are already included.  Draining them here stops a later tick from
+        // replaying those ranges against a document that already has them.
+        let Some(buffer) = self.editor.buffer_mut(id) else {
+            return;
+        };
+        let _ = buffer.take_changes();
+        if !enabled {
             return;
         }
-        let (path, language, text, root) = match self.editor.buffer(id) {
-            Some(buffer) => {
-                let Some(path) = buffer.path() else {
-                    return;
-                };
-                (
-                    path.to_path_buf(),
-                    buffer.language.id.to_string(),
-                    buffer.text(),
-                    search::project_root(Some(path)),
-                )
-            }
-            None => return,
+        let Some(path) = buffer.path().map(|path| path.to_path_buf()) else {
+            return;
         };
+        let language = buffer.language.id.to_string();
+        let text = buffer.text();
+        // The version the text belongs to.  Claiming 1 here made the app drop
+        // every diagnostic for a buffer that was already past version 1 when
+        // the server started, which is what happens when LSP is switched on
+        // mid-session.
+        let version = buffer.version as i64;
+        let root = search::project_root(Some(&path));
         let Some(spec) = self.server_spec_for(&language) else {
             return;
         };
         let uri = lsp::uri_for(&path);
         let sender = self.events.sender();
         if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
-            client.did_open(uri, &language, text);
+            client.did_open(uri, &language, text, version);
         }
     }
 
@@ -2380,23 +2418,41 @@ impl App {
     ///
     /// Without this the server answers completions and diagnostics against the
     /// text it was opened with, which is wrong from the first keystroke on.
+    ///
+    /// Incremental sync sends one ranged edit per change; full sync resends the
+    /// whole document.  The change log is drained either way, so a buffer whose
+    /// server is not running does not accumulate edits forever.
     fn notify_lsp_change(&mut self, id: BufferId) {
-        if !self.editor.config.lsp.enable {
+        let enabled = self.editor.config.lsp.enable;
+        let incremental = self.editor.config.lsp.sync.is_incremental();
+        let Some(buffer) = self.editor.buffer_mut(id) else {
+            return;
+        };
+        // `None` means the log overflowed: the ranges are gone, so the whole
+        // document has to be sent instead.
+        let changes = buffer.take_changes();
+        if !enabled {
             return;
         }
-        let (path, text, version) = match self.editor.buffer(id) {
-            Some(buffer) => {
-                let Some(path) = buffer.path() else {
-                    return;
-                };
-                (path.to_path_buf(), buffer.text(), buffer.version as i64)
-            }
-            None => return,
+        let Some(path) = buffer.path().map(|path| path.to_path_buf()) else {
+            return;
         };
+        let version = buffer.version as i64;
+        let text = buffer.text();
         let root = search::project_root(Some(&path));
         let uri = lsp::uri_for(&path);
-        if let Some(client) = self.clients.get(&root) {
-            client.did_change(uri, text, version);
+        let Some(client) = self.clients.get(&root) else {
+            return;
+        };
+        match changes {
+            // Nothing changed: a no-op notification would only make the server
+            // re-analyse the document for no reason.
+            Some(changes) if changes.is_empty() => {}
+            Some(changes) if incremental => {
+                client.did_change_ranged(uri, changes, version);
+            }
+            // Full sync, or the log overflowed and the ranges are gone.
+            _ => client.did_change(uri, text, version),
         }
     }
 
@@ -2645,6 +2701,10 @@ impl App {
                         buffer.syntax.invalidate();
                     }
                     self.spawn_parse(id);
+                    // A reload is how `[lsp] enable = true` takes effect, so the
+                    // servers have to be started here: without this the switch
+                    // flips and nothing else happens until the next restart.
+                    self.notify_lsp_open(id);
                 }
             }
             Err(error) => self.set_message(StatusLevel::Error, error.to_string()),

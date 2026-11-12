@@ -28,7 +28,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::buffer::{Buffer, BufferId};
-use crate::config::Config;
+use crate::config::{Config, LspSync};
 use crate::diagnostic::{Diagnostic, DiagnosticSource, DiagnosticTag, Severity};
 use crate::event::{AsyncEvent, EventTx, JobId};
 use crate::selection::Span;
@@ -100,6 +100,8 @@ pub struct ServerSpec {
     pub language: String,
     pub command: String,
     pub args: Vec<String>,
+    /// How edits are reported to this server.
+    pub sync: LspSync,
 }
 
 /// Resolve the server for a language from `[lsp.servers]`.
@@ -113,6 +115,7 @@ pub fn server_for(language: &str, config: &Config) -> Option<ServerSpec> {
                 language: language.to_string(),
                 command: entry.command.clone(),
                 args: entry.args.clone(),
+                sync: config.lsp.sync,
             });
         }
         return None;
@@ -131,6 +134,7 @@ pub fn server_for(language: &str, config: &Config) -> Option<ServerSpec> {
         language: language.to_string(),
         command: command.to_string(),
         args,
+        sync: config.lsp.sync,
     })
 }
 
@@ -205,6 +209,25 @@ impl DiagnosticItem {
         .with_tags(self.tags.clone())
         .with_related(related)
     }
+}
+
+/// Decode a whole `publishDiagnostics` notification into an event.
+///
+/// The notification is a JSON-RPC envelope: the payload lives under `params`,
+/// not at the top level.  Reading `diagnostics` off the envelope itself found
+/// nothing and returned an empty list, so every diagnostic was silently
+/// dropped — the unit tests missed it because they feed a bare params object.
+pub fn diagnostics_event(notification: &Value) -> Option<LspEvent> {
+    let params = notification.get("params")?;
+    Some(LspEvent::Diagnostics {
+        uri: params
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        version: params.get("version").and_then(Value::as_i64),
+        items: diagnostic_items(params),
+    })
 }
 
 /// Decode `publishDiagnostics` parameters.
@@ -625,10 +648,24 @@ enum Outgoing {
         uri: String,
         language: String,
         text: String,
+        /// The buffer version the text belongs to.  `didOpen` used to claim 1
+        /// unconditionally, which made the app drop every diagnostic for a
+        /// buffer that was already past version 1 when the server started —
+        /// exactly what happens when LSP is switched on mid-session.
+        version: i64,
     },
     Change {
         uri: String,
         text: String,
+        version: i64,
+    },
+    /// A set of ranged edits, for incremental sync.
+    ///
+    /// Each entry is applied to the document the previous one produced, so the
+    /// order matters and the ranges are already in LSP positions.
+    RangedChange {
+        uri: String,
+        changes: Vec<crate::buffer::RecordedChange>,
         version: i64,
     },
     Save {
@@ -741,16 +778,31 @@ impl ClientHandle {
         !self.failed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn did_open(&self, uri: String, language: &str, text: String) {
+    pub fn did_open(&self, uri: String, language: &str, text: String, version: i64) {
         let _ = self.outgoing.send(Outgoing::Open {
             uri,
             language: language.to_string(),
             text,
+            version,
         });
     }
 
     pub fn did_change(&self, uri: String, text: String, version: i64) {
         let _ = self.outgoing.send(Outgoing::Change { uri, text, version });
+    }
+
+    /// Report a set of ranged edits (incremental sync).
+    pub fn did_change_ranged(
+        &self,
+        uri: String,
+        changes: Vec<crate::buffer::RecordedChange>,
+        version: i64,
+    ) {
+        let _ = self.outgoing.send(Outgoing::RangedChange {
+            uri,
+            changes,
+            version,
+        });
     }
 
     pub fn did_save(&self, uri: String) {
@@ -897,6 +949,10 @@ async fn session(
                 "textDocument": {
                     "publishDiagnostics": { "relatedInformation": false },
                     "synchronization": {
+                        // 1 = full, 2 = incremental.  This is what we ask for;
+                        // the server answers with what it will actually do, and
+                        // `server_incremental` below honours that answer.
+                        "textDocumentSync": if spec.sync.is_incremental() { 2 } else { 1 },
                         "didSave": true,
                         "dynamicRegistration": false
                     },
@@ -927,6 +983,10 @@ async fn session(
     // The text the server has been told about, per URI.  Completion ranges are
     // resolved against it, so they line up with what the server actually saw.
     let mut synced: HashMap<String, String> = HashMap::new();
+    // What the server said it will accept.  A server may refuse incremental
+    // sync even when asked for it, and sending ranges to one that did would
+    // desync its copy of the document silently.
+    let mut server_incremental = spec.sync.is_incremental();
 
     loop {
         tokio::select! {
@@ -943,12 +1003,34 @@ async fn session(
                         if value.get("id").is_some() && value.get("method").is_none() {
                             // A response to one of our requests.
                             if !handshake.complete {
+                                // `textDocumentSync` is either a number or an
+                                // object with a `change` field; both shapes are
+                                // legal and servers use both.
+                                let sync = value
+                                    .pointer("/result/capabilities/textDocumentSync")
+                                    .and_then(|sync| {
+                                        sync.as_u64().or_else(|| {
+                                            sync.get("change").and_then(Value::as_u64)
+                                        })
+                                    });
+                                if let Some(kind) = sync {
+                                    // 2 is incremental; anything else (1, or a
+                                    // server that said nothing) means full.
+                                    server_incremental = kind == 2;
+                                }
                                 let note = jsonrpc::notification("initialized", Some(json!({})));
                                 let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
                                 // Now that the handshake is complete, replay
                                 // everything that arrived while it was running.
                                 for message in handshake.complete() {
-                                    send_outgoing(&stdin, message, &mut pending, &mut synced).await;
+                                    send_outgoing(
+                                        &stdin,
+                                        message,
+                                        &mut pending,
+                                        &mut synced,
+                                        server_incremental,
+                                    )
+                                    .await;
                                 }
                                 tx.send_async(AsyncEvent::Lsp(LspEvent::Ready {
                                     language: spec.language.clone(),
@@ -1001,19 +1083,9 @@ async fn session(
                         }
                         match value.get("method").and_then(Value::as_str) {
                             Some("textDocument/publishDiagnostics") => {
-                                let uri = value
-                                    .pointer("/params/uri")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let version = value
-                                    .pointer("/params/version")
-                                    .and_then(Value::as_i64);
-                                tx.send_async(AsyncEvent::Lsp(LspEvent::Diagnostics {
-                                    uri,
-                                    version,
-                                    items: diagnostic_items(&value),
-                                }));
+                                if let Some(event) = diagnostics_event(&value) {
+                                    tx.send_async(AsyncEvent::Lsp(event));
+                                }
                             }
                             Some("window/showMessage") | Some("window/logMessage") => {
                                 let message = value
@@ -1059,13 +1131,54 @@ async fn session(
                         // as a protocol violation and exits, so hold everything
                         // until the handshake is done.
                         if let Some(message) = handshake.accept(message) {
-                            send_outgoing(&stdin, message, &mut pending, &mut synced).await;
+                            send_outgoing(
+                                &stdin,
+                                message,
+                                &mut pending,
+                                &mut synced,
+                                server_incremental,
+                            )
+                            .await;
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Apply recorded changes to the text the server has been told about.
+///
+/// The stored copy has to track the server's view: completion ranges are
+/// resolved against it, so a stale copy puts every later answer on the wrong
+/// text.  Positions are line/UTF-16-column, so each is converted to a byte
+/// offset in the *current* copy before the edit is applied — the same order the
+/// server applies them in.
+fn apply_recorded(text: &mut String, changes: &[crate::buffer::RecordedChange]) {
+    for change in changes {
+        let start = byte_at_utf16_position(text, change.start);
+        let end = byte_at_utf16_position(text, change.end);
+        let end = end.max(start);
+        if start <= text.len() && end <= text.len() {
+            text.replace_range(start..end, &change.text);
+        }
+    }
+}
+
+/// Byte offset of an LSP `(line, UTF-16 column)` position in `text`.
+fn byte_at_utf16_position(text: &str, position: (usize, usize)) -> usize {
+    let (line, column) = position;
+    let mut offset = 0usize;
+    for _ in 0..line {
+        match text[offset..].find('\n') {
+            Some(index) => offset += index + 1,
+            None => return text.len(),
+        }
+    }
+    let rest = &text[offset..];
+    let line_end = rest.find('\n').unwrap_or(rest.len());
+    let line_text = &rest[..line_end];
+    offset + crate::buffer::utf16_col_to_byte(line_text, column)
 }
 
 /// Write one queued message to the server.
@@ -1078,17 +1191,19 @@ async fn send_outgoing(
     message: Outgoing,
     pending: &mut HashMap<i64, PendingRequest>,
     synced: &mut HashMap<String, String>,
+    server_incremental: bool,
 ) {
     match message {
         Outgoing::Open {
             uri,
             language,
             text,
+            version,
         } => {
             let note = jsonrpc::notification(
                 "textDocument/didOpen",
                 Some(json!({ "textDocument": {
-                    "uri": uri, "languageId": language, "version": 1, "text": text
+                    "uri": uri, "languageId": language, "version": version, "text": text
                 }})),
             );
             let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
@@ -1103,6 +1218,57 @@ async fn send_outgoing(
             );
             let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
             synced.insert(uri, text);
+        }
+        Outgoing::RangedChange {
+            uri,
+            changes,
+            version,
+        } => {
+            // The stored copy is the only place the full text exists here, so
+            // it is updated first: the fallback below needs the post-edit text,
+            // and completion ranges are resolved against it either way.
+            let full = match synced.get_mut(&uri) {
+                Some(text) => {
+                    apply_recorded(text, &changes);
+                    Some(text.clone())
+                }
+                None => None,
+            };
+            if !server_incremental {
+                // The server refused incremental sync even though we asked for
+                // it.  Sending ranges to it would desync its copy silently, so
+                // the whole document goes instead.
+                if let Some(text) = full {
+                    let note = jsonrpc::notification(
+                        "textDocument/didChange",
+                        Some(json!({ "textDocument": { "uri": uri, "version": version },
+                                      "contentChanges": [{ "text": text }] })),
+                    );
+                    let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
+                }
+                return;
+            }
+            // Incremental sync: one ranged entry per edit, in the order they
+            // were applied.  Each entry is applied to the document the previous
+            // one produced, which is exactly how the buffer recorded them.
+            let content: Vec<Value> = changes
+                .iter()
+                .map(|change| {
+                    json!({
+                        "range": {
+                            "start": { "line": change.start.0, "character": change.start.1 },
+                            "end": { "line": change.end.0, "character": change.end.1 }
+                        },
+                        "text": change.text
+                    })
+                })
+                .collect();
+            let note = jsonrpc::notification(
+                "textDocument/didChange",
+                Some(json!({ "textDocument": { "uri": uri, "version": version },
+                              "contentChanges": content })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &note).await;
         }
         Outgoing::Save { uri } => {
             let note = jsonrpc::notification(
@@ -1382,6 +1548,51 @@ mod tests {
             text.to_string(),
             &crate::config::EditorConfig::default(),
         )
+    }
+
+    #[test]
+    fn a_publish_diagnostics_notification_yields_an_event() {
+        // The real message is a JSON-RPC envelope: the payload is under
+        // `params`.  Reading `diagnostics` off the envelope itself found
+        // nothing, so every diagnostic was silently dropped in a live session
+        // while the params-level unit tests below kept passing.
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///tmp/x.rs",
+                "version": 7,
+                "diagnostics": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 3 }
+                    },
+                    "severity": 1,
+                    "message": "cannot find value `foo`",
+                    "source": "rust-analyzer"
+                }]
+            }
+        });
+
+        let Some(LspEvent::Diagnostics {
+            uri,
+            version,
+            items,
+        }) = diagnostics_event(&notification)
+        else {
+            panic!("no diagnostics event from a publish notification");
+        };
+        assert_eq!(uri, "file:///tmp/x.rs");
+        assert_eq!(version, Some(7));
+        assert_eq!(items.len(), 1, "the diagnostic must survive the envelope");
+        assert_eq!(items[0].message, "cannot find value `foo`");
+        assert_eq!(items[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn a_notification_without_params_yields_nothing() {
+        // A malformed notification must not panic the session loop.
+        assert!(diagnostics_event(&json!({ "method": "x" })).is_none());
     }
 
     #[test]
@@ -1753,11 +1964,71 @@ mod tests {
         assert_eq!(value["severity"], 1, "error is LSP severity 1");
     }
 
+    #[test]
+    fn recorded_changes_replay_onto_the_synced_copy() {
+        // The stored copy has to track the server's view: completion ranges are
+        // resolved against it, so a stale copy puts later answers on wrong text.
+        let mut text = String::from("fn  main() {}\n");
+        let changes = vec![
+            crate::buffer::RecordedChange {
+                start: (0, 2),
+                end: (0, 4),
+                text: " ".into(),
+            },
+        ];
+        apply_recorded(&mut text, &changes);
+        assert_eq!(text, "fn main() {}\n");
+    }
+
+    #[test]
+    fn recorded_changes_apply_in_order() {
+        // Each entry is applied to the document the previous one produced, so a
+        // later range is expressed against the already-edited text.
+        let mut text = String::from("abc\n");
+        let changes = vec![
+            crate::buffer::RecordedChange {
+                start: (0, 0),
+                end: (0, 0),
+                text: "X".into(),
+            },
+            crate::buffer::RecordedChange {
+                start: (0, 4),
+                end: (0, 4),
+                text: "Y".into(),
+            },
+        ];
+        apply_recorded(&mut text, &changes);
+        assert_eq!(text, "XabcY\n");
+    }
+
+    #[test]
+    fn a_recorded_position_counts_utf16_units() {
+        // `é` is one UTF-16 unit but two bytes; `😀` is two units and four
+        // bytes.  A byte column would land in the wrong place.
+        let text = "let é = 1;\nlet 😀 = 2;\n";
+        assert_eq!(byte_at_utf16_position(text, (0, 4)), 4);
+        assert_eq!(byte_at_utf16_position(text, (0, 5)), 6, "after the é");
+        // Line 1 starts after the first newline.
+        let line1 = text.find('\n').expect("a newline") + 1;
+        assert_eq!(byte_at_utf16_position(text, (1, 0)), line1);
+        assert_eq!(byte_at_utf16_position(text, (1, 4)), line1 + 4);
+        // The emoji is two units, so column 6 is just past it.
+        assert_eq!(byte_at_utf16_position(text, (1, 6)), line1 + 8);
+    }
+
+    #[test]
+    fn a_position_past_the_end_clamps() {
+        let text = "short\n";
+        assert_eq!(byte_at_utf16_position(text, (0, 99)), 5);
+        assert_eq!(byte_at_utf16_position(text, (99, 0)), text.len());
+    }
+
     fn open(uri: &str) -> Outgoing {
         Outgoing::Open {
             uri: uri.to_string(),
             language: "rust".into(),
             text: String::new(),
+            version: 1,
         }
     }
 

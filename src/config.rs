@@ -425,9 +425,58 @@ pub struct LspConfig {
     pub enable: bool,
     /// Ask the server for completions while typing in insert mode.
     pub completion: bool,
+    /// How edits are sent to the server: `"incremental"` (a range per change)
+    /// or `"full"` (the whole document every time).
+    ///
+    /// Incremental is the default because it is what makes editing a large file
+    /// bearable — a whole-buffer send on every keystroke is megabytes of JSON
+    /// for a one-character edit.  `"full"` is the escape hatch: it is always
+    /// correct, so it is the thing to try when diagnostics look like they
+    /// describe text that is not there.
+    pub sync: LspSync,
     /// Servers keyed by language name.
     #[serde(default)]
     pub servers: BTreeMap<String, LspServer>,
+}
+
+/// How `textDocument/didChange` reports edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LspSync {
+    /// One ranged change per edit.
+    #[default]
+    Incremental,
+    /// The whole document, every time.
+    Full,
+}
+
+impl LspSync {
+    pub fn is_incremental(self) -> bool {
+        self == LspSync::Incremental
+    }
+}
+
+impl std::str::FromStr for LspSync {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "incremental" => Ok(LspSync::Incremental),
+            "full" => Ok(LspSync::Full),
+            other => Err(format!(
+                "lsp.sync expects incremental or full (got \"{other}\")"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for LspSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LspSync::Incremental => "incremental",
+            LspSync::Full => "full",
+        })
+    }
 }
 
 impl Default for LspConfig {
@@ -435,6 +484,7 @@ impl Default for LspConfig {
         Self {
             enable: false,
             completion: true,
+            sync: LspSync::default(),
             servers: BTreeMap::new(),
         }
     }
@@ -807,6 +857,7 @@ impl Config {
             "spell.ignore-camel-case" => self.spell.ignore_camel_case = boolean(key, value)?,
             "lsp.enable" => self.lsp.enable = boolean(key, value)?,
             "lsp.completion" => self.lsp.completion = boolean(key, value)?,
+            "lsp.sync" => self.lsp.sync = text(key, value)?.parse::<LspSync>()?,
             other => return Err(format!("unknown option \"{other}\"")),
         }
         // Range checks `validate()` also performs, so a bad `:set` is refused
@@ -879,6 +930,7 @@ impl Config {
             "spell.ignore-camel-case" => on_off(self.spell.ignore_camel_case),
             "lsp.enable" => on_off(self.lsp.enable),
             "lsp.completion" => on_off(self.lsp.completion),
+            "lsp.sync" => self.lsp.sync.to_string(),
             _ => return None,
         })
     }
@@ -1223,5 +1275,30 @@ mod tests {
         // A bad value must not make `tab` insert nothing.
         let (config, _) = Config::parse("[editor.indent.go]\ntab-width = 0\n").expect("parses");
         assert_eq!(config.editor.tab_width_for("go"), 1);
+    }
+
+    #[test]
+    fn lsp_sync_defaults_to_incremental_and_can_be_turned_off() {
+        // Incremental is the default: a whole-buffer send per keystroke is
+        // megabytes of JSON for a one-character edit.
+        let config = Config::default();
+        assert_eq!(config.lsp.sync, LspSync::Incremental);
+        assert!(config.lsp.sync.is_incremental());
+
+        // `full` is the escape hatch when diagnostics look like they describe
+        // text that is not there.
+        let (config, warnings) = Config::parse("[lsp]\nsync = \"full\"\n").expect("parses");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.lsp.sync, LspSync::Full);
+        assert!(!config.lsp.sync.is_incremental());
+    }
+
+    #[test]
+    fn a_bad_lsp_sync_value_is_refused() {
+        assert!(Config::parse("[lsp]\nsync = \"sometimes\"\n").is_err());
+        let mut config = Config::default();
+        assert!(config.set_value("lsp.sync", "sometimes").is_err());
+        config.set_value("lsp.sync", "full").expect("sets");
+        assert_eq!(config.value_of("lsp.sync").as_deref(), Some("full"));
     }
 }

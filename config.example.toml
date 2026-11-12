@@ -135,6 +135,12 @@ enable = false
 # Ask the server for completions while typing in insert mode.  The popup opens
 # once typing pauses; Tab/Enter accept, the arrows move, Esc closes it.
 completion = true
+# How edits reach the server: "incremental" sends a range per change, "full"
+# resends the whole document every time.  Incremental is the default because a
+# whole-buffer send per keystroke is megabytes of JSON for a one-character edit.
+# "full" is always correct, so it is the thing to try when diagnostics look like
+# they describe text that is not there.
+sync = "incremental"
 
 # Name a server explicitly to override the implied choice; "" or enable = false
 # turns a language's server off.
