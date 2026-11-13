@@ -1153,6 +1153,25 @@ pub fn listing() -> Vec<&'static CommandSpec> {
     specs
 }
 
+/// The bindable actions that run as one-shot commands but have no row of their
+/// own in [`listing`]: `(name, help)` pairs.
+///
+/// `parse` accepts every action name whose effect is self-contained — the
+/// fallback through [`action_command`] means `:focus-next` runs today even
+/// though no spec names it — so a popup built from COMMANDS alone hides half
+/// the editor's commands.  Listing what actually parses keeps the palette and
+/// the keymap in step: anything someone can bind, they can find.  Names an ex
+/// spec already answers to (`quit`, exact or abbreviation) are skipped, since
+/// that row runs the same thing.
+pub fn unlisted_commands() -> Vec<(&'static str, &'static str)> {
+    crate::action::ACTIONS
+        .iter()
+        .filter(|(_, action, _)| matches!(action, crate::action::Action::Cmd(_)))
+        .map(|(name, _, help)| (*name, *help))
+        .filter(|(name, _)| command_for(name).is_none())
+        .collect()
+}
+
 /// The command a typed word names — exact, abbreviation or unambiguous prefix —
 /// as its full name.
 ///
@@ -1160,8 +1179,15 @@ pub fn listing() -> Vec<&'static CommandSpec> {
 /// *names* a command from one that merely resembles several: only in the second
 /// case does it fall back to the highlighted row, because someone who typed a
 /// command word said which one they meant.
-pub fn resolve(name: &str) -> Option<&'static str> {
-    command_for(name)
+pub fn resolve(name: &str) -> Option<&str> {
+    match command_for(name) {
+        Some(resolved) => Some(resolved),
+        // An exact action name is a typed word that names a command too —
+        // `:focus-next` means itself, not whatever row the filter left on top.
+        // (An empty word resolves to nothing; `parse_action` reads it as Noop.)
+        None if !name.is_empty() && action_command(name).is_some() => Some(name),
+        None => None,
+    }
 }
 
 /// The parameters of the command `name` resolves to, abbreviations included.
@@ -1536,6 +1562,44 @@ mod tests {
             names,
             "the list must be alphabetical — it is a lookup, not a tour"
         );
+    }
+
+    #[test]
+    fn every_bindable_command_is_listed() {
+        // The palette merges `listing` with `unlisted_commands`; together they
+        // must cover every action that parses as a one-shot command.  Anything
+        // bindable but unlistable is a command found only by typed guess.
+        for (name, action, _) in crate::action::ACTIONS {
+            if !matches!(action, crate::action::Action::Cmd(_)) {
+                continue;
+            }
+            let listed = listing().iter().any(|spec| spec.name == *name)
+                || unlisted_commands().iter().any(|(n, _)| n == name);
+            assert!(listed, "{name} runs as :{name} but no row lists it");
+        }
+        // The reported symptom: pane focus could be bound but never seen.
+        let extra: Vec<&str> = unlisted_commands().iter().map(|(n, _)| *n).collect();
+        for name in ["focus-next", "focus-prev", "focus-left", "zoom-pane"] {
+            assert!(extra.contains(&name), "{name} missing from the palette");
+        }
+    }
+
+    #[test]
+    fn listed_and_unlisted_do_not_overlap() {
+        // A name an ex spec already answers to gets that row, not two.
+        for (name, _) in unlisted_commands() {
+            assert!(command_for(name).is_none(), "{name} would get two rows");
+        }
+    }
+
+    #[test]
+    fn action_names_parse_and_resolve() {
+        assert_eq!(parse("focus-next"), Command::Editor(Cmd::FocusNext));
+        assert_eq!(resolve("focus-next"), Some("focus-next"));
+        // Specs keep their names, abbreviations included; a typed word that
+        // means nothing still resolves to nothing.
+        assert_eq!(resolve("w"), Some("write"));
+        assert_eq!(resolve("no-such-command"), None);
     }
 
     #[test]

@@ -2955,7 +2955,7 @@ impl App {
     /// nothing in speed and pays for itself in discoverability: a command nobody
     /// knows exists is a command nobody uses.
     fn command_items(&self) -> Vec<prompt::Item> {
-        command::listing()
+        let mut items: Vec<prompt::Item> = command::listing()
             .into_iter()
             .map(|spec| {
                 let preview = match command::param_lines(spec.params) {
@@ -2967,7 +2967,22 @@ impl App {
                     .preview(preview)
                     .payload(CommandPayload(spec.name.to_string()))
             })
-            .collect()
+            .collect();
+        // The actions that parse as one-shot commands but have no ex spec —
+        // `:focus-next`, `:zoom-pane` …  They run today; the audit trail was a
+        // keymap entry and a typed guess.  A row each makes them findable, and
+        // keeps this list honest about what Enter will accept.
+        items.extend(
+            command::unlisted_commands()
+                .into_iter()
+                .map(|(name, help)| {
+                    prompt::Item::new(format!(":{name}"))
+                        .preview(help.to_string())
+                        .payload(CommandPayload(name.to_string()))
+                }),
+        );
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items
     }
 
     /// Picker rows for `:diagnostic list`, over the buffer or the whole
