@@ -17,7 +17,7 @@ use crate::action::{
 };
 use crate::buffer::{Buffer, BufferId, Change, ChangeGroup, expand_home, next_char_boundary};
 use crate::config::{Config, LineNumber};
-use crate::diagnostic::{Diagnostic, DiagnosticSource};
+use crate::diagnostic::{Diagnostic, DiagnosticScope, DiagnosticSource};
 use crate::event::{AsyncEvent, JobId};
 use crate::input::motions::{self, Dest, Env, Kind, SearchQuery};
 use crate::input::operators::{self, Case, Region};
@@ -95,7 +95,7 @@ pub enum PromptSpec {
         suggestions: Vec<String>,
     },
     /// Diagnostics of the current buffer.
-    Diagnostics,
+    Diagnostics(DiagnosticScope),
     /// `:substitute` — a second argument line.
     Substitute(String),
 }
@@ -1677,9 +1677,11 @@ impl Editor {
             Cmd::CommandPalette => {
                 intents.push(Intent::OpenPrompt(PromptSpec::Palette(String::new())))
             }
-            Cmd::ShowDiagnostics => intents.push(Intent::OpenPrompt(PromptSpec::Diagnostics)),
-            Cmd::DiagnosticNext => intents.extend(self.diagnostic_jump(true, area)),
-            Cmd::DiagnosticPrev => intents.extend(self.diagnostic_jump(false, area)),
+            Cmd::ShowDiagnostics(scope) => {
+                intents.push(Intent::OpenPrompt(PromptSpec::Diagnostics(scope)))
+            }
+            Cmd::DiagnosticNext(scope) => intents.extend(self.diagnostic_jump(true, scope, area)),
+            Cmd::DiagnosticPrev(scope) => intents.extend(self.diagnostic_jump(false, scope, area)),
             Cmd::Hover => intents.push(Intent::Hover),
             Cmd::CodeAction => intents.push(Intent::CodeAction),
             Cmd::SpellSuggest => intents.extend(self.spell_suggest()),
@@ -2701,7 +2703,24 @@ impl Editor {
     /// than the order the servers happened to publish them in.  The target line
     /// is centred, which is what makes a jump read as "take me there" instead of
     /// "nudge the caret".
-    fn diagnostic_jump(&mut self, forward: bool, area: Rect) -> Vec<Intent> {
+    ///
+    /// Project scope walks every buffer in editor order — buffers the language
+    /// clients have reported on — so a jump can leave the current file; the
+    /// status message then names the file, since the caret moved somewhere the
+    /// user was not looking.
+    fn diagnostic_jump(
+        &mut self,
+        forward: bool,
+        scope: DiagnosticScope,
+        area: Rect,
+    ) -> Vec<Intent> {
+        match scope {
+            DiagnosticScope::Buffer => self.diagnostic_jump_buffer(forward, area),
+            DiagnosticScope::Project => self.diagnostic_jump_project(forward, area),
+        }
+    }
+
+    fn diagnostic_jump_buffer(&mut self, forward: bool, area: Rect) -> Vec<Intent> {
         let Some(buffer) = self.current_buffer() else {
             return Vec::new();
         };
@@ -2712,7 +2731,10 @@ impl Editor {
             .map(|diagnostic| diagnostic.range.start)
             .collect();
         if starts.is_empty() {
-            return vec![Intent::Message(StatusLevel::Info, "no diagnostics".into())];
+            return vec![Intent::Message(
+                StatusLevel::Info,
+                "no diagnostics in this buffer".into(),
+            )];
         }
         starts.sort_unstable();
         starts.dedup();
@@ -2737,15 +2759,96 @@ impl Editor {
             .map(|diagnostic| format!("{}: {}", diagnostic.severity.label(), diagnostic.message))
             .unwrap_or_default();
         self.set_cursor(target);
-        let height = self.text_height(area);
-        let line = self.line_at(target);
-        if let Some(pane) = self.layout.focused_pane_mut() {
-            pane.view.scroll_line = line.saturating_sub(height / 2);
-        }
+        self.center_cursor(area);
         vec![
             Intent::EnsureVisible,
             Intent::Message(StatusLevel::Info, message),
         ]
+    }
+
+    /// Project-scope `]d` / `[d`: the targets are `(buffer index, offset)`
+    /// pairs over every buffer, so the walk continues into the next file
+    /// instead of stopping at the end of this one.
+    fn diagnostic_jump_project(&mut self, forward: bool, area: Rect) -> Vec<Intent> {
+        let mut targets: Vec<(usize, usize, String)> = Vec::new();
+        for (index, buffer) in self.buffers.iter().enumerate() {
+            let mut starts: Vec<usize> = buffer
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.range.start)
+                .collect();
+            starts.sort_unstable();
+            starts.dedup();
+            for start in starts {
+                let message = buffer
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.range.start == start)
+                    .map(|diagnostic| {
+                        format!(
+                            "{}: {}: {}",
+                            buffer.display_name(),
+                            diagnostic.severity.label(),
+                            diagnostic.message
+                        )
+                    })
+                    .unwrap_or_default();
+                targets.push((index, start, message));
+            }
+        }
+        if targets.is_empty() {
+            return vec![Intent::Message(
+                StatusLevel::Info,
+                "no diagnostics in the project".into(),
+            )];
+        }
+        let current = self.current_buffer_id().and_then(|id| {
+            self.buffers
+                .iter()
+                .position(|buffer| buffer.id == id)
+                .map(|index| (index, self.cursor()))
+        });
+        let after = |entry: &(usize, usize, String)| match current {
+            Some((index, cursor)) => entry.0 > index || (entry.0 == index && entry.1 > cursor),
+            None => true,
+        };
+        let before = |entry: &(usize, usize, String)| match current {
+            Some((index, cursor)) => entry.0 < index || (entry.0 == index && entry.1 < cursor),
+            None => false,
+        };
+        let target = if forward {
+            targets
+                .iter()
+                .find(|entry| after(entry))
+                .unwrap_or(&targets[0])
+        } else {
+            targets
+                .iter()
+                .rev()
+                .find(|entry| before(entry))
+                .unwrap_or(targets.last().expect("non-empty"))
+        };
+        let (index, offset, message) = (target.0, target.1, target.2.clone());
+        let id = self.buffers[index].id;
+        if self.current_buffer_id() != Some(id) && !self.focus_buffer(id) {
+            // Cross-buffer: focus first so the scroll lands in the right pane.
+            return Vec::new();
+        }
+        self.set_cursor(offset);
+        self.center_cursor(area);
+        vec![
+            Intent::EnsureVisible,
+            Intent::Message(StatusLevel::Info, message),
+        ]
+    }
+
+    /// Centre the caret's line in the focused pane.
+    fn center_cursor(&mut self, area: Rect) {
+        let height = self.text_height(area);
+        let line = self.line_at(self.cursor());
+        if let Some(pane) = self.layout.focused_pane_mut() {
+            pane.view.scroll_line = line.saturating_sub(height / 2);
+        }
     }
 
     fn scroll_to_edge(&mut self, top: bool, area: Rect) -> Option<Intent> {
@@ -3836,6 +3939,11 @@ mod tests {
     /// Give the fixture's buffer a diagnostic at each of `lines` (0-based).
     fn mark_lines(fixture: &mut Fixture, lines: &[usize]) {
         let id = fixture.editor.current_buffer_id().expect("a buffer");
+        mark_lines_in(fixture, id, lines);
+    }
+
+    /// `mark_lines` for a buffer that is not the focused one.
+    fn mark_lines_in(fixture: &mut Fixture, id: BufferId, lines: &[usize]) {
         let diagnostics = {
             let buffer = fixture.editor.buffer(id).expect("a buffer");
             lines
@@ -3854,6 +3962,19 @@ mod tests {
         fixture
             .editor
             .set_diagnostics(id, DiagnosticSource::Lsp, diagnostics);
+    }
+
+    /// Add an in-memory buffer without showing it, the way the LSP client
+    /// leaves buffers it has reported on but the user never opened.
+    fn add_scratch(fixture: &mut Fixture, text: &str) -> BufferId {
+        let id = fixture.editor.alloc_buffer_id();
+        fixture.editor.buffers.push(Buffer::new(
+            id,
+            None,
+            text.to_string(),
+            &fixture.editor.config.editor,
+        ));
+        id
     }
 
     #[test]
@@ -3889,6 +4010,102 @@ mod tests {
             intents.iter().any(|intent| matches!(
                 intent,
                 Intent::Message(StatusLevel::Info, text) if text.contains("no diagnostics")
+            )),
+            "expected a message, got {intents:?}"
+        );
+    }
+
+    #[test]
+    fn project_d_jumps_walk_into_the_next_buffer_and_wrap() {
+        let mut fixture = Fixture::new("one\ntwo\nthree\n");
+        let first = fixture.editor.current_buffer_id().expect("a buffer");
+        mark_lines(&mut fixture, &[0, 2]);
+        let second = add_scratch(&mut fixture, "alpha\nbeta\n");
+        mark_lines_in(&mut fixture, second, &[1]);
+
+        let jump = |fixture: &mut Fixture| {
+            fixture
+                .editor
+                .run_cmd(Cmd::DiagnosticNext(DiagnosticScope::Project), fixture.area)
+        };
+        jump(&mut fixture);
+        assert_eq!(
+            caret_at(&fixture).0,
+            2,
+            "the caret sits on the line-0 target already, so the first jump moves on"
+        );
+        assert_eq!(fixture.editor.current_buffer_id(), Some(first));
+        jump(&mut fixture);
+        assert_eq!(
+            fixture.editor.current_buffer_id(),
+            Some(second),
+            "past the last target in this buffer, the walk crosses into the next"
+        );
+        assert_eq!(caret_at(&fixture).0, 1);
+        jump(&mut fixture);
+        assert_eq!(
+            fixture.editor.current_buffer_id(),
+            Some(first),
+            "past the last target in the project, it wraps"
+        );
+        assert_eq!(caret_at(&fixture).0, 0);
+    }
+
+    #[test]
+    fn project_d_back_walks_into_the_previous_buffer() {
+        let mut fixture = Fixture::new("one\ntwo\nthree\n");
+        let first = fixture.editor.current_buffer_id().expect("a buffer");
+        mark_lines(&mut fixture, &[2]);
+        let second = add_scratch(&mut fixture, "alpha\nbeta\n");
+        mark_lines_in(&mut fixture, second, &[0]);
+        // The caret sits at the top of the first buffer: `[d` wraps to the
+        // last target in the project, which lives in the other buffer.
+        let intents = fixture
+            .editor
+            .run_cmd(Cmd::DiagnosticPrev(DiagnosticScope::Project), fixture.area);
+        assert_eq!(fixture.editor.current_buffer_id(), Some(second));
+        assert_eq!(caret_at(&fixture).0, 0);
+        assert!(
+            intents.iter().any(|intent| matches!(
+                intent,
+                Intent::Message(StatusLevel::Info, text) if text.contains("problem on line 0")
+            )),
+            "the message names the target: {intents:?}"
+        );
+        fixture
+            .editor
+            .run_cmd(Cmd::DiagnosticPrev(DiagnosticScope::Project), fixture.area);
+        assert_eq!(fixture.editor.current_buffer_id(), Some(first));
+        assert_eq!(caret_at(&fixture).0, 2);
+    }
+
+    #[test]
+    fn buffer_d_jumps_ignore_other_buffers() {
+        let mut fixture = Fixture::new("one\ntwo\n");
+        let first = fixture.editor.current_buffer_id().expect("a buffer");
+        mark_lines(&mut fixture, &[0]);
+        let second = add_scratch(&mut fixture, "alpha\n");
+        mark_lines_in(&mut fixture, second, &[0]);
+        fixture.feed("]d");
+        assert_eq!(
+            fixture.editor.current_buffer_id(),
+            Some(first),
+            "buffer scope never leaves the current buffer"
+        );
+    }
+
+    #[test]
+    fn project_d_with_no_diagnostics_says_so() {
+        let mut fixture = Fixture::new("clean\n");
+        add_scratch(&mut fixture, "also clean\n");
+        let intents = fixture
+            .editor
+            .run_cmd(Cmd::DiagnosticNext(DiagnosticScope::Project), fixture.area);
+        assert!(
+            intents.iter().any(|intent| matches!(
+                intent,
+                Intent::Message(StatusLevel::Info, text)
+                    if text.contains("no diagnostics in the project")
             )),
             "expected a message, got {intents:?}"
         );

@@ -20,7 +20,7 @@ use crate::buffer::BufferId;
 use crate::command::{self, Command, ConfigAction, SetOutcome, SplitDirection};
 use crate::config::Background;
 use crate::config::Config;
-use crate::diagnostic::DiagnosticSource;
+use crate::diagnostic::{DiagnosticScope, DiagnosticSource};
 use crate::editor::{Editor, Intent, PromptSpec, StatusLevel};
 use crate::event::{AsyncEvent, Event, Events};
 use crate::format::{self, Formatter};
@@ -832,9 +832,13 @@ impl App {
                 picker.smart_case = false;
                 self.prompt = Some((PromptKind::Spell { span }, picker));
             }
-            PromptSpec::Diagnostics => {
-                let items = self.diagnostic_items();
-                self.open_picker(PromptKind::Diagnostics, "diagnostics", "", items);
+            PromptSpec::Diagnostics(scope) => {
+                let items = self.diagnostic_items(scope);
+                let title = match scope {
+                    DiagnosticScope::Buffer => "diagnostics",
+                    DiagnosticScope::Project => "diagnostics (project)",
+                };
+                self.open_picker(PromptKind::Diagnostics, title, "", items);
             }
             PromptSpec::Substitute(_) => {
                 self.set_message(
@@ -2704,16 +2708,30 @@ impl App {
             .collect()
     }
 
-    fn diagnostic_items(&self) -> Vec<prompt::Item> {
-        let Some(buffer) = self.editor.current_buffer() else {
-            return Vec::new();
+    /// Picker rows for `:diagnostic list`, over the buffer or the whole
+    /// project.  Project rows carry the file name — the point of the wider
+    /// scope is that the target may not be where the caret is.
+    fn diagnostic_items(&self, scope: DiagnosticScope) -> Vec<prompt::Item> {
+        let buffers: Vec<&crate::buffer::Buffer> = match scope {
+            DiagnosticScope::Buffer => self.editor.current_buffer().into_iter().collect(),
+            DiagnosticScope::Project => self.editor.buffers().iter().collect(),
         };
-        buffer
-            .diagnostics
-            .iter()
-            .map(|diagnostic| {
+        let mut items = Vec::new();
+        for buffer in buffers {
+            // Ordered by position, like the jump keys, so the picker reads as
+            // a walk through the text rather than publication order.
+            let mut diagnostics: Vec<&crate::diagnostic::Diagnostic> =
+                buffer.diagnostics.iter().collect();
+            diagnostics.sort_by_key(|diagnostic| diagnostic.range.start);
+            for diagnostic in diagnostics {
                 let line = buffer.line_of(diagnostic.range.start) + 1;
                 let column = buffer.display_col(diagnostic.range.start) + 1;
+                let label = match scope {
+                    DiagnosticScope::Buffer => format!("{line}:{column}"),
+                    DiagnosticScope::Project => {
+                        format!("{}:{line}:{column}", buffer.display_name())
+                    }
+                };
                 // The headline carries the severity and the server's code, so
                 // `error[E0308]` is visible without opening the message.
                 let mut preview = diagnostic.headline();
@@ -2721,15 +2739,18 @@ impl App {
                     let line = buffer.line_of(span.start) + 1;
                     preview.push_str(&format!("\n  {line}: {message}"));
                 }
-                prompt::Item::new(format!("{line}:{column}"))
-                    .detail(diagnostic.headline())
-                    .preview(preview)
-                    .payload(DiagnosticPayload {
-                        buffer: buffer.id,
-                        offset: diagnostic.range.start,
-                    })
-            })
-            .collect()
+                items.push(
+                    prompt::Item::new(label)
+                        .detail(diagnostic.headline())
+                        .preview(preview)
+                        .payload(DiagnosticPayload {
+                            buffer: buffer.id,
+                            offset: diagnostic.range.start,
+                        }),
+                );
+            }
+        }
+        items
     }
 
     // --------------------------------------------------------------- config

@@ -332,6 +332,15 @@ fn motion_name(motion: Motion) -> String {
     }
 }
 
+/// `-project` for the project scope, empty for the buffer scope, so the
+/// diagnostic action names round-trip through `parse_action`.
+fn diagnostic_suffix(scope: crate::diagnostic::DiagnosticScope) -> &'static str {
+    match scope {
+        crate::diagnostic::DiagnosticScope::Buffer => "",
+        crate::diagnostic::DiagnosticScope::Project => "-project",
+    }
+}
+
 fn cmd_name(command: &Cmd) -> String {
     use crate::action::Cmd;
     (match command {
@@ -419,9 +428,15 @@ fn cmd_name(command: &Cmd) -> String {
         Cmd::NormalOnce => "normal-once",
         Cmd::ToggleOption(option) => return format!("toggle-{}", option.key()),
         Cmd::SpellSuggest => "spell-suggest",
-        Cmd::ShowDiagnostics => "show-diagnostics",
-        Cmd::DiagnosticNext => "diagnostic-next",
-        Cmd::DiagnosticPrev => "diagnostic-prev",
+        Cmd::ShowDiagnostics(scope) => {
+            return format!("show-diagnostics{}", diagnostic_suffix(*scope));
+        }
+        Cmd::DiagnosticNext(scope) => {
+            return format!("diagnostic-next{}", diagnostic_suffix(*scope));
+        }
+        Cmd::DiagnosticPrev(scope) => {
+            return format!("diagnostic-prev{}", diagnostic_suffix(*scope));
+        }
         Cmd::Hover => "hover",
         Cmd::CodeAction => "code-action",
         Cmd::FormatBuffer => "format-buffer",
@@ -507,6 +522,30 @@ mod tests {
     fn the_default_keymap_is_sane() {
         let (_maps, warnings) = crate::input::Keymaps::build(&crate::config::Config::default());
         assert!(warnings.is_empty(), "broken default bindings: {warnings:?}");
+    }
+
+    #[test]
+    fn diagnostic_scope_names_round_trip() {
+        // `:map` prints `action_name`; the scoped diagnostic names it shows
+        // for `]d` and its project-scope siblings must re-bind identically.
+        for name in [
+            "show-diagnostics",
+            "show-diagnostics-project",
+            "diagnostic-next",
+            "diagnostic-next-project",
+            "diagnostic-prev",
+            "diagnostic-prev-project",
+        ] {
+            let action = crate::action::parse_action(name)
+                .unwrap_or_else(|| panic!("{name:?} is not an action"));
+            let rendered = action_name(&action);
+            assert_eq!(rendered, name, "{name:?} renders as {rendered:?}");
+            assert_eq!(
+                crate::action::parse_action(&rendered),
+                Some(action),
+                "{rendered:?} does not parse back"
+            );
+        }
     }
 
     #[test]

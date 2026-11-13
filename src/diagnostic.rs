@@ -60,6 +60,40 @@ pub enum DiagnosticSource {
     Format,
 }
 
+/// Which set of diagnostics a command acts on: this buffer, or every buffer
+/// the editor is holding (the project's known diagnostics).
+///
+/// Project scope covers the buffers the language clients have reported on —
+/// opened or reached through a picker — not a disk-wide scan; a full workspace
+/// query would need every file opened first, which is what the servers key
+/// their analysis on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum DiagnosticScope {
+    /// The focused buffer only.
+    #[default]
+    Buffer,
+    /// Every buffer in the editor.
+    Project,
+}
+
+impl DiagnosticScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            DiagnosticScope::Buffer => "buffer",
+            DiagnosticScope::Project => "project",
+        }
+    }
+
+    /// Parse the scope argument of `:diagnostic … [buffer|project]`.
+    pub fn parse(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "buffer" | "buf" => Some(DiagnosticScope::Buffer),
+            "project" | "proj" => Some(DiagnosticScope::Project),
+            _ => None,
+        }
+    }
+}
+
 /// What kind of "this is not an error" hint a diagnostic carries.
 ///
 /// LSP reports these out of band in `tags`, and they are what makes "unused

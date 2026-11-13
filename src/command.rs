@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::action::{Cmd, ToggleOption};
+use crate::diagnostic::DiagnosticScope;
 use crate::editor::{Editor, StatusLevel};
 use crate::input::keys;
 use crossterm::event::KeyEvent;
@@ -241,6 +242,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: ":format",
     },
     CommandSpec {
+        name: "diagnostic",
+        abbreviation: "diag",
+        help: "jump between or list diagnostics in the buffer or the project",
+        usage: ":diagnostic [next|prev|list] [buffer|project]",
+    },
+    CommandSpec {
         name: "config",
         abbreviation: "conf",
         help: "config paths, reload or write",
@@ -407,6 +414,7 @@ pub fn parse(input: &str) -> Command {
         // `:grep` with no pattern opens the content prompt (like `space s`),
         // not the file picker; `:find` is the file-name search.
         Some("grep") => Command::Grep(rest.to_string()),
+        Some("diagnostic") => parse_diagnostic(rest),
         Some("format") => Command::Format,
         Some("config") => match rest.split_whitespace().next() {
             None | Some("path") => Command::Config(ConfigAction::Path),
@@ -452,6 +460,42 @@ pub fn parse(input: &str) -> Command {
                 format!("not an editor command: :{head}  (:help lists them)"),
             ),
         },
+    }
+}
+
+/// `:diagnostic [next|prev|list] [buffer|project]` — the diagnostic verbs.
+///
+/// The scope argument defaults to the current buffer; `project` widens the
+/// jump walk and the picker to every buffer the editor holds.
+fn parse_diagnostic(rest: &str) -> Command {
+    let mut words = rest.split_whitespace();
+    let verb = words.next().unwrap_or("list");
+    let scope = match words.next() {
+        None => DiagnosticScope::Buffer,
+        Some(word) => match DiagnosticScope::parse(word) {
+            Some(scope) => scope,
+            None => {
+                return Command::Message(
+                    StatusLevel::Error,
+                    format!("unknown diagnostic scope \"{word}\" (buffer, project)"),
+                );
+            }
+        },
+    };
+    if words.next().is_some() {
+        return Command::Message(
+            StatusLevel::Error,
+            "usage: :diagnostic [next|prev|list] [buffer|project]".into(),
+        );
+    }
+    match verb {
+        "list" | "ls" => Command::Editor(Cmd::ShowDiagnostics(scope)),
+        "next" | "n" => Command::Editor(Cmd::DiagnosticNext(scope)),
+        "prev" | "previous" | "p" => Command::Editor(Cmd::DiagnosticPrev(scope)),
+        other => Command::Message(
+            StatusLevel::Error,
+            format!("unknown :diagnostic verb \"{other}\" (list, next, prev)"),
+        ),
     }
 }
 
@@ -952,6 +996,36 @@ mod tests {
         assert_eq!(parse("palette"), Command::Editor(Cmd::CommandPalette));
         assert_eq!(parse("pal"), Command::Editor(Cmd::CommandPalette));
         assert_eq!(parse("help"), Command::Editor(Cmd::CommandPalette));
+    }
+
+    #[test]
+    fn diagnostic_commands_take_a_verb_and_a_scope() {
+        // Bare `:diagnostic` lists this buffer, the way `space d` does.
+        assert_eq!(
+            parse("diagnostic"),
+            Command::Editor(Cmd::ShowDiagnostics(DiagnosticScope::Buffer))
+        );
+        assert_eq!(
+            parse("diag list project"),
+            Command::Editor(Cmd::ShowDiagnostics(DiagnosticScope::Project))
+        );
+        assert_eq!(
+            parse("diagnostic next project"),
+            Command::Editor(Cmd::DiagnosticNext(DiagnosticScope::Project))
+        );
+        assert_eq!(
+            parse("diag prev buffer"),
+            Command::Editor(Cmd::DiagnosticPrev(DiagnosticScope::Buffer))
+        );
+        // A bad verb or scope is reported, not guessed.
+        assert!(matches!(
+            parse("diagnostic sideways"),
+            Command::Message(StatusLevel::Error, _)
+        ));
+        assert!(matches!(
+            parse("diagnostic next world"),
+            Command::Message(StatusLevel::Error, _)
+        ));
     }
 
     #[test]

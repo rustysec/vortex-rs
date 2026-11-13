@@ -6,6 +6,8 @@
 
 use std::str::FromStr;
 
+use crate::diagnostic::DiagnosticScope;
+
 /// How a motion walks the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Motion {
@@ -200,10 +202,11 @@ pub enum Cmd {
     // --- misc ---
     ToggleOption(ToggleOption),
     SpellSuggest,
-    ShowDiagnostics,
-    /// Jump to the next (`]d`) or previous (`[d`) diagnostic in the buffer.
-    DiagnosticNext,
-    DiagnosticPrev,
+    /// `:diagnostic list` — the diagnostics picker over the given scope.
+    ShowDiagnostics(DiagnosticScope),
+    /// Jump to the next (`]d`) or previous (`[d`) diagnostic in the scope.
+    DiagnosticNext(DiagnosticScope),
+    DiagnosticPrev(DiagnosticScope),
     /// Ask the language server what is at the caret (`K`).
     Hover,
     /// Ask the language server for quick fixes at the caret.
@@ -958,18 +961,33 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
     ),
     (
         "show-diagnostics",
-        Action::Cmd(Cmd::ShowDiagnostics),
-        "list diagnostics",
+        Action::Cmd(Cmd::ShowDiagnostics(DiagnosticScope::Buffer)),
+        "list diagnostics in this buffer",
+    ),
+    (
+        "show-diagnostics-project",
+        Action::Cmd(Cmd::ShowDiagnostics(DiagnosticScope::Project)),
+        "list diagnostics in the project",
     ),
     (
         "diagnostic-next",
-        Action::Cmd(Cmd::DiagnosticNext),
-        "jump to next diagnostic",
+        Action::Cmd(Cmd::DiagnosticNext(DiagnosticScope::Buffer)),
+        "jump to next diagnostic in this buffer",
+    ),
+    (
+        "diagnostic-next-project",
+        Action::Cmd(Cmd::DiagnosticNext(DiagnosticScope::Project)),
+        "jump to next diagnostic in the project",
     ),
     (
         "diagnostic-prev",
-        Action::Cmd(Cmd::DiagnosticPrev),
-        "jump to previous diagnostic",
+        Action::Cmd(Cmd::DiagnosticPrev(DiagnosticScope::Buffer)),
+        "jump to previous diagnostic in this buffer",
+    ),
+    (
+        "diagnostic-prev-project",
+        Action::Cmd(Cmd::DiagnosticPrev(DiagnosticScope::Project)),
+        "jump to previous diagnostic in the project",
     ),
     (
         "hover",

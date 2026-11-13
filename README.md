@@ -108,6 +108,7 @@ to scroll, and click inside a picker to choose an item.
                    # `:set editor.scroll-margin=4` all mean the same option
 :map [<lhs>]  :unmap <lhs>                              key bindings
 :f[ind] [pattern]  :gr[ep] <pattern>                    search the project
+:diag[nostic] [next|prev|list] [buffer|project]   jump between or list diagnostics
 :fo[rmat]                                          run the language formatter
 :conf[ig] path|source|write [path]                   configuration
 :cd <dir>  :pwd  :hl[search] clear                   misc
