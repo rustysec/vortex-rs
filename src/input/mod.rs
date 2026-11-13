@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::action::{Action, Cmd, Motion, Operator};
 
@@ -71,7 +71,7 @@ impl Mode {
         }
     }
 
-    /// Label shown in the status area (lower case, as in the spec).
+    /// Label shown in the status row (lower case, as in the spec).
     pub fn label(self) -> String {
         match self {
             Mode::Normal => "normal".into(),
@@ -267,221 +267,30 @@ pub(crate) fn operator_status(operator: Operator) -> &'static str {
     }
 }
 
-/// Default bindings: vim motions with a few modern conveniences.
+/// Keys that are text input rather than bindings.
 ///
-/// Values are action names from [`crate::action::ACTIONS`], so `:help keys`
-/// documents exactly what the editor understands.
-pub const DEFAULT_BINDINGS: &[(&str, &[(&str, &str)])] = &[
-    (
-        "normal",
-        &[
-            // movement
-            ("h", "move-left"),
-            ("j", "move-down"),
-            ("k", "move-up"),
-            ("l", "move-right"),
-            ("0", "line-start"),
-            ("^", "first-non-blank"),
-            ("$", "line-end"),
-            ("_", "line-end-non-blank"),
-            ("|", "column"),
-            ("w", "word-forward"),
-            ("b", "word-back"),
-            ("e", "word-end"),
-            ("ge", "word-end-back"),
-            ("W", "big-word-forward"),
-            ("B", "big-word-back"),
-            ("E", "big-word-end"),
-            ("gE", "big-word-end-back"),
-            ("f", "find-char"),
-            ("F", "find-char-back"),
-            ("t", "till-char"),
-            ("T", "till-char-back"),
-            (";", "repeat-find"),
-            (",", "repeat-find-reverse"),
-            ("gg", "document-start"),
-            ("G", "document-end"),
-            ("H", "view-top"),
-            ("M", "view-middle"),
-            ("L", "view-bottom"),
-            ("}", "paragraph-next"),
-            ("{", "paragraph-prev"),
-            (")", "sentence-next"),
-            ("(", "sentence-prev"),
-            ("%", "match-bracket"),
-            ("n", "search-next"),
-            ("N", "search-prev"),
-            ("pageup", "page-up"),
-            ("pagedown", "page-down"),
-            ("ctrl-b", "page-up"),
-            ("ctrl-f", "page-down"),
-            ("ctrl-u", "half-page-up"),
-            ("ctrl-d", "half-page-down"),
-            ("ctrl-y", "scroll-line-up"),
-            ("ctrl-e", "scroll-line-down"),
-            ("ctrl-o", "jump-back"),
-            ("ctrl-i", "jump-forward"),
-            ("z z", "recenter"),
-            ("z t", "scroll-to-top"),
-            ("z b", "scroll-to-bottom"),
-            // text objects
-            // insert / mode
-            ("i", "insert"),
-            ("gi", "insert-previous"),
-            ("a", "append"),
-            ("A", "append-line-end"),
-            ("I", "insert-line-start"),
-            ("o", "open-below"),
-            ("O", "open-above"),
-            ("v", "visual"),
-            ("V", "visual-line"),
-            ("ctrl-v", "visual-block"),
-            ("esc", "cancel"),
-            // operators
-            ("d", "delete"),
-            ("c", "change"),
-            ("y", "yank"),
-            ("r", "replace"),
-            ("J", "join"),
-            (">", "indent"),
-            ("<", "unindent"),
-            ("=", "reindent"),
-            ("~", "swap-case-char"),
-            ("g~", "swap-case"),
-            ("gU", "uppercase"),
-            ("gu", "lowercase"),
-            ("gc", "toggle-comment"),
-            ("x", "delete-char"),
-            ("X", "delete-char-back"),
-            ("s", "change-char"),
-            ("S", "change-line"),
-            ("D", "delete-to-line-end"),
-            ("C", "change-to-line-end"),
-            ("Y", "yank-line"),
-            ("p", "paste-after"),
-            ("P", "paste-before"),
-            ("u", "undo"),
-            ("ctrl-r", "redo"),
-            (".", "repeat"),
-            ("\"", "select-register"),
-            ("m", "set-mark"),
-            ("`", "goto-mark-char"),
-            ("'", "goto-mark-line"),
-            ("gp", "paste-after"),
-            ("gs", "duplicate-line"),
-            // search & prompts
-            ("/", "search-forward"),
-            ("?", "search-backward"),
-            ("*", "find-word-forward"),
-            ("#", "find-word-backward"),
-            (":", "command-mode"),
-            // files & panes (space is the leader)
-            ("ctrl-s", "save"),
-            ("space p", "command-palette"),
-            ("space f", "find-files"),
-            ("space s", "grep-project"),
-            ("space b", "switch-buffer"),
-            ("space w", "save"),
-            ("space q", "quit"),
-            ("space d", "show-diagnostics"),
-            ("]d", "diagnostic-next"),
-            ("[d", "diagnostic-prev"),
-            // vim's `K` keyword lookup, answered by the language server.
-            ("K", "hover"),
-            ("space a", "code-action"),
-            ("space e", "spell-suggest"),
-            // vim's spelling suggestion key.
-            ("z=", "spell-suggest"),
-            ("space x", "clear-search-highlight"),
-            ("space F", "format-buffer"),
-            // layout
-            ("space o", "only-pane"),
-            ("space z", "zoom-pane"),
-            ("space v", "split-vertical"),
-            ("space h", "split-horizontal"),
-            ("space n", "split-auto"),
-            ("space c", "close-pane"),
-            ("space =", "equalize-panes"),
-            // `ctrl-w` then a direction moves between panes, as in vim.
-            ("ctrl-w h", "focus-left"),
-            ("ctrl-w j", "focus-down"),
-            ("ctrl-w k", "focus-up"),
-            ("ctrl-w l", "focus-right"),
-            ("space left", "focus-left"),
-            ("space right", "focus-right"),
-            ("space up", "focus-up"),
-            ("space down", "focus-down"),
-            ("space tab", "focus-next"),
-            ("shift-tab", "focus-prev"),
-            ("space H", "move-left"),
-            ("space J", "move-down"),
-            ("space K", "move-up"),
-            ("space L", "move-right"),
-            ("space ctrl-h", "resize-left"),
-            ("space ctrl-j", "resize-down"),
-            ("space ctrl-k", "resize-up"),
-            ("space ctrl-l", "resize-right"),
-            ("space plus", "resize-right"),
-            ("space minus", "resize-left"),
-            ("space g e", "layout-equal"),
-            ("space g g", "layout-golden"),
-            // toggles
-            ("space t n", "toggle-line-numbers"),
-            ("space t c", "toggle-cursorline"),
-            ("space t w", "toggle-wrap"),
-            ("space t s", "toggle-spell"),
-            ("space t f", "toggle-auto-format"),
-            ("space t m", "toggle-mouse"),
-        ],
-    ),
-    (
-        "insert",
-        &[
-            ("esc", "exit-insert"),
-            ("ctrl-c", "exit-insert"),
-            ("ctrl-[", "exit-insert"),
-            ("enter", "insert-newline"),
-            ("ctrl-j", "insert-newline"),
-            ("tab", "insert-tab"),
-            ("shift-tab", "insert-backtab"),
-            ("backspace", "insert-backspace"),
-            ("ctrl-h", "insert-backspace"),
-            ("delete", "insert-delete"),
-            ("ctrl-w", "insert-delete-word"),
-            ("ctrl-u", "insert-delete-line-start"),
-            ("ctrl-t", "insert-indent-line"),
-            ("ctrl-o", "normal-once"),
-            ("left", "move-left"),
-            ("right", "move-right"),
-            ("up", "move-up"),
-            ("down", "move-down"),
-            ("home", "line-start"),
-            ("end", "line-end"),
-        ],
-    ),
-    (
-        "visual",
-        &[
-            ("v", "visual"),
-            ("V", "visual-line"),
-            ("ctrl-v", "visual-block"),
-            ("o", "swap-anchor"),
-            ("esc", "normal"),
-            ("i", "inside"),
-            ("a", "around"),
-        ],
-    ),
-    (
-        "operator",
-        &[
-            // `i` / `a` introduce text objects here rather than insert mode.
-            ("i", "inside"),
-            ("a", "around"),
-            ("t", "till-char"),
-            ("T", "till-char-back"),
-        ],
-    ),
-];
+/// Vortex binds nothing itself: a key does what `[keymap.*]` says and nothing
+/// otherwise (see [`Keymaps::build`]).  Writing text in insert mode is the one
+/// exception — printable characters, backspace and enter are how text gets into
+/// the buffer, not commands, and the arrow keys move while you type them.  All
+/// of these yield to a config line that claims the key first, because they are
+/// consulted only when the insert-mode keymap has no answer for the press.
+pub fn typing_core(event: KeyEvent) -> Option<Action> {
+    let event = normalize(event);
+    let control = event.modifiers.contains(KeyModifiers::CONTROL);
+    match event.code {
+        // Ctrl-H is what several terminals send for Backspace, so both spellings
+        // mean "delete backwards" and neither needs a config line.
+        KeyCode::Backspace => Some(Action::Cmd(Cmd::InsertBackspace)),
+        KeyCode::Char('h') if control => Some(Action::Cmd(Cmd::InsertBackspace)),
+        KeyCode::Enter => Some(Action::Cmd(Cmd::InsertNewline)),
+        KeyCode::Left => Some(Action::motion(Motion::Left)),
+        KeyCode::Right => Some(Action::motion(Motion::Right)),
+        KeyCode::Up => Some(Action::motion(Motion::Up)),
+        KeyCode::Down => Some(Action::motion(Motion::Down)),
+        _ => None,
+    }
+}
 
 /// Every keymap, one per resolution context.
 #[derive(Debug, Clone, Default)]
@@ -494,40 +303,33 @@ pub struct Keymaps {
 }
 
 impl Keymaps {
-    /// Built-in bindings with `[keymap.*]` overrides applied.
+    /// The keymaps `[keymap.*]` describes — nothing else.
+    ///
+    /// A fresh configuration binds no keys at all: the editor starts up in
+    /// normal mode with an empty trie, and every binding is a line the user
+    /// wrote.  Two contexts are still filled by hand rather than configured:
+    /// insert-mode text input ([`typing_core`], resolved before the keymap) and
+    /// the derived contexts below.
+    ///
+    /// Normal feeds the rest, because a motion means the same thing in each:
+    /// visual extends the selection with it (see [`keymap::Keymap::derive_visual`])
+    /// and an operator pending waits for it.  A `[keymap.visual]` or
+    /// `[keymap.operator]` line then adds to, or overrides, what normal gave.
     pub fn build(config: &crate::config::Config) -> (Keymaps, Vec<String>) {
         let mut warnings = Vec::new();
 
         let mut normal = keymap::Keymap::default();
-        for (keys, action) in bindings_for(KeyContext::Normal) {
-            bind(&mut normal, keys, action, KeyContext::Normal, &mut warnings);
-        }
         apply_config_overrides(&mut normal, config, KeyContext::Normal, &mut warnings);
 
         // Visual mode reuses the normal bindings; motions extend the selection.
         let mut visual = normal.derive_visual();
-        for (keys, action) in bindings_for(KeyContext::Visual) {
-            bind(&mut visual, keys, action, KeyContext::Visual, &mut warnings);
-        }
         apply_config_overrides(&mut visual, config, KeyContext::Visual, &mut warnings);
 
         let mut insert = keymap::Keymap::default();
-        for (keys, action) in bindings_for(KeyContext::Insert) {
-            bind(&mut insert, keys, action, KeyContext::Insert, &mut warnings);
-        }
         apply_config_overrides(&mut insert, config, KeyContext::Insert, &mut warnings);
 
-        // Operator pending: every motion works, plus `i`/`a` text objects.
+        // Operator pending: every motion the user bound works here.
         let mut operator = normal.clone();
-        for (keys, action) in bindings_for(KeyContext::Operator) {
-            bind(
-                &mut operator,
-                keys,
-                action,
-                KeyContext::Operator,
-                &mut warnings,
-            );
-        }
         apply_config_overrides(&mut operator, config, KeyContext::Operator, &mut warnings);
 
         // Unknown sections are reported rather than silently ignored.
@@ -612,37 +414,6 @@ fn apply_config_overrides(
             apply_override(map, keys, action, context, warnings);
         }
     }
-}
-
-fn bindings_for(context: KeyContext) -> &'static [(&'static str, &'static str)] {
-    DEFAULT_BINDINGS
-        .iter()
-        .find(|(name, _)| *name == context.name())
-        .map(|(_, table)| *table)
-        .unwrap_or(&[])
-}
-
-fn bind(
-    map: &mut keymap::Keymap,
-    keys: &str,
-    action: &str,
-    context: KeyContext,
-    warnings: &mut Vec<String>,
-) {
-    let Some(parsed) = parse_key_sequence(keys) else {
-        warnings.push(format!(
-            "default binding \"{keys}\" in {} mode does not parse",
-            context.name()
-        ));
-        return;
-    };
-    let Some(action) = crate::action::parse_action(action) else {
-        warnings.push(format!(
-            "default binding \"{keys}\" refers to unknown action \"{action}\""
-        ));
-        return;
-    };
-    map.insert(&parsed, action);
 }
 
 fn apply_override(

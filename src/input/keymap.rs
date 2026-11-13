@@ -185,7 +185,7 @@ impl Keymap {
         self.size == 0
     }
 
-    /// A `key  action` listing for `:help keys`.
+    /// A `key  action  help` listing of every binding this keymap holds.
     pub fn documentation(&self) -> Vec<(String, String, &'static str)> {
         self.entries()
             .into_iter()
@@ -504,24 +504,58 @@ mod tests {
         assert!(!map.remove(&press("ctrl-s")));
     }
 
-    #[test]
-    fn no_default_binding_is_shadowed() {
-        // Two entries for the same keys mean the first one is unreachable.
-        for (context, table) in crate::input::DEFAULT_BINDINGS {
-            let mut seen = std::collections::HashSet::new();
-            for (keys, action) in *table {
-                assert!(
-                    seen.insert((*keys, *action)),
-                    "duplicate binding for {keys:?} in {context} mode"
-                );
-            }
-        }
+    /// The starter configuration `vortex --write-config` writes: vortex binds no
+    /// keys of its own, so a fixture that wants vim motions has to ask for them
+    /// the way any other configuration does.
+    fn starter() -> crate::config::Config {
+        let (config, warnings) =
+            crate::config::Config::parse(crate::config::Config::default_config_text())
+                .expect("the shipped starter configuration parses");
+        assert!(warnings.is_empty(), "starter config warnings: {warnings:?}");
+        config
     }
 
     #[test]
-    fn the_default_keymap_is_sane() {
-        let (_maps, warnings) = crate::input::Keymaps::build(&crate::config::Config::default());
-        assert!(warnings.is_empty(), "broken default bindings: {warnings:?}");
+    fn an_unconfigured_editor_binds_nothing() {
+        // The whole point of `[keymap.*]`: no key does anything until a line in
+        // the configuration says so.
+        let (maps, warnings) = crate::input::Keymaps::build(&crate::config::Config::default());
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert!(maps.normal.is_empty(), "normal mode bound keys by itself");
+        assert!(maps.insert.is_empty(), "insert mode bound keys by itself");
+        assert!(maps.visual.is_empty(), "visual mode bound keys by itself");
+        assert!(
+            maps.operator.is_empty(),
+            "operator pending bound keys by itself"
+        );
+    }
+
+    #[test]
+    fn the_starter_keymap_is_sane() {
+        let (maps, warnings) = crate::input::Keymaps::build(&starter());
+        assert!(warnings.is_empty(), "broken starter bindings: {warnings:?}");
+        assert!(!maps.normal.is_empty(), "the starter binds nothing");
+    }
+
+    #[test]
+    fn a_normal_motion_reaches_visual_and_operator_pending() {
+        // One `[keymap.normal]` line is enough to move, extend a selection and
+        // delete: the other contexts take normal's bindings and translate them.
+        let (maps, warnings) = crate::input::Keymaps::build(&starter());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let word = press("w");
+        assert!(matches!(
+            maps.normal.lookup(&word),
+            Lookup::Action(Action::Motion(Motion::WordStart))
+        ));
+        assert!(matches!(
+            maps.visual.lookup(&word),
+            Lookup::Action(Action::Extend(Motion::WordStart))
+        ));
+        assert!(matches!(
+            maps.operator.lookup(&word),
+            Lookup::Action(Action::Motion(Motion::WordStart))
+        ));
     }
 
     #[test]
@@ -552,15 +586,17 @@ mod tests {
     fn every_bound_action_name_can_be_rebound() {
         // `:map` prints `action_name`; a name shown there must be accepted by
         // `parse_action` and mean the same thing, so directional commands
-        // (`focus-left`, `resize-up`, …) survive the round trip.
-        for (context, table) in crate::input::DEFAULT_BINDINGS {
-            for (keys, name) in *table {
-                let action = crate::action::parse_action(name)
-                    .unwrap_or_else(|| panic!("default binding {context} {keys:?} -> {name:?}"));
+        // (`focus-left`, `resize-up`, …) survive the round trip.  The starter
+        // configuration is the list that ships, so it is what gets checked.
+        for (context, table) in starter().keymap {
+            for (keys, name) in table {
+                let action = crate::action::parse_action(&name).unwrap_or_else(|| {
+                    panic!("[keymap.{context}] {keys:?} refers to unknown action {name:?}")
+                });
                 let rendered = action_name(&action);
                 assert_eq!(
-                    rendered, *name,
-                    "{context} {keys:?} renders as {rendered:?}, which would not rebind"
+                    rendered, name,
+                    "[keymap.{context}] {keys:?} renders as {rendered:?}, which would not rebind"
                 );
                 assert_eq!(
                     crate::action::parse_action(&rendered),

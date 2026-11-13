@@ -108,7 +108,7 @@ fn every_repo_file_parses_renders_and_spells() {
                     config: &config,
                     theme: &theme,
                     status: snapshot,
-                    command_line: None,
+                    prompt: None,
                     picker: None,
                     completion: None,
                     diagnostic_float: None,

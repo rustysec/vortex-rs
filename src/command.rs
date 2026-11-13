@@ -104,184 +104,336 @@ impl MappingMode {
     }
 }
 
-/// One row of the command table, used for completion and the palette.
+/// One row of the command table, used by the `:` popup and by completion.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandSpec {
     pub name: &'static str,
     pub abbreviation: &'static str,
     pub help: &'static str,
     pub usage: &'static str,
+    /// What the command takes, in order.  The popup shows these under the help
+    /// text and steps through them one at a time once the command is chosen, so
+    /// this is the list that makes a parameter discoverable without reading the
+    /// reference — an empty slice means the command runs on Enter.
+    pub params: &'static [Param],
 }
 
-/// Every `:` command, in the order the palette lists them.
+/// One parameter of a `:` command.
+#[derive(Debug, Clone, Copy)]
+pub struct Param {
+    /// Shown in the popup and as the prompt label while it is being typed.
+    pub name: &'static str,
+    pub help: &'static str,
+    pub kind: ParamKind,
+    /// Whether the command still means something without it — `:write` saves in
+    /// place, so its path is optional and Enter on an empty answer accepts.
+    pub optional: bool,
+}
+
+/// Where a parameter's candidates come from.
+#[derive(Debug, Clone, Copy)]
+pub enum ParamKind {
+    /// Free text (a search pattern, a key sequence).  Nothing to offer.
+    Text,
+    /// A file system path, completed from the working directory.
+    Path,
+    /// One of a fixed set of words.
+    Choice(&'static [&'static str]),
+    /// The name of an open buffer.
+    BufferName,
+    /// An option name for `:set`, with its current value shown beside it.
+    OptionName,
+}
+
+/// Every `:` command.  The `:` popup sorts these alphabetically (see
+/// [`listing`]); this table's own order is only how they were written down.
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "quit",
         abbreviation: "q",
         help: "close the pane, or quit when it is the last one",
         usage: ":quit[!]",
+        params: &[],
     },
     CommandSpec {
         name: "qall",
         abbreviation: "qa",
         help: "quit, refusing if buffers are modified",
         usage: ":qall[!]",
+        params: &[],
     },
     CommandSpec {
         name: "write",
         abbreviation: "w",
         help: "save the buffer",
         usage: ":write [path]",
+        params: &[Param {
+            name: "path",
+            help: "file to write; the current file when empty",
+            kind: ParamKind::Path,
+            optional: true,
+        }],
     },
     CommandSpec {
         name: "wall",
         abbreviation: "wa",
         help: "save every modified buffer",
         usage: ":wall",
+        params: &[],
     },
     CommandSpec {
         name: "wquit",
         abbreviation: "wq",
         help: "save, then quit",
         usage: ":wquit",
+        params: &[],
     },
     CommandSpec {
         name: "edit",
         abbreviation: "e",
         help: "reload this file, or open <path> here (`:edit!` discards changes)",
         usage: ":edit [path]",
+        params: &[Param {
+            name: "path",
+            help: "file to open in this pane; reloads the current one when empty",
+            kind: ParamKind::Path,
+            optional: true,
+        }],
     },
     CommandSpec {
         name: "enew",
         abbreviation: "ene",
         help: "open an empty unnamed buffer",
         usage: ":enew",
+        params: &[],
     },
     CommandSpec {
         name: "split",
         abbreviation: "sp",
         help: "split this pane (same file), or open <path> in a new pane",
         usage: ":split [path]",
+        params: &[Param {
+            name: "path",
+            help: "file for the new pane; the current buffer when empty",
+            kind: ParamKind::Path,
+            optional: true,
+        }],
     },
     CommandSpec {
         name: "vsplit",
         abbreviation: "vs",
         help: "split this pane side by side (same file), or open <path>",
         usage: ":vsplit [path]",
+        params: &[Param {
+            name: "path",
+            help: "file for the new pane; the current buffer when empty",
+            kind: ParamKind::Path,
+            optional: true,
+        }],
     },
     CommandSpec {
         name: "only",
         abbreviation: "on",
         help: "keep only the focused pane",
         usage: ":only",
+        params: &[],
     },
     CommandSpec {
         name: "buffer",
         abbreviation: "b",
         help: "switch to a buffer",
         usage: ":buffer <name>",
+        params: &[Param {
+            name: "name",
+            help: "buffer to switch to",
+            kind: ParamKind::BufferName,
+            optional: false,
+        }],
     },
     CommandSpec {
         name: "bnext",
         abbreviation: "bn",
         help: "switch to the next buffer",
         usage: ":bnext",
+        params: &[],
     },
     CommandSpec {
         name: "bprevious",
         abbreviation: "bp",
         help: "switch to the previous buffer",
         usage: ":bprevious",
+        params: &[],
     },
     CommandSpec {
         name: "bdelete",
         abbreviation: "bd",
         help: "close a buffer",
         usage: ":bdelete[!] <name>",
+        params: &[Param {
+            name: "name",
+            help: "buffer to close",
+            kind: ParamKind::BufferName,
+            optional: false,
+        }],
     },
     CommandSpec {
         name: "buffers",
         abbreviation: "ls",
         help: "list buffers",
         usage: ":buffers",
+        params: &[],
     },
     CommandSpec {
         name: "set",
         abbreviation: "se",
         help: "show or change options",
         usage: ":set [name[=value]|noname]",
+        params: &[Param {
+            name: "option",
+            help: "option to show or change, as `name=value`",
+            kind: ParamKind::OptionName,
+            optional: true,
+        }],
     },
     CommandSpec {
         name: "map",
         abbreviation: "map",
         help: "show key bindings",
         usage: ":map [<lhs>]",
+        params: &[Param {
+            name: "lhs",
+            help: "key sequence to look up; every binding when empty",
+            kind: ParamKind::Text,
+            optional: true,
+        }],
     },
     CommandSpec {
         name: "unmap",
         abbreviation: "unmap",
         help: "remove a key binding",
         usage: ":unmap <lhs>",
+        params: &[Param {
+            name: "lhs",
+            help: "key sequence to unbind",
+            kind: ParamKind::Text,
+            optional: false,
+        }],
     },
     CommandSpec {
         name: "find",
         abbreviation: "f",
         help: "search file names",
         usage: ":find [pattern]",
+        params: &[Param {
+            name: "pattern",
+            help: "text to look for in file names",
+            kind: ParamKind::Text,
+            optional: true,
+        }],
     },
     CommandSpec {
         name: "grep",
         abbreviation: "gr",
         help: "search file contents",
         usage: ":grep <pattern>",
+        params: &[Param {
+            name: "pattern",
+            help: "regular expression to search the project for",
+            kind: ParamKind::Text,
+            optional: false,
+        }],
     },
     CommandSpec {
         name: "format",
         abbreviation: "fo",
         help: "run the buffer's formatter",
         usage: ":format",
+        params: &[],
     },
     CommandSpec {
         name: "diagnostic",
         abbreviation: "diag",
         help: "jump between or list diagnostics in the buffer or the project",
         usage: ":diagnostic [next|prev|list] [buffer|project]",
+        params: &[
+            Param {
+                name: "what",
+                help: "jump or list",
+                kind: ParamKind::Choice(&["next", "prev", "list"]),
+                optional: true,
+            },
+            Param {
+                name: "scope",
+                help: "buffer or whole project",
+                kind: ParamKind::Choice(&["buffer", "project"]),
+                optional: true,
+            },
+        ],
     },
     CommandSpec {
         name: "config",
         abbreviation: "conf",
         help: "config paths, reload or write",
         usage: ":config path|source|write [path]",
+        params: &[
+            Param {
+                name: "action",
+                help: "print paths, reload, or write the file",
+                kind: ParamKind::Choice(&["path", "source", "write"]),
+                optional: true,
+            },
+            Param {
+                name: "path",
+                help: "file to write with `write`",
+                kind: ParamKind::Path,
+                optional: true,
+            },
+        ],
     },
     CommandSpec {
         name: "cd",
         abbreviation: "cd",
         help: "change the working directory",
         usage: ":cd <dir>",
+        params: &[Param {
+            name: "dir",
+            help: "directory to work in; the home directory when empty",
+            kind: ParamKind::Path,
+            optional: false,
+        }],
     },
     CommandSpec {
         name: "pwd",
         abbreviation: "pwd",
         help: "print the working directory",
         usage: ":pwd",
+        params: &[],
     },
     CommandSpec {
         name: "hlsearch",
         abbreviation: "hl",
         help: "clear search highlighting",
         usage: ":hlsearch clear",
+        params: &[Param {
+            name: "what",
+            help: "only `clear`, which is also the default",
+            kind: ParamKind::Choice(&["clear"]),
+            optional: true,
+        }],
     },
     CommandSpec {
         name: "palette",
         abbreviation: "pal",
-        help: "list commands in the palette",
+        help: "list every command, as `:` does",
         usage: ":palette",
+        params: &[],
     },
     CommandSpec {
         name: "help",
         abbreviation: "h",
         help: "list commands",
         usage: ":help",
+        params: &[],
     },
 ];
 
@@ -441,7 +593,9 @@ pub fn parse(input: &str) -> Command {
         } else {
             Some(rest.to_string())
         }),
-        Some("pwd") => Command::ChangeDir(Some(String::new())),
+        // `:pwd` reports the directory without changing it; an empty path would
+        // canonicalize to nothing and fail, so it asks for the report instead.
+        Some("pwd") => Command::ChangeDir(None),
         Some("hlsearch") => {
             if rest.is_empty() || rest == "clear" {
                 Command::ClearSearchHighlight
@@ -453,7 +607,7 @@ pub fn parse(input: &str) -> Command {
         Some(_) => Command::Noop, // unreachable: command_for returns a known name
         None => match action_command(head) {
             // Every bindable action is also a `:` command, so the two lists
-            // can never drift: if `:help keys` names it, `:name` runs it.
+            // can never drift: if `vortex --list-actions` names it, `:name` runs it.
             Some(cmd) => Command::Editor(cmd),
             None => Command::Message(
                 StatusLevel::Error,
@@ -716,34 +870,36 @@ fn parse_set_one(argument: &str, editor: &Editor) -> SetOutcome {
     }
 }
 
+/// The options `:set` lists and completes, in the order the listing shows them.
+pub const OPTION_KEYS: &[&str] = &[
+    "editor.tab-width",
+    "editor.expand-tab",
+    "editor.auto-indent",
+    "editor.line-number",
+    "editor.cursorline",
+    "editor.wrap",
+    "editor.mouse",
+    "editor.scroll-margin",
+    "layout.split-mode",
+    "layout.split-ratio",
+    "layout.min-width",
+    "layout.min-height",
+    "status.position",
+    "spell.enable",
+    "spell.only-comments",
+    "spell.case-sensitive",
+    "search.ignore-case",
+    "search.smart-case",
+    "search.ripgrep",
+    "format.on-idle",
+    "lsp.enable",
+    "lsp.completion",
+];
+
 /// The `:set` listing: every option the user is likely to change.
 pub fn option_summary(editor: &Editor) -> String {
-    const KEYS: &[&str] = &[
-        "editor.tab-width",
-        "editor.expand-tab",
-        "editor.auto-indent",
-        "editor.line-number",
-        "editor.cursorline",
-        "editor.wrap",
-        "editor.mouse",
-        "editor.scroll-margin",
-        "layout.split-mode",
-        "layout.split-ratio",
-        "layout.min-width",
-        "layout.min-height",
-        "status.position",
-        "status.height",
-        "spell.enable",
-        "spell.only-comments",
-        "spell.case-sensitive",
-        "search.ignore-case",
-        "search.smart-case",
-        "search.ripgrep",
-        "format.on-idle",
-        "lsp.enable",
-        "lsp.completion",
-    ];
-    KEYS.iter()
+    OPTION_KEYS
+        .iter()
         .filter_map(|key| {
             editor
                 .config
@@ -821,7 +977,6 @@ fn vim_option(name: &str) -> Option<&'static str> {
         "min-height" => "layout.min-height",
         "min-width" => "layout.min-width",
         "status-position" => "status.position",
-        "status-height" => "status.height",
         "spell" => "spell.enable",
         "spell-command" => "spell.command",
         "only-comments" => "spell.only-comments",
@@ -943,12 +1098,133 @@ pub fn complete_command(input: &str) -> Vec<String> {
         .collect()
 }
 
-/// Command names plus help text, for the palette.
-pub fn palette_entries() -> Vec<(&'static str, &'static str, &'static str)> {
-    COMMANDS
-        .iter()
-        .map(|spec| (spec.name, spec.usage, spec.help))
-        .collect()
+/// The argument part of a usage string: `":write [path]"` yields `"[path]"`, and
+/// `":quit[!]"` — which has no space to split on — yields `"[!]"`.
+///
+/// The popup prints this dimmed after the command name, so the shape of a command
+/// is visible without anyone having to open it first.  Everything past the first
+/// space is an argument; a usage with no space at all can still carry a bracketed
+/// suffix, which is vim's notation for "and a bang".
+pub fn arguments(usage: &'static str) -> &'static str {
+    let body = usage.strip_prefix(':').unwrap_or(usage);
+    if let Some(at) = body.find(' ') {
+        return body[at + 1..].trim();
+    }
+    match body.find(['[', '<']) {
+        Some(at) => &body[at..],
+        None => "",
+    }
+}
+
+/// The parameter lines shown in a command's preview, one per parameter.
+///
+/// Reads like `path — file to write; the current file when empty (optional)`, so
+/// the shape of an unfamiliar command is on screen before anyone commits to it.
+pub fn param_lines(params: &[Param]) -> String {
+    let mut lines = String::new();
+    for param in params {
+        let requirement = if param.optional {
+            "optional"
+        } else {
+            "required"
+        };
+        let choices = match param.kind {
+            ParamKind::Choice(words) => format!(" [{}]", words.join(" | ")),
+            _ => String::new(),
+        };
+        lines.push_str(&format!(
+            "  {} — {}{} ({requirement})\n",
+            param.name, param.help, choices
+        ));
+    }
+    lines
+}
+
+/// Every command in the order `:` lists them: alphabetically.
+///
+/// The popup is a lookup, not a tour of the table — publication order made
+/// someone hunt for `:write` among the quit-and-save neighbours — so it sorts by
+/// name and lets the fuzzy filter do the narrowing.  Abbreviations are listed too
+/// in each row's preview rather than as rows of their own, which would double the
+/// list to no purpose.
+pub fn listing() -> Vec<&'static CommandSpec> {
+    let mut specs: Vec<&'static CommandSpec> = COMMANDS.iter().collect();
+    specs.sort_by_key(|spec| spec.name);
+    specs
+}
+
+/// The command a typed word names — exact, abbreviation or unambiguous prefix —
+/// as its full name.
+///
+/// `:w` and `:wri` both mean `write`.  The popup needs this to tell a line that
+/// *names* a command from one that merely resembles several: only in the second
+/// case does it fall back to the highlighted row, because someone who typed a
+/// command word said which one they meant.
+pub fn resolve(name: &str) -> Option<&'static str> {
+    command_for(name)
+}
+
+/// The parameters of the command `name` resolves to, abbreviations included.
+pub fn params_for(name: &str) -> &'static [Param] {
+    match command_for(name) {
+        Some(resolved) => COMMANDS
+            .iter()
+            .find(|spec| spec.name == resolved)
+            .map(|spec| spec.params)
+            .unwrap_or(&[]),
+        None => &[],
+    }
+}
+
+/// The option names `:set` accepts, for the popup's parameter stage.
+pub fn option_keys() -> &'static [&'static str] {
+    OPTION_KEYS
+}
+
+/// Candidates a parameter can offer while it is being typed.
+///
+/// `Text` has none — there is nothing to suggest before someone has written a
+/// search pattern — and the kinds that depend on editor state (open buffers) are
+/// filled in by the caller, which can see them.  Paths come from the file system
+/// and choices from the command table itself, so they belong here.
+pub fn param_candidates(param: &Param, fragment: &str) -> Vec<String> {
+    match param.kind {
+        ParamKind::Text => Vec::new(),
+        ParamKind::Path => complete_path(fragment)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        ParamKind::Choice(words) => words
+            .iter()
+            .filter(|word| word.starts_with(fragment))
+            .map(|word| (*word).to_string())
+            .collect(),
+        ParamKind::OptionName => OPTION_KEYS
+            .iter()
+            .filter(|key| key.contains(fragment.rsplit('.').next().unwrap_or("")))
+            .map(|key| (*key).to_string())
+            .collect(),
+        // Buffer names belong to the editor, which is the caller that can see them.
+        ParamKind::BufferName => Vec::new(),
+    }
+}
+
+/// True when a typed `:` line carries its own arguments — `:write notes.txt`,
+/// `:set tab-width=4`, `:q!`.
+///
+/// The popup offers commands while you type, but a line like this has already
+/// been written by someone who knows what they want: Enter runs exactly what is
+/// on the line rather than whatever row happens to be highlighted.
+pub fn has_arguments(line: &str) -> bool {
+    line.contains(char::is_whitespace) || line.ends_with('!')
+}
+
+/// Rebuild a command line from a chosen command and its collected parameters.
+pub fn assemble(head: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        return head.to_string();
+    }
+    format!("{head} {}", args.join(" "))
 }
 
 #[cfg(test)]
@@ -1079,7 +1355,7 @@ mod tests {
 
     #[test]
     fn bindable_actions_are_commands_too() {
-        // Anything the keymap can bind (`:help keys`) also runs from `:`.
+        // Anything the keymap can bind (`vortex --list-actions`) also runs from `:`.
         assert_eq!(parse("close-pane"), Command::Editor(Cmd::ClosePane));
         assert_eq!(parse("recenter"), Command::Editor(Cmd::Recenter));
         assert_eq!(parse("equalize-panes"), Command::Editor(Cmd::EqualizePanes));
@@ -1246,6 +1522,107 @@ mod tests {
         assert!(summary.contains("editor.tab-width=4"), "{summary}");
         assert!(summary.contains("layout.split-mode="), "{summary}");
         assert!(summary.contains("search.ripgrep=auto"), "{summary}");
+    }
+
+    #[test]
+    fn the_popup_lists_every_command_alphabetically() {
+        let listing = listing();
+        assert_eq!(listing.len(), COMMANDS.len(), "no command may be hidden");
+        let mut names: Vec<&str> = listing.iter().map(|spec| spec.name).collect();
+        names.sort_unstable();
+        assert_eq!(names.first(), Some(&"bdelete"), "{names:?}");
+        assert_eq!(
+            listing.iter().map(|spec| spec.name).collect::<Vec<_>>(),
+            names,
+            "the list must be alphabetical — it is a lookup, not a tour"
+        );
+    }
+
+    #[test]
+    fn usage_shows_the_arguments_and_the_preview_the_parameters() {
+        // The two ways a parameter becomes discoverable without reading the
+        // reference: dimmed after the name, then spelled out in the preview.
+        let write = COMMANDS
+            .iter()
+            .find(|spec| spec.name == "write")
+            .expect("write");
+        assert_eq!(arguments(write.usage), "[path]");
+        assert_eq!(arguments(":quit[!]"), "[!]");
+        assert_eq!(arguments(":only"), "");
+
+        let lines = param_lines(write.params);
+        assert!(lines.contains("path"), "{lines}");
+        assert!(lines.contains("(optional)"), "{lines}");
+        // The help text and the requirement are separate phrases, not one word.
+        assert!(!lines.contains("empty(optional)"), "{lines}");
+
+        let diagnostic = COMMANDS
+            .iter()
+            .find(|spec| spec.name == "diagnostic")
+            .expect("diagnostic");
+        let lines = param_lines(diagnostic.params);
+        assert!(lines.contains("next | prev | list"), "{lines}");
+        assert!(lines.contains("(optional)"), "{lines}");
+    }
+
+    #[test]
+    fn a_typed_word_names_one_command_or_none() {
+        // Enter on the popup runs what was typed when it names a command, so
+        // `resolve` is what decides that — exact, abbreviation, or a prefix only
+        // one command could mean.  Anything else leaves the choice to the list.
+        assert_eq!(resolve("write"), Some("write"));
+        assert_eq!(resolve("w"), Some("write"));
+        assert_eq!(resolve("wri"), Some("write"));
+        assert_eq!(resolve("q"), Some("quit"));
+        // `s` could mean set, split, or spell: guessing would surprise someone.
+        assert_eq!(resolve("s"), None);
+        assert_eq!(resolve("frobnicate"), None);
+        assert_eq!(resolve(""), None);
+    }
+
+    #[test]
+    fn parameters_are_found_through_abbreviations_too() {
+        // `:w` is the same command as `:write`, so it must be asked the same
+        // questions; a name that resolves to nothing simply has none.
+        assert!(!params_for("w").is_empty());
+        assert_eq!(params_for("w").len(), params_for("write").len());
+        assert!(params_for("se").first().is_some_and(|p| p.name == "option"));
+        assert!(params_for("frobnicate").is_empty());
+    }
+
+    #[test]
+    fn a_typed_line_with_arguments_runs_as_written() {
+        assert!(has_arguments("write notes.txt"));
+        assert!(has_arguments("set tab-width=4"));
+        assert!(has_arguments("q!"));
+        assert!(
+            !has_arguments("write"),
+            "a bare name may step into its params"
+        );
+
+        // What the guided stages assemble must parse back to the same command as
+        // if it had been typed in one go.
+        let args = vec!["notes.txt".to_string()];
+        assert_eq!(parse(&assemble("write", &args)), parse("write notes.txt"));
+        assert_eq!(assemble("only", &[]), "only");
+    }
+
+    #[test]
+    fn parameter_candidates_offer_choices_and_narrow_as_typed() {
+        let diagnostic = COMMANDS
+            .iter()
+            .find(|spec| spec.name == "diagnostic")
+            .expect("diagnostic");
+        let what = &diagnostic.params[0];
+        assert_eq!(param_candidates(what, ""), ["next", "prev", "list"]);
+        assert_eq!(param_candidates(what, "p"), ["prev"]);
+
+        // A pattern has nothing to suggest before it exists.
+        let grep = COMMANDS
+            .iter()
+            .find(|spec| spec.name == "grep")
+            .expect("grep");
+        assert!(param_candidates(&grep.params[0], "any").is_empty());
     }
 
     #[test]

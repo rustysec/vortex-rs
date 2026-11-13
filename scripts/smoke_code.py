@@ -7,7 +7,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ptyui import Pty, clean_config, drain
+from ptyui import Pty, drain, starter_config
 
 FAILURES = []
 
@@ -22,7 +22,7 @@ def check(name, condition, detail=""):
 SOURCE = """fn  main() {
     let mut v = vec![3,1,2];
     v.sort();
-    // teh sorted numbers are printed here
+    // the sorted numbrs are printed here
     println!("{:?}", v);
 }
 """
@@ -30,7 +30,7 @@ SOURCE = """fn  main() {
 FORMATTED = """fn main() {
     let mut v = vec![3, 1, 2];
     v.sort();
-    // teh sorted numbers are printed here
+    // the sorted numbrs are printed here
     println!("{:?}", v);
 }
 """
@@ -43,7 +43,7 @@ def main():
     with open(target, "w") as handle:
         handle.write(SOURCE)
 
-    app = Pty(binary, project, target, extra_args=clean_config(project))
+    app = Pty(binary, project, target, extra_args=starter_config(project, binary))
     # Parsing, then the idle spell pass, need a moment.
     app.keys(b"", 4.0)
     raw = app.raw

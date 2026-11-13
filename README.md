@@ -43,8 +43,9 @@ objects, the `"` registers, `m`/`` ` `` marks, `Ctrl-O`/`Ctrl-I` jump list, `u`
 and `Ctrl-R`, and `.` repeat.
 
 The terminal cursor is the mode indicator: a block in normal and visual, a bar
-in insert and while typing on the command line, an underline while an operator
-waits for its motion. A fresh session starts in normal mode and looks like it.
+in insert and while typing in the `:` popup or a search, an underline while an
+operator waits for its motion. A fresh session starts in normal mode and looks
+like it.
 
 `{`/`}` move between paragraph boundaries the way vim does: `}` finds the *next*
 empty line even when the cursor is already standing on one, runs to the end of
@@ -58,12 +59,14 @@ words, sentences and paragraphs. When a tree-sitter grammar exists for the
 file you also get grammar objects: `af`/`if` function, `ac`/`ic` class,
 `ab`/`ib` block, `as`/`is` string, `aC`/`iC` comment.
 
-The bindings you are most likely to reach for:
+These are the keys the shipped starter binds — `vortex --write-config` writes the
+list out as `[keymap.*]` lines you can cut down or replace, and a key with no
+line does nothing:
 
 | Keys | Action |
 | --- | --- |
 | `i` `a` `o` `O` `v` `V` `Ctrl-V` `Esc` | enter modes |
-| `Space p` | command palette |
+| `Space p` | command popup, the same list as `:` |
 | `Space f` | fuzzy file picker |
 | `Space s` | grep the project's contents |
 | `Space b` | buffer picker (`:bn`/`:bp` cycle, `:ls` lists) |
@@ -80,8 +83,8 @@ The bindings you are most likely to reach for:
 | `Ctrl-W` `h/j/k/l`, `Space ←/→/↑/↓`, `Space Tab` | move between panes |
 | `Space Ctrl-H/J/K/L`, `Space +`, `Space -` | resize the focused pane |
 | `/` `?` `n` `N` `#` `*` | search, next/previous, search for the word under the cursor |
-| `:`, `<Count>:` | command line |
-| `Ctrl-C` | cancel a pending key sequence |
+| `:`, `<Count>:` | command popup |
+| `Esc` | cancel a pending key sequence, leave modes, close popups |
 
 Insert mode keeps the readline habits that matter while typing code:
 `Ctrl-W` (delete word back), `Ctrl-U` (delete to the line start), `Ctrl-T`
@@ -112,11 +115,44 @@ to scroll, and click inside a picker to choose an item.
 :fo[rmat]                                          run the language formatter
 :conf[ig] path|source|write [path]                   configuration
 :cd <dir>  :pwd  :hl[search] clear                   misc
-:pal[ette]  :help                                    open the command palette
+:pal[ette]  :help                                    list every command
 ```
 
-`:palette` (also `Space p`) opens the command palette, and `:help`
-does the same with the command list. `:map` prints the active bindings.
+`:palette` (also `Space p`) opens the same popup as `:` — one list, not two that
+differ slightly. `:map` prints the active bindings.
+
+## The `:` popup
+
+Pressing `:` — a binding you write, since vortex binds nothing itself — opens a
+card over the panes listing every command alphabetically, its arguments dimmed
+after the name and its help plus one line per parameter in the preview below.
+Typing narrows that list as you go, so a command you have never heard of is
+reachable by guessing two letters.
+
+What `Enter` runs, in the order the evidence speaks:
+
+- A word you typed that *names* a command wins outright: `:q` quits even while
+  the filter happens to be holding `:qall`, and `:wri` writes. Typing a command
+  word is a deliberate act; where the highlight landed is not.
+- A line with arguments runs exactly as written — `:write notes.txt`,
+  `:set tab-width=4`, `:q!`. The list keeps narrowing by the command word while
+  you type them, so it never empties out from under you.
+- A row you walked to with the arrows (or clicked) is a choice, and runs even if
+  what you typed names a different command — that is how two guessed letters
+  reach something you have never heard of.
+- `:` then `Enter` on an untouched list does nothing, as in vim.
+
+`Ctrl-P`/`Ctrl-N` walk the commands you have run, and recalling one re-narrows
+the list to it, so a popup that replaced the command line kept its history.
+
+Choosing a command from the list steps into asking for its parameters one at a
+time — `:config` asks for an action, then a path — with each step offering what
+could possibly go there (paths off the file system as you type them, open
+buffers, option names with their current values, or the fixed set from the
+command table). A command typed by hand is only asked for a parameter it cannot
+run without: `:grep` needs a pattern, so it asks; `:write` does not, so it saves.
+An optional parameter says so in its title and is skipped by `Enter` on an empty
+row; `Esc` backs out one step instead of throwing the whole line away.
 
 ## Dark or light
 
@@ -144,8 +180,8 @@ accent = "#3c85b4"            # or a colour name, or "" for the scheme default
 ## Configuration
 
 `~/.config/vortex/config.toml` (or `$VORTEX_CONFIG`, or `-c`). Every key is
-optional, keys are kebab-case, and unknown keys are reported on the message
-line rather than refused:
+optional, keys are kebab-case, and unknown keys are reported on a card over the
+panes rather than refused:
 
 ```toml
 [editor]
@@ -155,7 +191,6 @@ line-number = "relative"     # "absolute" | "relative" | "none"
 wrap = false
 
 [status]
-height = 1
 show-mode = true
 show-diagnostics = true
 
@@ -205,8 +240,8 @@ space d = "show-diagnostics"
 "<A-x>" = "delete-word-after"
 ```
 
-Pickers and the palette are drawn on an opaque card, so the buffer behind them
-cannot show through the text.
+The `:` popup, search lists and messages are all drawn on opaque cards, so the
+buffer behind them cannot show through the text.
 
 Panes scroll independently, and each one scrolls to its *own* height: split the
 window in two and the cursor turns the pane at the pane's edge, not at the edge
@@ -216,9 +251,16 @@ of the screen.
 `:config write` is how you save them. `:config source` re-reads the file. The
 annotated reference is one command away: `vortex --default-config`.
 
-Binding a key that starts with a built-in one (`wd = "close-pane"`) does not
-disble the built-in: `w` still moves after a short pause, or immediately when
-the next key cannot continue the sequence — the way vim's `timeoutlen` works.
+Binding a key that starts with another one you bound (`wd = "close-pane"` next to
+`w = "word-forward"`) does not disable the shorter: `w` still moves after a short
+pause, or immediately when the next key cannot continue the sequence — the way
+vim's `timeoutlen` works.
+
+Nothing is bound until `[keymap.*]` says so.  Vortex ships no built-ins it would
+apply behind your back; what you get from `vortex --write-config` is a vim-style
+starter written out as ordinary lines, and the only keys that work with an empty
+configuration are insert-mode text input — printable characters, backspace, enter
+and the arrows — because those write text rather than run commands.
 
 Project vocabulary for the spell checker goes in `.vortex-words` (one word per
 line) at the working directory.
@@ -275,7 +317,7 @@ src/
   input/          keys, keymap trie, motions, text objects, operators
   layout.rs       pane tree, equal/golden sizing
   ui.rs           pure renderer over a ratatui Buffer
-  status.rs       configurable status line and message row
+  status.rs       the one-row status area (transient text is a card in ui.rs)
   prompt.rs       command line, search, fuzzy pickers
   syntax.rs       tree-sitter parsing and highlight spans
   indent.rs       syntax-aware indentation while typing

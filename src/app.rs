@@ -35,7 +35,7 @@ use crate::status::Snapshot;
 use crate::syntax::{self, TreeSlot};
 use crate::term::{self, Terminal, TerminalGuard};
 use crate::theme::{Observed, Theme};
-use crate::ui::{self, CommandLine, Picker, Screen};
+use crate::ui::{self, Notice, NoticeTone, Picker, Screen};
 
 /// Idle time before a buffer is re-parsed.
 const PARSE_IDLE: Duration = Duration::from_millis(120);
@@ -53,6 +53,13 @@ const DIAGNOSTIC_HOLD: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptKind {
     Command,
+    /// The guided parameter stage of a chosen command: `head` is the command
+    /// word and `collected` the answers already given, so the next question can
+    /// be asked with everything before it intact.
+    Param {
+        head: String,
+        collected: Vec<String>,
+    },
     Search {
         forward: bool,
     },
@@ -88,7 +95,7 @@ pub struct DiagnosticPayload {
 #[derive(Debug, Clone, Copy)]
 pub struct BufferPayload(pub BufferId);
 
-/// Payload of a palette entry: the command line to run.
+/// Payload of a `:` popup row: the command word it runs.
 #[derive(Debug, Clone)]
 pub struct CommandPayload(pub String);
 
@@ -539,15 +546,6 @@ impl App {
             return;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.editor.pending.clear();
-            self.editor.leave_insert();
-            self.editor.leave_visual();
-            self.completion = None;
-            self.needs_redraw = true;
-            return;
-        }
-
         // The completion popup gets first refusal on Tab/Enter/Esc/arrows; any
         // other key falls through to the editor so typing narrows the list.
         if self.completion.is_some() && self.completion_key(key) {
@@ -777,12 +775,7 @@ impl App {
 
     fn open_prompt(&mut self, spec: PromptSpec) {
         match spec {
-            PromptSpec::Command(initial) => {
-                let mut prompt =
-                    Prompt::command(initial).with_history(self.command_history.clone());
-                prompt.remember("");
-                self.prompt = Some((PromptKind::Command, prompt));
-            }
+            PromptSpec::Command(initial) => self.open_command_popup(initial),
             PromptSpec::Search { forward, initial } => {
                 let mut prompt = Prompt::search(forward, initial);
                 let history = self.search_history.clone();
@@ -813,10 +806,7 @@ impl App {
                 let items = self.buffer_items();
                 self.open_picker(PromptKind::SwitchBuffer, "buffers", "", items);
             }
-            PromptSpec::Palette(query) => {
-                let items = self.palette_items();
-                self.open_picker(PromptKind::Palette, "commands", &query, items);
-            }
+            PromptSpec::Palette(query) => self.open_command_popup(query),
             PromptSpec::Spell {
                 word,
                 span,
@@ -862,6 +852,142 @@ impl App {
         self.prompt = Some((kind, picker));
     }
 
+    /// The `:` popup: every command in the book, alphabetically, narrowing as
+    /// the user types.
+    ///
+    /// It replaces both the old bare command line and the palette — one list is
+    /// easier to learn than two that differ slightly.  A fully typed line still
+    /// runs exactly as written (see [`App::submit_prompt`]), so nothing someone
+    /// already knows how to type got slower, while anything they did not know
+    /// existed is now four keystrokes and a glance away.
+    fn open_command_popup(&mut self, initial: String) {
+        let mut prompt = self.command_prompt();
+        prompt.set_text(initial);
+        self.prompt = Some((PromptKind::Command, prompt));
+    }
+
+    /// A fresh `:` popup over every command, with the session's history attached.
+    ///
+    /// It is a picker whose input row *is* the ex line: built from
+    /// [`Prompt::command`] so tab-completion ghosting survives, then switched to
+    /// select mode so the rows can be walked with the arrows.  Typing narrows the
+    /// list either way, which is what makes a bare `:` safe to hand over to someone
+    /// who means to type the whole line themselves.
+    fn command_prompt(&self) -> Prompt {
+        let mut prompt = Prompt::command(String::new()).with_history(self.command_history.clone());
+        prompt.label = "commands".into();
+        prompt.select_mode = true;
+        prompt.set_items(self.command_items());
+        prompt
+    }
+
+    /// Run a command the popup settled on, asking for its parameters or not.
+    ///
+    /// `from_row` says whether the choice came from a highlighted row rather than
+    /// from a word typed at the top of the card.  It decides how much to ask:
+    ///
+    /// - A typed word is someone who already knows the command, so it runs as
+    ///   written unless it cannot — `:grep` with no pattern still has to be asked,
+    ///   while `:w`, `:e` and `:split` do their job on Enter because everything
+    ///   left over is optional.  Stepping into questions there would break the
+    ///   oldest habit in the book.
+    /// - A row *chosen* from the list is the discovery path, so every parameter it
+    ///   takes gets asked about, each one skippable with Enter on an empty answer.
+    fn choose_command(&mut self, name: &str, from_row: bool) {
+        let params = command::params_for(name);
+        let asks = match params.first() {
+            Some(first) => from_row || !first.optional,
+            None => false,
+        };
+        if asks {
+            self.open_param_stage(name.to_string(), Vec::new());
+            return;
+        }
+        let parsed = command::parse(name);
+        self.run_command(parsed);
+    }
+
+    /// The guided parameter stage of a chosen command.
+    ///
+    /// One question at a time, with the answers so far kept in `collected` and
+    /// echoed back into the next row's candidates: `:config write` asks for an
+    /// action, then a path, and each step offers what could possibly go there.
+    fn open_param_stage(&mut self, head: String, collected: Vec<String>) {
+        let params = command::params_for(&head);
+        let Some(param) = params.get(collected.len()) else {
+            let line = command::assemble(&head, &collected);
+            push_history(&mut self.command_history, line.clone());
+            let parsed = command::parse(&line);
+            self.run_command(parsed);
+            return;
+        };
+        // The title reads like the command line being assembled — `:config write
+        // path` — so each step shows what has been answered and what is asked.
+        let mut title = format!(":{head}");
+        for answer in &collected {
+            title.push_str(&format!(" {answer}"));
+        }
+        title.push_str(&format!(" {}", param.name));
+        if param.optional {
+            // An optional answer is accepted by Enter on an empty row, so say so
+            // where the person will read it rather than in a manual.
+            title.push_str("  (⏎ to skip)");
+        }
+        let items = self.param_items(param, "");
+        // A parameter with nothing to offer — a search pattern, a key sequence —
+        // is typed, so it gets a line on the card rather than an empty list whose
+        // only row would be a placeholder standing between Enter and the answer.
+        let prompt = if items.is_empty() {
+            Prompt::new(format!("{title} "))
+        } else {
+            // Typing narrows the rows and Enter takes the highlighted one, so the
+            // top match after a few characters is what the fragment names.  Paths
+            // additionally re-list the directory each keystroke, which is how
+            // `src/` becomes a list of what is inside it.
+            Prompt::picker(title, items)
+        };
+        self.prompt = Some((PromptKind::Param { head, collected }, prompt));
+        self.needs_redraw = true;
+    }
+
+    /// Candidates for one parameter: the fixed sets from the command table, and
+    /// the two that can only be answered by looking — open buffers and paths.
+    ///
+    /// `fragment` is what has been typed so far; it only narrows anything for a
+    /// path, whose candidates come off the file system rather than out of a list.
+    fn param_items(&self, param: &command::Param, fragment: &str) -> Vec<prompt::Item> {
+        let requirement = if param.optional {
+            "optional"
+        } else {
+            "required"
+        };
+        let mut items: Vec<prompt::Item> = match param.kind {
+            command::ParamKind::BufferName => self
+                .editor
+                .buffer_labels()
+                .into_iter()
+                .map(|(_, label, dirty)| {
+                    prompt::Item::new(label).detail(if dirty { "modified" } else { "" }.to_string())
+                })
+                .collect(),
+            command::ParamKind::OptionName => command::option_keys()
+                .iter()
+                .filter_map(|key| {
+                    let value = self.editor.config.value_of(key)?;
+                    Some(prompt::Item::new((*key).to_string()).detail(value))
+                })
+                .collect(),
+            _ => command::param_candidates(param, fragment)
+                .into_iter()
+                .map(prompt::Item::new)
+                .collect(),
+        };
+        for item in items.iter_mut() {
+            item.preview = Some(format!("{} ({requirement})", param.help));
+        }
+        items
+    }
+
     /// The grep picker's text is the engine's pattern, not a local filter:
     /// hit labels are `path:line` and would all be fuzzy-filtered away.
     fn disable_local_filter(&mut self) {
@@ -873,14 +999,37 @@ impl App {
 
     fn cancel_prompt(&mut self) {
         if let Some((kind, _)) = self.prompt.take() {
-            if matches!(kind, PromptKind::FindFiles | PromptKind::Grep)
-                && let Some(handle) = self.search_job.take()
-            {
-                handle.cancel();
-            }
-            if let PromptKind::Search { .. } = kind {
-                // `/` cancelled: vim keeps the previous term but drops the highlight.
-                self.editor.refresh_search_matches();
+            match kind {
+                // Esc inside a guided parameter backs out one step rather than
+                // throwing away the command someone had already chosen: an
+                // answer they did not mean to give should cost them only that
+                // answer.
+                PromptKind::Param {
+                    head,
+                    mut collected,
+                } => {
+                    if collected.pop().is_some() {
+                        self.open_param_stage(head, collected);
+                    } else {
+                        // Back at the first parameter: step out to the command
+                        // list with the chosen word still on the line.
+                        let mut prompt = self.command_prompt();
+                        prompt.set_text(format!("{head} "));
+                        self.prompt = Some((PromptKind::Command, prompt));
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+                PromptKind::FindFiles | PromptKind::Grep => {
+                    if let Some(handle) = self.search_job.take() {
+                        handle.cancel();
+                    }
+                }
+                PromptKind::Search { .. } => {
+                    // `/` cancelled: vim keeps the previous term but drops the highlight.
+                    self.editor.refresh_search_matches();
+                }
+                _ => {}
             }
         }
         self.needs_redraw = true;
@@ -902,6 +1051,21 @@ impl App {
             PromptKind::FindFiles => {
                 // The file list is fetched once; the picker filters it locally.
             }
+            PromptKind::Param { head, collected } => {
+                // A path parameter is completed from the file system as it is
+                // typed, so each keystroke re-lists the directory the fragment
+                // names — a fixed list would stop being true the moment someone
+                // descended into a folder.
+                let Some(param) = command::params_for(&head).get(collected.len()) else {
+                    return;
+                };
+                if matches!(param.kind, command::ParamKind::Path) {
+                    let items = self.param_items(param, &text);
+                    if let Some((_, prompt)) = self.prompt.as_mut() {
+                        prompt.set_items(items);
+                    }
+                }
+            }
             PromptKind::Command
             | PromptKind::Path
             | PromptKind::GotoLine
@@ -922,12 +1086,96 @@ impl App {
         let text = prompt.display_text();
         match kind {
             PromptKind::Command => {
-                let line = text.trim_start().to_string();
+                // The card already shows the `:` that opens it, but muscle memory
+                // from vim types one anyway; a leading colon is punctuation on the
+                // same command, not part of its name.
+                let line = text.trim().trim_start_matches(':').trim_start().to_string();
                 if !line.is_empty() {
                     push_history(&mut self.command_history, line.clone());
                 }
-                let parsed = command::parse(&line);
-                self.run_command(parsed);
+                // A line with arguments runs exactly as written — someone who
+                // typed `:write notes.txt` said the whole thing.  Otherwise the
+                // question is which command they meant.
+                if command::has_arguments(&line) {
+                    let parsed = command::parse(&line);
+                    self.run_command(parsed);
+                    return;
+                }
+                let named = command::resolve(&line);
+                let row = item
+                    .and_then(|index| prompt.item(index))
+                    .and_then(|item| item.payload_as::<CommandPayload>())
+                    .map(|payload| payload.0.clone());
+                // Enter on an empty popup is a dismissal, not a choice: with no
+                // filter the whole table is visible and row zero would otherwise
+                // run whatever sorts first.  `:` then Enter did nothing in vim.
+                // Walking down to a row *is* a choice, though, so a moved
+                // highlight still counts.
+                if line.is_empty() {
+                    match (prompt.selected > 0, row) {
+                        (true, Some(name)) => self.choose_command(&name, true),
+                        _ => self.needs_redraw = true,
+                    }
+                    return;
+                }
+                // Which command Enter means, in order of who spoke loudest: a
+                // highlight the user *walked to* is a choice; otherwise a typed
+                // word that names a command wins, because `:q` must quit even
+                // while the filter happens to be holding `:qall`.  With neither —
+                // two guessed letters and no command of that name — the top row
+                // stands, which is how an unfamiliar command gets found.
+                let walked = prompt.selected > 0;
+                let chosen = match (walked.then_some(row.as_deref()).flatten(), named) {
+                    (Some(picked), _) => Some((picked.to_string(), true)),
+                    (None, Some(word)) => Some((word.to_string(), false)),
+                    (None, None) => row.map(|picked| (picked, true)),
+                };
+                match chosen {
+                    Some((name, from_row)) => self.choose_command(&name, from_row),
+                    // Neither a name nor a row: let the parser report it, as a bare
+                    // ex line would.
+                    None => {
+                        let parsed = command::parse(&line);
+                        self.run_command(parsed);
+                    }
+                }
+            }
+            PromptKind::Param {
+                head,
+                mut collected,
+            } => {
+                // The answer is the highlighted row when there is one, otherwise
+                // whatever was typed; an empty answer to an optional parameter is
+                // how the popup's "⏎ to skip" gets taken.
+                let value = item
+                    .and_then(|index| prompt.item(index))
+                    .map(|item| item.label.clone())
+                    .or_else(|| {
+                        let typed = text.trim().to_string();
+                        (!typed.is_empty()).then_some(typed)
+                    });
+                let params = command::params_for(&head);
+                match value {
+                    Some(value) if !value.is_empty() => {
+                        collected.push(value);
+                        self.open_param_stage(head, collected);
+                    }
+                    // Skipped or blank: only the remaining optional parameters
+                    // are given up on, so run with what has been answered.
+                    _ => {
+                        let trailing = params.get(collected.len());
+                        if trailing.is_some_and(|param| !param.optional) {
+                            let name = &trailing.expect("checked above").name;
+                            self.set_message(StatusLevel::Warn, format!(":{head} needs a {name}"));
+                            self.open_param_stage(head, collected);
+                        } else {
+                            let line = command::assemble(&head, &collected);
+                            push_history(&mut self.command_history, line.clone());
+                            let parsed = command::parse(&line);
+                            self.run_command(parsed);
+                        }
+                    }
+                }
             }
             PromptKind::Search { forward } => {
                 let term = text.clone();
@@ -1110,10 +1358,11 @@ impl App {
                 }
             }
             Command::NewBuffer => {
-                self.editor.new_scratch();
-                if let Some(id) = self.editor.current_buffer_id() {
-                    self.editor.show_in_pane(id, None);
-                }
+                // Show the buffer that was just made; asking which one is focused
+                // afterwards reads back the pane we are about to replace, so
+                // `:enew` looked like a no-op.
+                let id = self.editor.new_scratch();
+                self.editor.show_in_pane(id, None);
             }
             Command::Write { path, force } => {
                 let target = path.as_deref().map(expand);
@@ -1188,7 +1437,9 @@ impl App {
             Command::Unmap { lhs, mode } => {
                 let context = context_name(mode);
                 let removed = self.editor.config.remove_binding(context, &lhs);
-                // Unmapping a built-in means binding it to nothing.
+                // Nothing shadows a binding here, so removing the line is not
+                // enough to keep the key quiet across a reload: write an explicit
+                // unbind in its place.
                 self.editor
                     .config
                     .keymap
@@ -2563,7 +2814,7 @@ impl App {
     }
 
     fn pane_area(&self, area: Rect) -> Rect {
-        let (_status, panes, _message) = ui::areas(area, &self.editor.config);
+        let (_status, panes) = ui::areas(area, &self.editor.config);
         panes
     }
 
@@ -2586,26 +2837,19 @@ impl App {
         // Borrow the pieces the screen needs without holding `self` mutably.
         let editor = &self.editor;
         let theme = &self.theme;
-        let command_line: Option<CommandLine> = self
+        // A prompt that is not a picker still needs its line on screen: it draws
+        // on the transient card, where messages and key echoes also go.  The
+        // picker kinds draw their own input row inside the list card.
+        let prompt_card: Option<Notice> = self
             .prompt
             .as_ref()
-            .filter(|(kind, _)| {
-                !matches!(
-                    kind,
-                    PromptKind::FindFiles
-                        | PromptKind::Grep
-                        | PromptKind::SwitchBuffer
-                        | PromptKind::Palette
-                        | PromptKind::Spell { .. }
-                        | PromptKind::Diagnostics
-                        | PromptKind::CodeActions
-                )
-            })
-            .map(|(_, prompt)| CommandLine {
+            .filter(|(_, prompt)| !prompt.select_mode)
+            .map(|(_, prompt)| Notice {
                 prompt: &prompt.label,
                 text: &prompt.text,
-                caret: prompt.caret(),
+                caret: Some(prompt.caret()),
                 suffix: &prompt.completion_suffix,
+                tone: NoticeTone::Prompt,
             });
 
         let picker: Option<Picker> = self
@@ -2614,8 +2858,14 @@ impl App {
             .filter(|(_, prompt)| {
                 prompt.select_mode && !prompt.items.is_empty() || prompt.select_mode
             })
-            .map(|(_, prompt)| Picker {
+            .map(|(kind, prompt)| Picker {
                 title: &prompt.label,
+                // The command popup and its parameter stages read as ex lines;
+                // every other list is a plain `>` picker.
+                prompt: match kind {
+                    PromptKind::Command | PromptKind::Param { .. } => ": ",
+                    _ => "> ",
+                },
                 input: &prompt.text,
                 caret: prompt.caret(),
                 suffix: &prompt.completion_suffix,
@@ -2653,7 +2903,7 @@ impl App {
             config: &editor.config,
             theme,
             status,
-            command_line,
+            prompt: prompt_card,
             picker,
             completion,
             diagnostic_float,
@@ -2696,14 +2946,26 @@ impl App {
             .collect()
     }
 
-    fn palette_items(&self) -> Vec<prompt::Item> {
-        command::palette_entries()
+    /// The `:` popup's rows: every command, alphabetically, with its arguments
+    /// after the name and its parameters in the preview.
+    ///
+    /// Alphabetical because the list is a lookup — someone arriving from vim
+    /// looks under `w` for `write`, not wherever the table happened to grow.  The
+    /// fuzzy filter then narrows it as they type, so the full listing costs
+    /// nothing in speed and pays for itself in discoverability: a command nobody
+    /// knows exists is a command nobody uses.
+    fn command_items(&self) -> Vec<prompt::Item> {
+        command::listing()
             .into_iter()
-            .map(|(name, usage, help)| {
-                prompt::Item::new(format!(":{name}"))
-                    .detail(help.to_string())
-                    .preview(format!("{usage}\n{help}"))
-                    .payload(CommandPayload(name.to_string()))
+            .map(|spec| {
+                let preview = match command::param_lines(spec.params) {
+                    lines if lines.is_empty() => spec.help.to_string(),
+                    lines => format!("{}\n{}", spec.help, lines.trim_end()),
+                };
+                prompt::Item::new(format!(":{}", spec.name))
+                    .detail(command::arguments(spec.usage).to_string())
+                    .preview(preview)
+                    .payload(CommandPayload(spec.name.to_string()))
             })
             .collect()
     }

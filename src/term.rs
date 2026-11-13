@@ -438,7 +438,7 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// A printable rendering of a key event, used by `:help keys` and prompts.
+/// A printable rendering of a key event, in the kebab-case spelling `[keymap.*]` uses.
 pub fn describe_key(key: ct::event::KeyEvent) -> String {
     let mut out = String::new();
     let modifiers = key.modifiers;

@@ -30,7 +30,7 @@ pub enum Error {
 }
 
 impl Error {
-    /// A user facing message: shown in the status area instead of crashing.
+    /// A user facing message: shown on the transient card instead of crashing.
     pub fn message(msg: impl Into<String>) -> Self {
         Error::Message(msg.into())
     }
@@ -38,7 +38,8 @@ impl Error {
 
 /// Errors that are *expected* during editing (bad command, no formatter, …).
 ///
-/// These never terminate the editor; they flash a message in the status area.
+/// These never terminate the editor; they flash a message on the card over the
+/// panes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserError(pub String);
 

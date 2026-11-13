@@ -1,19 +1,18 @@
-//! The configurable status area.
+//! The configurable status row.
 //!
 //! `[status]` decides which sections appear.  Sections are rendered left to right
 //! and right to left; when the terminal is too narrow the least important sections
 //! drop out from the inside, so the mode and file name always survive.
 //!
-//! The area is `status.height` rows tall, and the very last row of the terminal is
-//! always the **message line** — the place where the mode indicator, key echoes,
-//! messages and the command line are drawn.
+//! It is one row, and it says only what is true of the buffer: messages, key
+//! echoes and prompts are transient, and they float on a card over the panes
+//! (see [`crate::ui`]) instead of borrowing this row for a moment.
 
 use std::path::Path;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
 
 use crate::config::StatusConfig;
 use crate::diagnostic::DiagnosticCount;
@@ -38,8 +37,6 @@ pub struct Snapshot {
     pub message: Option<(StatusLevel, String)>,
     pub jobs: usize,
     pub cwd: Option<String>,
-    pub read_only: bool,
-    pub insert: bool,
 }
 
 impl Snapshot {
@@ -60,8 +57,6 @@ impl Snapshot {
         };
         snapshot.file = buffer.display_name();
         snapshot.language = buffer.language.name.to_string();
-        snapshot.read_only = buffer.read_only;
-        snapshot.insert = editor.mode == crate::input::Mode::Insert;
         if buffer.is_dirty() {
             snapshot.flags.push("modified");
         }
@@ -94,7 +89,7 @@ impl Snapshot {
     }
 }
 
-/// Draw the status area (`area` covers `status.height` rows).
+/// Draw the status row.
 pub fn render(
     area: Rect,
     buf: &mut Buffer,
@@ -105,7 +100,7 @@ pub fn render(
     for row in area.rows() {
         buf.set_style(row, theme.status);
     }
-    // Row 0 carries the sections; a taller status area stays one blank block.
+    // The sections all live on the one row.
     let Some(row) = area.rows().next() else {
         return;
     };
@@ -330,71 +325,6 @@ fn truncate(text: &str, width: usize) -> String {
     shortened
 }
 
-/// Draw the message line: mode echo, pending keys, messages or the command line.
-pub fn render_message(
-    area: Rect,
-    buf: &mut Buffer,
-    snapshot: &Snapshot,
-    command_line: Option<(&str, &str, usize)>,
-    theme: &Theme,
-) {
-    for row in area.rows() {
-        // Blank the row as well as restyling it, or a shorter message leaves the
-        // previous one's characters behind.
-        for x in row.left()..row.right() {
-            buf[(x, row.y)].set_symbol(" ").set_style(theme.status);
-        }
-    }
-    let Some(y) = area.rows().next().map(|row| row.y) else {
-        return;
-    };
-    // The command line wins over everything else, vim-style.
-    if let Some((prompt, text, caret)) = command_line {
-        let mut spans = vec![Span::styled(prompt.to_string(), theme.prompt)];
-        spans.push(Span::styled(text.to_string(), theme.text));
-        // `caret` is a character index; the cursor is placed by the caller.
-        let _ = caret;
-        let _ = buf.set_line(0, y, &Line::from(spans), area.width);
-        return;
-    }
-    if !snapshot.echo.is_empty() {
-        let _ = buf.set_stringn(
-            0,
-            y,
-            snapshot.echo.clone(),
-            area.width as usize,
-            theme.prompt,
-        );
-        return;
-    }
-    if let Some((level, message)) = &snapshot.message {
-        let style = match level {
-            StatusLevel::Info => theme.status,
-            StatusLevel::Warn => theme.diagnostic_warning,
-            StatusLevel::Error => theme.diagnostic_error,
-        };
-        let prefix = match level {
-            StatusLevel::Info => "",
-            StatusLevel::Warn => "warning: ",
-            StatusLevel::Error => "error: ",
-        };
-        let _ = buf.set_stringn(
-            0,
-            y,
-            format!("{prefix}{message}"),
-            area.width as usize,
-            style,
-        );
-        return;
-    }
-    let hint = if snapshot.insert {
-        "esc to normal".to_string()
-    } else {
-        ":  commands   /  search   space p  palette".to_string()
-    };
-    let _ = buf.set_stringn(0, y, hint, area.width as usize, theme.status_inactive);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,8 +346,6 @@ mod tests {
             message: None,
             jobs: 0,
             cwd: None,
-            read_only: false,
-            insert: false,
         }
     }
 
@@ -472,28 +400,5 @@ mod tests {
         let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(!rendered.contains("12:4"), "{rendered}");
         assert!(!rendered.contains("30%"), "{rendered}");
-    }
-
-    #[test]
-    fn message_line_prefers_the_command_line_then_messages() {
-        let area = Rect::new(0, 0, 40, 1);
-        let mut buffer = Buffer::empty(area);
-        let mut snapshot = snapshot();
-        snapshot.message = Some((StatusLevel::Error, "nope".into()));
-        render_message(
-            area,
-            &mut buffer,
-            &snapshot,
-            Some(("/", "vortex", 6)),
-            &Theme::default(),
-        );
-        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-        assert!(rendered.contains("/vortex"), "{rendered}");
-        assert!(!rendered.contains("nope"), "{rendered}");
-
-        let mut buffer = Buffer::empty(area);
-        render_message(area, &mut buffer, &snapshot, None, &Theme::default());
-        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-        assert!(rendered.contains("error: nope"), "{rendered}");
     }
 }

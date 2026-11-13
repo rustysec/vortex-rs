@@ -280,8 +280,6 @@ impl EditorConfig {
 pub struct StatusConfig {
     /// `"top"` or `"bottom"`.
     pub position: StatusPosition,
-    /// Number of rows the status area occupies.
-    pub height: u16,
     pub show_mode: bool,
     /// Show the label (name) of the focused text pane.
     pub show_pane_name: bool,
@@ -298,7 +296,6 @@ impl Default for StatusConfig {
     fn default() -> Self {
         Self {
             position: StatusPosition::default(),
-            height: 1,
             show_mode: true,
             show_pane_name: true,
             show_diagnostics: true,
@@ -734,7 +731,7 @@ impl Config {
                     T::try_from(number).map_err(|_| format!("{key} is out of range: {number}"))
                 }
                 // `1` and `0` read as booleans above, and are perfectly good
-                // values for `:set status.height=1`.
+                // values for `:set layout.min-width=1`.
                 Parsed::Bool(flag) => T::try_from(u64::from(flag))
                     .map_err(|_| format!("{key} is out of range: {flag}")),
                 _ => Err(format!("{key} expects a number")),
@@ -830,7 +827,6 @@ impl Config {
                     }
                 }
             }
-            "status.height" => self.status.height = number(key, value)?,
             "status.show-mode" => self.status.show_mode = boolean(key, value)?,
             "status.show-pane-name" => self.status.show_pane_name = boolean(key, value)?,
             "status.show-diagnostics" => self.status.show_diagnostics = boolean(key, value)?,
@@ -873,9 +869,6 @@ impl Config {
             "editor.tab-width" if !(1..=32).contains(&self.editor.tab_width) => {
                 return Err("editor.tab-width must be between 1 and 32".into());
             }
-            "status.height" if !(1..=6).contains(&self.status.height) => {
-                return Err("status.height must be between 1 and 6".into());
-            }
             "layout.min-height" if self.layout.min_height < 1 => {
                 return Err("layout.min-height must be at least 1".into());
             }
@@ -915,7 +908,6 @@ impl Config {
             "layout.min-height" => self.layout.min_height.to_string(),
             "layout.min-width" => self.layout.min_width.to_string(),
             "status.position" => format!("{:?}", self.status.position).to_lowercase(),
-            "status.height" => self.status.height.to_string(),
             "status.show-mode" => on_off(self.status.show_mode),
             "status.show-pane-name" => on_off(self.status.show_pane_name),
             "status.show-diagnostics" => on_off(self.status.show_diagnostics),
@@ -949,9 +941,6 @@ impl Config {
         if self.editor.tab_width == 0 || self.editor.tab_width > 32 {
             warnings.push("editor.tab-width must be between 1 and 32".into());
         }
-        if self.status.height == 0 || self.status.height > 6 {
-            warnings.push("status.height must be between 1 and 6".into());
-        }
         if !(0.05..=0.95).contains(&self.layout.golden_ratio) {
             warnings.push("layout.golden-ratio must be between 0.05 and 0.95".into());
         }
@@ -964,14 +953,17 @@ impl Config {
         if self.layout.min_width < 4 {
             warnings.push("layout.min-width should be at least 4".into());
         }
-        for (mode, bindings) in &self.keymap {
-            let Some(mode) = crate::input::mode_from_name(mode) else {
+        for (section, bindings) in &self.keymap {
+            // Every resolution context is a legal section name, `operator`
+            // included: `[keymap.operator]` binds the keys an operator waits for
+            // its motion, which is a thing of its own even though it is not a mode.
+            let Some(context) = crate::input::KeyContext::from_name(section) else {
                 warnings.push(format!(
-                    "unknown keymap section [keymap.{mode}] (expected normal, insert, visual or command)"
+                    "unknown keymap section [keymap.{section}] (expected normal, insert, visual, operator or command)"
                 ));
                 continue;
             };
-            let name = crate::input::mode_name(mode);
+            let name = context.name();
             for (keys, action) in bindings {
                 if keys.trim().is_empty() {
                     warnings.push(format!("[keymap.{name}] contains an empty key"));
@@ -1081,7 +1073,7 @@ fn is_free_form(path: &str) -> bool {
 }
 
 impl Config {
-    /// Drop a user binding so the built-in one shows through again.
+    /// Drop a binding line from the configuration.
     ///
     /// `context` is the keymap section (`normal`, `insert`, …) and `lhs` the key
     /// sequence exactly as written in the TOML file.
@@ -1115,9 +1107,11 @@ mod tests {
     fn example_config_agrees_with_the_defaults() {
         // config.example.toml is documentation, so every value it spells out has
         // to be the value the code really defaults to.  Compared key by key so
-        // the free-form tables (`[keymap.*]`, `[format.command]`,
-        // `[lsp.servers]`), which the file documents with commented-out
-        // examples, are skipped instead of reported as drift.
+        // the free-form tables (`[format.command]`, `[lsp.servers]`), which the
+        // file documents with commented-out examples, are skipped instead of
+        // reported as drift — and `[keymap.*]` with them: vortex binds nothing
+        // itself, so what the starter spells out is a choice it makes *for* you,
+        // not a default it would apply anyway.
         let (_config, warnings) = Config::parse(Config::default_config_text()).expect("parses");
         assert!(warnings.is_empty(), "unknown keys: {warnings:?}");
 
@@ -1138,12 +1132,16 @@ mod tests {
     }
 
     /// Parse a serialised config, dropping empty tables so that free-form maps
-    /// (`[keymap.*]`, `[format.command]`, `[lsp.servers]`) documented with
-    /// commented-out examples do not read as drift.
+    /// (`[format.command]`, `[lsp.servers]`) documented with commented-out
+    /// examples do not read as drift, and the keymap along with them.
     fn value_of(text: &str) -> toml::Value {
         fn prune(value: toml::Value) -> toml::Value {
             match value {
                 toml::Value::Table(mut table) => {
+                    // Bindings are the user's own doing; the starter spells them
+                    // out, an unconfigured editor has none of them, and neither
+                    // is drift.
+                    table.remove("keymap");
                     for (_, child) in table.iter_mut() {
                         *child = prune(child.clone());
                     }
@@ -1215,8 +1213,8 @@ mod tests {
         assert_eq!(config.editor.line_number, LineNumber::Absolute);
 
         // Numbers that happen to be 0 or 1 are still numbers.
-        config.set_value("status.height", "1").expect("sets");
-        assert_eq!(config.status.height, 1);
+        config.set_value("layout.min-height", "1").expect("sets");
+        assert_eq!(config.layout.min_height, 1);
         config.set_value("editor.scroll-margin", "0").expect("sets");
         assert_eq!(config.editor.scroll_margin, 0);
         config.set_value("editor.tab-width", "2").expect("sets");

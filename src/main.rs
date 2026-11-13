@@ -184,7 +184,7 @@ fn check_config(explicit: Option<&Path>) -> Result<ExitCode> {
     let mut problems = Vec::new();
     for (key, value) in [
         ("editor.tab-width", "4"),
-        ("status.height", "1"),
+        ("layout.min-width", "12"),
         ("layout.split-mode", "golden"),
     ] {
         if let Err(error) = probe.set_value(key, value) {

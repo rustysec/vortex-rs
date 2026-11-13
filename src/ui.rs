@@ -21,7 +21,7 @@ use crate::action::VisualKind;
 use crate::buffer::Buffer as TextBuffer;
 use crate::config::{BorderStyle, Config, LineNumber};
 use crate::diagnostic::{Diagnostic, DiagnosticTag, Severity};
-use crate::editor::Editor;
+use crate::editor::{Editor, StatusLevel};
 use crate::prompt;
 use crate::selection::{Selection, Span};
 use crate::status::{self, Snapshot};
@@ -33,20 +33,43 @@ use crate::theme::Theme;
 /// is meant to explain.
 const MAX_PREVIEW_ROWS: usize = 6;
 
-/// The command line drawn on the message row.
+/// Transient text drawn on a card over the panes: an open prompt, a message or
+/// the echo of a partial key sequence.
+///
+/// This replaces the command row the status area used to carry.  One type covers
+/// all three because they are the same thing on screen — one line of text that is
+/// true only for this moment — and because drawing them in one place is what
+/// keeps the status row from ever being overwritten.
 #[derive(Debug, Clone, Copy)]
-pub struct CommandLine<'a> {
+pub struct Notice<'a> {
+    /// Label drawn before the text: a prompt's `:` or `/`, empty for a message.
     pub prompt: &'a str,
     pub text: &'a str,
-    /// Caret as a character index into `text`.
-    pub caret: usize,
+    /// Caret as a character index into `text`; `Some` means the card is being
+    /// typed into, so the terminal cursor goes there.
+    pub caret: Option<usize>,
     /// Ghost text from tab completion, drawn dimmed after the caret.
     pub suffix: &'a str,
+    /// How the text is coloured — a message's severity, or prompt styling.
+    pub tone: NoticeTone,
+}
+
+/// Colouring of a [`Notice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeTone {
+    Prompt,
+    Info,
+    Warn,
+    Error,
 }
 
 /// A fuzzy picker drawn over the panes.
 pub struct Picker<'a> {
     pub title: &'a str,
+    /// Drawn before the typed text: `:` while a command or one of its parameters
+    /// is being written, `>` for every other list.  The ex-style glyph is what
+    /// makes the `:` popup read like the line it replaced.
+    pub prompt: &'a str,
     pub input: &'a str,
     pub caret: usize,
     pub suffix: &'a str,
@@ -74,7 +97,8 @@ pub struct Screen<'a> {
     pub config: &'a Config,
     pub theme: &'a Theme,
     pub status: Snapshot,
-    pub command_line: Option<CommandLine<'a>>,
+    /// The prompt being typed into, if one is open.
+    pub prompt: Option<Notice<'a>>,
     pub picker: Option<Picker<'a>>,
     pub completion: Option<CompletionView<'a>>,
     pub diagnostic_float: Option<DiagnosticFloat<'a>>,
@@ -82,23 +106,56 @@ pub struct Screen<'a> {
     pub hover: Option<&'a str>,
 }
 
-/// Split the terminal into status area, pane area and the message line.
+impl<'a> Screen<'a> {
+    /// The one transient line this frame has to show, if it has one.
+    ///
+    /// A prompt being typed into wins over everything, then the echo of a key
+    /// sequence that is still waiting for its rest, then a message.  They cannot
+    /// genuinely overlap — typing a key dismisses a message — but the order says
+    /// which one does if they ever do, and it is the order that put the newest,
+    /// most actionable text on top.
+    pub fn notice(&self) -> Option<Notice<'_>> {
+        if let Some(prompt) = &self.prompt {
+            return Some(Notice {
+                prompt: prompt.prompt,
+                text: prompt.text,
+                caret: prompt.caret,
+                suffix: prompt.suffix,
+                tone: prompt.tone,
+            });
+        }
+        if !self.status.echo.is_empty() {
+            return Some(Notice {
+                prompt: "",
+                text: &self.status.echo,
+                caret: None,
+                suffix: "",
+                tone: NoticeTone::Prompt,
+            });
+        }
+        let (level, message) = self.status.message.as_ref()?;
+        Some(Notice {
+            prompt: "",
+            text: message,
+            caret: None,
+            suffix: "",
+            tone: match level {
+                StatusLevel::Info => NoticeTone::Info,
+                StatusLevel::Warn => NoticeTone::Warn,
+                StatusLevel::Error => NoticeTone::Error,
+            },
+        })
+    }
+}
+
+/// Split the terminal into the status row and the panes.
 ///
-/// The last row of the screen is always the message line, wherever `[status]
-/// position` puts the status area.
-pub fn areas(area: Rect, config: &Config) -> (Rect, Rect, Rect) {
-    let status_height = config
-        .status
-        .height
-        .clamp(1, 6)
-        .min(area.height.saturating_sub(1));
-    let message = Rect {
-        x: area.x,
-        y: area.bottom().saturating_sub(1),
-        width: area.width,
-        height: 1.min(area.height),
-    };
-    let panes_height = area.height.saturating_sub(1 + status_height);
+/// The status area is exactly one row — there is no command or message row of
+/// its own any more.  Everything transient (messages, key echoes, prompts) is
+/// drawn on a card floating over the panes, so the row never has to be cleared
+/// and restored, and `[status] position` only decides which edge it sits on.
+pub fn areas(area: Rect, config: &Config) -> (Rect, Rect) {
+    let status_height = 1.min(area.height);
     if config.status.position.is_top() {
         (
             Rect {
@@ -111,15 +168,14 @@ pub fn areas(area: Rect, config: &Config) -> (Rect, Rect, Rect) {
                 x: area.x,
                 y: area.y + status_height,
                 width: area.width,
-                height: panes_height,
+                height: area.height.saturating_sub(status_height),
             },
-            message,
         )
     } else {
         (
             Rect {
                 x: area.x,
-                y: area.y + panes_height,
+                y: area.bottom().saturating_sub(status_height),
                 width: area.width,
                 height: status_height,
             },
@@ -127,9 +183,8 @@ pub fn areas(area: Rect, config: &Config) -> (Rect, Rect, Rect) {
                 x: area.x,
                 y: area.y,
                 width: area.width,
-                height: panes_height,
+                height: area.height.saturating_sub(status_height),
             },
-            message,
         )
     }
 }
@@ -137,7 +192,7 @@ pub fn areas(area: Rect, config: &Config) -> (Rect, Rect, Rect) {
 /// Draw one frame; the return value is where the terminal cursor should sit.
 pub fn draw(frame: &mut Frame, screen: &Screen) -> Option<Position> {
     let area = frame.area();
-    let (status_area, pane_area, message_area) = areas(area, screen.config);
+    let (status_area, pane_area) = areas(area, screen.config);
     let buf = frame.buffer_mut();
     buf.set_style(area, screen.theme.text);
 
@@ -150,14 +205,19 @@ pub fn draw(frame: &mut Frame, screen: &Screen) -> Option<Position> {
         &screen.status,
         screen.theme,
     );
-    let command = screen
-        .command_line
-        .as_ref()
-        .map(|line| (line.prompt, line.text, line.caret));
-    status::render_message(message_area, buf, &screen.status, command, screen.theme);
 
-    if let Some(line) = screen.command_line {
-        cursor = Some(command_line_cursor(message_area, &line));
+    // Transient text — a message or the echo of a partial key sequence — floats on
+    // a card over the panes.  The status row keeps its own contents whatever
+    // happens, which is the point of not having a command row: nothing has to be
+    // cleared and restored, and the file you are reading is only ever covered for
+    // as long as the message lasts.  It sits against the status row, except while
+    // a list card is open — those grow up from there — when it moves to the far
+    // edge of the panes so a warning is not buried under the thing that caused it.
+    if let Some(card) = screen.notice() {
+        let anchor_top = screen.picker.is_some() || screen.config.status.position.is_top();
+        if let Some(position) = draw_notice(buf, pane_area, &card, anchor_top, screen.theme) {
+            cursor = Some(position);
+        }
     }
     if let Some(picker) = &screen.picker {
         if let Some(position) = draw_picker(buf, area, picker, screen.theme) {
@@ -167,8 +227,7 @@ pub fn draw(frame: &mut Frame, screen: &Screen) -> Option<Position> {
     if let Some(completion) = &screen.completion {
         // The popup hangs off the caret, so it needs the position the panes
         // just computed; without one (no focused pane) there is nowhere to put
-        // it.  It is clipped to the pane area so it never covers the status or
-        // message rows.
+        // it.  It is clipped to the pane area so it never covers the status row.
         if let Some(anchor) = cursor {
             draw_completion(buf, pane_area, anchor, completion, screen.theme);
         }
@@ -229,10 +288,10 @@ fn draw_welcome(buf: &mut Buffer, area: Rect, screen: &Screen) {
         "",
         "a modal, async code editor",
         "",
-        ":edit <file>    open a file",
-        "space f         find a file in the project",
-        ":grep <text>    search the project",
-        ":help           list commands",
+        "no keys are bound until your config binds them",
+        "vortex --write-config   the vim starter, to edit",
+        ":edit <file>            open a file",
+        ":help                   list commands",
     ];
     let start = area.y + area.height.saturating_sub(LINES.len() as u16) / 2;
     for (index, line) in LINES.iter().enumerate() {
@@ -1143,12 +1202,79 @@ pub fn pane_content(area: Rect, config: &Config) -> Rect {
 
 // ------------------------------------------------------------------ overlays
 
-fn command_line_cursor(area: Rect, line: &CommandLine) -> Position {
-    let prompt_width = line.prompt.chars().count() as u16;
-    Position {
-        x: area.x + (prompt_width + line.caret as u16).min(area.width.saturating_sub(1)),
-        y: area.y,
+/// Draw one transient line — a prompt, an echo or a message — on a card pinned
+/// to the bottom of the panes (or the top when `[status] position = "top"`).
+///
+/// The card is one row tall inside its border: this text is read in a glance, and
+/// a taller box would cover the file for no reason.  It is as wide as the text
+/// needs up to most of the pane, so a long path or error still reads in one
+/// piece while a short "42 lines yanked" leaves the buffer visible around it.
+/// The return value is where the terminal cursor goes: inside the card when the
+/// user is typing into it, nowhere otherwise.
+fn draw_notice(
+    buf: &mut Buffer,
+    pane_area: Rect,
+    notice: &Notice,
+    anchor_top: bool,
+    theme: &Theme,
+) -> Option<Position> {
+    if pane_area.width < 8 || pane_area.height < 3 {
+        return None;
     }
+    let body = format!("{}{}{}", notice.prompt, notice.text, notice.suffix);
+    let wanted = body.chars().count() + 6;
+    let width = (wanted as u16)
+        .min(pane_area.width.saturating_sub(2).max(8))
+        .max(12.min(pane_area.width));
+    let height = 3.min(pane_area.height);
+    // The card sits against the status row, wherever `[status] position` put it.
+    let top_of_card = if anchor_top {
+        pane_area.y
+    } else {
+        pane_area.bottom().saturating_sub(height)
+    };
+    let area = Rect {
+        x: pane_area.x + pane_area.width.saturating_sub(width) / 2,
+        y: top_of_card,
+        width,
+        height,
+    };
+    draw_card(buf, area, theme);
+
+    let style = match notice.tone {
+        NoticeTone::Prompt => theme.prompt,
+        NoticeTone::Info => theme.text,
+        NoticeTone::Warn => theme.diagnostic_warning,
+        NoticeTone::Error => theme.diagnostic_error,
+    };
+    let text_x = area.x + 2;
+    let limit = area.right().saturating_sub(text_x) as usize;
+    let row = area.y + 1;
+    for column in (area.x + 1)..area.right().saturating_sub(1) {
+        buf[(column, row)].set_style(style);
+    }
+    emit(buf, text_x, row, notice.prompt, theme.prompt, 0, limit);
+    let typed = notice.prompt.chars().count();
+    emit(buf, text_x, row, notice.text, style, typed, limit);
+    if !notice.suffix.is_empty() {
+        emit(
+            buf,
+            text_x,
+            row,
+            notice.suffix,
+            theme.status_inactive,
+            typed + notice.text.chars().count(),
+            limit,
+        );
+    }
+
+    // Only a prompt has a caret; a message is read, not edited.
+    let caret = notice.caret?;
+    let column = text_x as usize + typed + caret.min(limit);
+    Some(Position {
+        x: (column as u16).min(area.right().saturating_sub(1)),
+        y: row,
+    })
 }
 
 /// Draw a fuzzy picker as a bordered box over the panes.
@@ -1174,17 +1300,17 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         .map(|text| wrap_preview(text, width.saturating_sub(4), max_preview))
         .unwrap_or_default();
     let preview_rows = preview_lines.len();
-    // Leave room for the status and message rows at the bottom, and for the
-    // preview when there is one.
+    // Leave room for the status row at the bottom, and for the preview when
+    // there is one.
     let list_rows = picker
         .visible
         .len()
-        .min((screen.height as usize).saturating_sub(8 + preview_rows))
+        .min((screen.height as usize).saturating_sub(7 + preview_rows))
         .max(1);
-    let height = (list_rows + 4 + preview_rows).min(screen.height as usize - 2);
+    let height = (list_rows + 4 + preview_rows).min(screen.height.saturating_sub(1) as usize);
     let area = Rect {
         x: screen.x + screen.width.saturating_sub(width as u16) / 2,
-        y: screen.y + screen.height.saturating_sub(height as u16 + 2),
+        y: screen.y + screen.height.saturating_sub(height as u16 + 1),
         width: width as u16,
         height: height as u16,
     };
@@ -1225,10 +1351,19 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         theme.label_focused,
     );
 
-    // Input row.
+    // Input row.  The glyph is the prompt itself — `:` for a command or one of
+    // its parameters, `>` for a plain list — so the popup reads as the line it
+    // replaced rather than as a search box.
     let input_y = area.y + 1;
-    buf.set_stringn(area.x + 2, input_y, "> ", 2, theme.prompt);
-    let text_x = area.x + 4;
+    let glyph_width = picker.prompt.chars().count() as u16 + 1;
+    buf.set_stringn(
+        area.x + 2,
+        input_y,
+        picker.prompt,
+        glyph_width as usize,
+        theme.prompt,
+    );
+    let text_x = area.x + 2 + glyph_width;
     let limit = area.right().saturating_sub(text_x) as usize;
     emit(buf, text_x, input_y, picker.input, theme.text, 0, limit);
     let typed = picker.input.chars().count();
@@ -1366,7 +1501,7 @@ fn draw_card(buf: &mut Buffer, area: Rect, theme: &Theme) {
 /// Draw the completion popup hanging off the caret.
 ///
 /// It opens below the caret when there is room and above it otherwise, and is
-/// clipped to the pane area so it never covers the status or message rows.
+/// clipped to the pane area so it never covers the status row or the cards on it.
 fn draw_completion(
     buf: &mut Buffer,
     screen: Rect,
@@ -1693,13 +1828,13 @@ mod tests {
             config,
             theme: &theme,
             status: snapshot,
-            command_line: None,
+            prompt: None,
             picker: None,
             completion: None,
             diagnostic_float: None,
             hover: None,
         };
-        let (status_area, pane_area, message_area) = areas(area, config);
+        let (status_area, pane_area) = areas(area, config);
         buffer.set_style(area, theme.text);
         let cursor = draw_panes(&mut buffer, pane_area, &screen);
         status::render(
@@ -1709,7 +1844,6 @@ mod tests {
             &screen.status,
             &theme,
         );
-        status::render_message(message_area, &mut buffer, &screen.status, None, &theme);
         (buffer, cursor)
     }
 
@@ -1735,21 +1869,23 @@ mod tests {
     }
 
     #[test]
-    fn areas_reserve_the_message_row_and_status_rows() {
+    fn one_status_row_and_the_panes_take_the_rest() {
+        // There is no command row any more: transient text floats on a card, so
+        // the panes get every row the status area does not.
         let config = Config::default();
         let area = Rect::new(0, 0, 80, 24);
-        let (status_area, pane_area, message) = areas(area, &config);
-        assert_eq!(status_area.height, config.status.height);
-        assert_eq!(message.y, 23);
-        assert_eq!(pane_area.height, 24 - 1 - status_area.height);
-        assert_eq!(pane_area.y, 0, "status sits above the message line");
+        let (status_area, pane_area) = areas(area, &config);
+        assert_eq!(status_area.height, 1);
+        assert_eq!(status_area.y, 23, "the status row sits at the bottom");
+        assert_eq!(pane_area.y, 0);
+        assert_eq!(pane_area.height, 23);
 
         let mut top = Config::default();
         top.status.position = crate::config::StatusPosition::Top;
-        let (status_area, pane_area, message) = areas(area, &top);
+        let (status_area, pane_area) = areas(area, &top);
         assert_eq!(status_area.y, 0);
         assert_eq!(pane_area.y, status_area.height);
-        assert_eq!(message.y, 23);
+        assert_eq!(pane_area.height, 23);
     }
 
     #[test]
@@ -1867,13 +2003,13 @@ mod tests {
             config: &config,
             theme: &theme,
             status: snapshot,
-            command_line: None,
+            prompt: None,
             picker: None,
             completion: None,
             diagnostic_float: Some(DiagnosticFloat { diagnostic }),
             hover: None,
         };
-        let (_, pane_area, _) = areas(area, &config);
+        let (_, pane_area) = areas(area, &config);
         draw_panes(&mut buffer, pane_area, &screen);
         // The float hangs off the caret, which the panes just placed.
         let anchor = Position { x: 3, y: 1 };
@@ -1960,7 +2096,7 @@ mod tests {
         let mut config = Config::default();
         config.editor.wrap = true;
         let area = Rect::new(0, 0, 40, 8);
-        let (_, pane_area, _) = areas(area, &config);
+        let (_, pane_area) = areas(area, &config);
         let content_width = pane_area.width as usize - 2 - 3;
         let rows = visual_rows(
             editor.buffer(BufferId(1)).unwrap(),
@@ -2000,6 +2136,96 @@ mod tests {
     }
 
     #[test]
+    fn a_message_floats_on_a_card_and_leaves_the_status_row_alone() {
+        // The old two-row area overwrote whatever the status line said with each
+        // message and had to restore it afterwards.  A card cannot do that, which
+        // is the point: the row keeps reporting the buffer while a message is up.
+        let editor = editor_with("alpha\nbeta\n");
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buffer = Buffer::empty(area);
+        let config = Config::default();
+        let theme = Theme::default();
+        let mut snapshot = Snapshot::collect(&editor, None, std::path::Path::new("/tmp"));
+        snapshot.message = Some((StatusLevel::Info, "42 lines yanked".into()));
+        let screen = Screen {
+            editor: &editor,
+            config: &config,
+            theme: &theme,
+            status: snapshot,
+            prompt: None,
+            picker: None,
+            completion: None,
+            diagnostic_float: None,
+            hover: None,
+        };
+
+        let (status_area, pane_area) = areas(area, &config);
+        draw_panes(&mut buffer, pane_area, &screen);
+        let notice = screen.notice().expect("the message is the notice");
+        assert_eq!(notice.tone, NoticeTone::Info);
+        assert_eq!(notice.caret, None, "a message is read, not edited");
+        // No caret: a message takes no input, so the terminal cursor stays on the
+        // text it belongs to rather than jumping into the card.
+        assert_eq!(
+            draw_notice(&mut buffer, pane_area, &notice, false, &theme),
+            None
+        );
+        status::render(
+            status_area,
+            &mut buffer,
+            &config.status,
+            &screen.status,
+            &theme,
+        );
+
+        let rendered = frame_text(&buffer);
+        assert!(rendered.contains("42 lines yanked"), "{rendered}");
+        // The status row still reports the buffer, untouched by the card above it.
+        let status_row = row_text(&buffer, 11);
+        assert!(status_row.contains("*scratch*"), "{status_row:?}");
+    }
+
+    #[test]
+    fn a_prompt_card_carries_the_caret_and_beats_a_message() {
+        // Typing into the popup is the newest thing on screen; a stale message
+        // must not win the row over it.
+        let editor = editor_with("alpha\n");
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buffer = Buffer::empty(area);
+        let config = Config::default();
+        let theme = Theme::default();
+        let mut snapshot = Snapshot::collect(&editor, None, std::path::Path::new("/tmp"));
+        snapshot.message = Some((StatusLevel::Warn, "older news".into()));
+        let screen = Screen {
+            editor: &editor,
+            config: &config,
+            theme: &theme,
+            status: snapshot,
+            prompt: Some(Notice {
+                prompt: "/",
+                text: "vortex",
+                caret: Some(6),
+                suffix: "",
+                tone: NoticeTone::Prompt,
+            }),
+            picker: None,
+            completion: None,
+            diagnostic_float: None,
+            hover: None,
+        };
+
+        let notice = screen.notice().expect("the prompt is the notice");
+        assert_eq!(notice.text, "vortex", "the message waits its turn");
+        let (_, pane_area) = areas(area, &config);
+        let caret = draw_notice(&mut buffer, pane_area, &notice, false, &theme).expect("a caret");
+        let rendered = frame_text(&buffer);
+        assert!(rendered.contains("/vortex"), "{rendered}");
+        assert!(!rendered.contains("older news"), "{rendered}");
+        // The cursor lands after the six characters typed.
+        assert_eq!(caret.y, pane_area.bottom() - 2);
+    }
+
+    #[test]
     fn picker_renders_title_and_candidates() {
         let area = Rect::new(0, 0, 60, 20);
         let mut buffer = Buffer::empty(area);
@@ -2009,6 +2235,7 @@ mod tests {
             prompt::Item::new("src/lib.rs").detail("rust"),
         ];
         let picker = Picker {
+            prompt: "> ",
             title: "find",
             input: "ma",
             caret: 2,
@@ -2036,6 +2263,7 @@ mod tests {
             prompt::Item::new(":quit").preview(":q\nleave the editor"),
         ];
         let picker = Picker {
+            prompt: "> ",
             title: "palette",
             input: "",
             caret: 0,
@@ -2062,6 +2290,7 @@ mod tests {
             prompt::Item::new(":quit").preview("leave the editor"),
         ];
         let picker = Picker {
+            prompt: "> ",
             title: "palette",
             input: "",
             caret: 0,
@@ -2086,6 +2315,7 @@ mod tests {
             .collect();
         let visible: Vec<usize> = (0..10).collect();
         let picker = Picker {
+            prompt: "> ",
             title: "find",
             input: "",
             caret: 0,
@@ -2143,6 +2373,7 @@ mod tests {
             .collect();
         let visible: Vec<usize> = (0..500).collect();
         let picker = Picker {
+            prompt: "> ",
             title: "grep",
             input: "vortex",
             caret: 6,
@@ -2181,6 +2412,7 @@ mod tests {
         }
         let items = vec![prompt::Item::new("only/one.rs")];
         let picker = Picker {
+            prompt: "> ",
             title: "find",
             input: "",
             caret: 0,
@@ -2306,7 +2538,7 @@ mod tests {
             config: &config,
             theme: &theme,
             status: Snapshot::default(),
-            command_line: None,
+            prompt: None,
             picker: None,
             completion: None,
             diagnostic_float: None,

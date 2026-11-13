@@ -16,7 +16,7 @@ import tempfile
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ptyui import Pty, clean_config, color_report  # noqa: E402
+from ptyui import Pty, color_report, starter_config  # noqa: E402
 
 SOURCE = """fn  main() {
     // note the numbers
@@ -44,7 +44,7 @@ def run(binary, label, answer_colors):
         with open(target, "w") as handle:
             handle.write(SOURCE)
         app = Pty(
-            binary, project, target, extra_args=clean_config(project), answer_colors=answer_colors
+            binary, project, target, extra_args=starter_config(project, binary), answer_colors=answer_colors
         )
         app.keys(b"", 1.2)
         raw = app.raw
@@ -114,7 +114,7 @@ def run_late_answer(binary):
         target = os.path.join(project, "notes.txt")
         with open(target, "w") as handle:
             handle.write("hello\n")
-        app = LatePty(binary, project, target, extra_args=clean_config(project))
+        app = LatePty(binary, project, target, extra_args=starter_config(project, binary))
         app.keys(b"i", 0.3)
         app.keys(b"world ", 0.4)
         app.keys(b"\x1b", 0.3)

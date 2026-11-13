@@ -30,9 +30,9 @@ use crate::selection::{Dir, Selection, Span};
 /// A request for the app layer to act on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
-    /// Show a message in the status area.
+    /// Show a message on the transient card over the panes.
     Message(StatusLevel, String),
-    /// Open a prompt (command line, search, picker).
+    /// Open a prompt (the `:` popup, search, picker).
     OpenPrompt(PromptSpec),
     /// Run an ex command line straight away (a keybound `":bnext"`-style action).
     RunCommand(String),
@@ -586,13 +586,6 @@ impl Editor {
     }
 
     /// Leave visual mode without touching anything else.
-    /// Leave insert mode without inserting anything (Ctrl-C).
-    pub fn leave_insert(&mut self) {
-        if self.mode == Mode::Insert {
-            self.exit_insert();
-        }
-    }
-
     pub fn leave_visual(&mut self) {
         if self.mode.is_visual() {
             self.mode = Mode::Normal;
@@ -758,10 +751,19 @@ impl Editor {
             }
             Lookup::Unknown => {
                 if self.mode == Mode::Insert {
+                    // Writing text is not a binding: an unbound key still types,
+                    // deletes or steps, so a configuration with no
+                    // `[keymap.insert]` at all can still write.  A line that
+                    // claims one of these keys wins — this branch only runs when
+                    // the insert keymap had no answer.
                     if let Some(text) = insertable(key) {
                         self.pending.clear_keys();
                         self.insert_typed(&text);
                         return vec![Intent::EnsureVisible];
+                    }
+                    if let Some(action) = crate::input::typing_core(key) {
+                        let pressed = std::mem::take(&mut self.pending.keys);
+                        return self.dispatch(action, &pressed, area);
                     }
                 }
                 let pressed: Vec<KeyEvent> = std::mem::take(&mut self.pending.keys);
@@ -991,7 +993,7 @@ impl Editor {
     /// measuring the terminal instead lets the cursor walk off screen while the
     /// editor still counts it as visible.
     pub fn focused_area(&self, area: Rect) -> Rect {
-        let (_status, panes, _message) = crate::ui::areas(area, &self.config);
+        let (_status, panes) = crate::ui::areas(area, &self.config);
         let Some(focused) = self.layout.focused() else {
             return panes;
         };
@@ -2481,8 +2483,12 @@ impl Editor {
     }
 
     /// Area available for panes inside the terminal.
+    ///
+    /// The status row is one row wherever `[status] position` puts it, and there
+    /// is no command row any more — transient text floats over the panes on a
+    /// card instead of taking a row of its own.
     pub fn text_area(&self, area: Rect) -> Rect {
-        let status = self.config.status.height.min(6).min(area.height);
+        let status = 1.min(area.height);
         if self.config.status.position.is_top() {
             Rect {
                 y: area.y + status,
@@ -3542,10 +3548,21 @@ impl Editor {
 mod tests {
     use super::*;
 
-    /// An editor with one in-memory buffer shown in a pane.
-    /// A user binding that extends a built-in key must not disable it.
+    /// The vim-style starter configuration `vortex --write-config` ships.
+    ///
+    /// Vortex binds nothing itself, so a test that types `w` or `d` has to ask
+    /// for those keys the way any user does — reading the shipped starter is also
+    /// the check that it really does bind what the tests (and people) expect.
+    fn starter() -> Config {
+        let (config, warnings) = Config::parse(Config::default_config_text())
+            .expect("the shipped starter configuration parses");
+        assert!(warnings.is_empty(), "starter config warnings: {warnings:?}");
+        config
+    }
+
+    /// A user binding that extends a starter key must not disable it.
     fn fixture_with_wd(text: &str) -> Fixture {
-        let mut config = Config::default();
+        let mut config = starter();
         config
             .keymap
             .entry("normal".to_string())
@@ -3643,6 +3660,8 @@ mod tests {
         );
     }
 
+    /// An editor with one in-memory buffer shown in a pane, driven by keys the
+    /// way the app drives it.
     struct Fixture {
         editor: Editor,
         keymaps: Keymaps,
@@ -3651,7 +3670,7 @@ mod tests {
 
     impl Fixture {
         fn new(text: &str) -> Self {
-            Self::with_config(text, Config::default())
+            Self::with_config(text, starter())
         }
 
         fn with_config(text: &str, config: Config) -> Self {
@@ -3769,7 +3788,7 @@ mod tests {
 
     #[test]
     fn auto_pairs_can_be_turned_off() {
-        let mut config = Config::default();
+        let mut config = starter();
         config.editor.auto_match_pairs = false;
         let mut fixture = Fixture::with_config("\n", config);
         fixture.feed("i(");

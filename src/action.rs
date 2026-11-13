@@ -370,7 +370,7 @@ impl From<Cmd> for Action {
     }
 }
 
-/// `name, action, help` — the registry used by the keymap, `:help keys` and tests.
+/// `name, action, help` — the registry used by the keymap, `vortex --list-actions` and tests.
 pub const ACTIONS: &[(&str, Action, &str)] = &[
     // ---- motions ----
     ("move-left", Action::motion(Motion::Left), "move left"),
@@ -817,7 +817,7 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
     (
         "command-palette",
         Action::Cmd(Cmd::CommandPalette),
-        "command palette",
+        "list every command",
     ),
     // ---- layout ----
     (
@@ -1119,7 +1119,7 @@ pub fn name_for(action: &Action) -> Option<&'static str> {
         .map(|(name, _, _)| *name)
 }
 
-/// `name<TAB>description` lines for `:help keys`.
+/// `name<TAB>description` lines for the action listing (`vortex --list-actions`).
 pub fn help_lines() -> Vec<String> {
     ACTIONS
         .iter()

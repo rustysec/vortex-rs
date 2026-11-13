@@ -7,7 +7,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ptyui import Pty, clean_config
+from ptyui import Pty, starter_config
 
 FAILURES = []
 
@@ -39,7 +39,7 @@ def main():
     with open(os.path.join(project, "other.md"), "w") as handle:
         handle.write("# other\n\nvortex is here\n")
 
-    app = Pty(binary, project, target, extra_args=clean_config(project))
+    app = Pty(binary, project, target, extra_args=starter_config(project, binary))
     screen = app.screen.dump()
     check("opens the file in a pane", "notes.txt" in screen and "alpha bravo" in screen, screen)
     check("status area reports normal mode", "NORMAL" in screen, screen)
@@ -180,11 +180,62 @@ def main():
 
     # Fuzzy file picker.
     app.keys(b" ", 0.3)
-    app.keys(b"p", 0.6)  # space p opens the palette
+    app.keys(b"p", 0.6)  # space p opens the command popup
     body = app.repaint().dump()
     # The overlay reports how many actions match, which only a live picker does.
-    check("space p opens the palette", re.search(r"\d+/\d+ match", body) is not None, body)
-    app.keys(b"\x1b")
+    check("space p opens the command popup", re.search(r"\d+/\d+ match", body) is not None, body)
+    # Every command listed alphabetically, so the list is a lookup: `bdelete`
+    # sorts first and its argument shape rides along dimmed after the name.
+    check(
+        "the popup lists commands alphabetically with their arguments",
+        ":bdelete" in body
+        and "<name>" in body
+        and 0 < body.index(":bdelete") < body.index(":grep"),
+        body,
+    )
+    app.keys(b"wri", 0.5)
+    body = app.repaint().dump()
+    check(
+        "typing narrows the list to what it could mean",
+        ":write" in body and ":bdelete" not in body,
+        body,
+    )
+    # A word that names a command runs as written: `:enew` takes an empty answer
+    # for its optional path rather than stepping into a question.
+    app.keys(b"\x1b", 0.3)
+    app.keys(b" ", 0.3)
+    app.keys(b"p", 0.5)
+    app.keys(b"enew\r", 0.8)
+    body = app.repaint().dump()
+    check(
+        "a typed command word runs instead of asking",
+        "*scratch*" in body,
+        body,
+    )
+
+    # Walking to a row is the discovery path: it asks for that command's
+    # parameters one at a time, and Esc backs out of a step rather than the lot.
+    app.keys(b":", 0.5)
+    for _ in range(8):
+        app.keys(b"\x1b[B", 0.12)  # Down to :edit, whose path is optional
+    body = app.repaint().dump()
+    check("the arrows walk the list and the preview follows", "reload this file" in body, body)
+    app.keys(b"\r", 0.7)
+    body = app.repaint().dump()
+    check(
+        "Enter on a chosen row asks for its parameter",
+        ":edit path" in body and "to skip" in body,
+        body,
+    )
+    app.keys(b"\x1b", 0.6)
+    body = app.repaint().dump()
+    check(
+        "Esc backs out one step with the command still on the line",
+        ":edit path" not in body and "edit" in body and "commands" in body,
+        body,
+    )
+    app.keys(b"\x1b", 0.4)
+
     # The leader is a key of its own: send it apart from the key it modifies.
     app.keys(b" ", 0.3)
     app.keys(b"f", 0.8)

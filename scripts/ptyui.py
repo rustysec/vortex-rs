@@ -11,6 +11,7 @@ import re
 import select
 import signal
 import struct
+import subprocess
 import sys
 import termios
 import time
@@ -66,15 +67,24 @@ class Screen:
         return "\n".join("".join(row).rstrip() for row in self.grid)
 
 
-def clean_config(directory):
-    """Args that pin an empty config, so a test never reads ~/.config/vortex.
+def starter_config(directory, binary):
+    """Args that pin the shipped starter config, so a test never reads ~/.config/vortex.
 
-    A developer's own options (`wd = close-pane`, `spell enable = false`, …)
-    would otherwise change editor behaviour under the test's feet.
+    Vortex binds no keys of its own: with an empty file every keystroke these
+    scripts send would do nothing at all.  So ask the binary for the very document
+    `vortex --write-config` installs and drive the editor with that — which also
+    means the smoke tests run the configuration a first-time user gets, keymap
+    included.
+
+    A developer's own options (`wd = close-pane`, `spell enable = false`, …) stay
+    out of it either way, since the file is passed with `-c`.
     """
+    text = subprocess.run(
+        [binary, "--default-config"], capture_output=True, text=True, check=True
+    ).stdout
     path = os.path.join(directory, "vortex-test-config.toml")
     with open(path, "w") as handle:
-        handle.write("# intentionally empty: the built-in defaults are under test\n")
+        handle.write(text)
     return ["--config", path]
 
 

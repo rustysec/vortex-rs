@@ -78,7 +78,7 @@ pub enum PromptAction {
     Submit,
     /// Enter was pressed on a candidate: `index` is an index into [`Prompt::items`].
     SubmitItem(usize),
-    /// Esc or `ctrl-c`: close the prompt.
+    /// Esc or `ctrl-g`: close the prompt.
     Cancel,
 }
 
@@ -213,9 +213,20 @@ impl Prompt {
             self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
             return;
         }
+        // An ex line narrows its list by the command word alone.  Once a space is
+        // typed the rest is arguments, which no candidate label contains — without
+        // this, `:set tab-width=4` would empty the popup mid-word and look broken
+        // even though Enter still runs exactly what was written.
+        let query = match self.completion {
+            Completion::Command => match self.text.split_once(char::is_whitespace) {
+                Some((head, _)) => head.to_string(),
+                None => self.text.clone(),
+            },
+            _ => self.text.clone(),
+        };
         let scored = fuzzy::filter_and_sort(
             &self.items,
-            &self.text,
+            &query,
             self.smart_case,
             self.limit,
             Item::match_key,
@@ -391,8 +402,9 @@ impl Prompt {
         let index = index as usize;
         self.history_index = Some(index);
         let entry = self.history[index].clone();
-        self.caret = entry.chars().count();
-        self.text = entry;
+        // Set through `set_text` so a popup re-narrows its list: the recalled line
+        // is what the user would have typed, and the rows should match it.
+        self.set_text(entry);
     }
 
     /// Record a submitted line in history.
@@ -443,8 +455,6 @@ impl Prompt {
                 }
                 return PromptAction::Submit;
             }
-            // Ctrl-C cancels, like vim's `[Command-line]` default.
-            KeyCode::Char('c') if control => return PromptAction::Cancel,
             KeyCode::Backspace | KeyCode::Char('h')
                 if control || key.code == KeyCode::Backspace =>
             {
@@ -469,15 +479,18 @@ impl Prompt {
             KeyCode::Char('e') | KeyCode::End if control || key.code == KeyCode::End => {
                 self.caret = self.text.chars().count()
             }
+            // Plain arrows move through the candidate list; Ctrl-P/Ctrl-N still
+            // walk history inside a picker, because a popup that replaces the
+            // command line must not take its history with it.
             KeyCode::Char('n') | KeyCode::Down if control || key.code == KeyCode::Down => {
-                if self.select_mode {
+                if self.select_mode && !control {
                     self.select(1);
                 } else {
                     self.recall_history(1);
                 }
             }
             KeyCode::Char('p') | KeyCode::Up if control || key.code == KeyCode::Up => {
-                if self.select_mode {
+                if self.select_mode && !control {
                     self.select(-1);
                 } else {
                     self.recall_history(-1);
@@ -698,6 +711,22 @@ mod tests {
     }
 
     #[test]
+    fn arrows_move_a_picker_while_ctrl_p_n_still_walk_history() {
+        // The `:` popup replaced the bare command line, so it inherits the habit
+        // of recalling what was typed last — but inside a list the plain arrows
+        // belong to the selection.  Ctrl keeps the history keys.
+        let items = vec![Item::new("one"), Item::new("two")];
+        let mut prompt =
+            Prompt::picker("commands", items).with_history(vec!["first".into(), "second".into()]);
+        prompt.handle_key(key(KeyCode::Down));
+        assert_eq!(prompt.selected, 1, "arrows move the highlighted row");
+        prompt.handle_key(ctrl('p'));
+        assert_eq!(prompt.text, "second", "ctrl-p recalls the last command");
+        prompt.handle_key(ctrl('p'));
+        assert_eq!(prompt.text, "first");
+    }
+
+    #[test]
     fn picker_with_empty_text_keeps_everything() {
         let items = vec![Item::new("a"), Item::new("b")];
         let prompt = Prompt::picker("buffers", items);
@@ -804,11 +833,19 @@ mod tests {
     }
 
     #[test]
-    fn escape_and_ctrl_c_cancel() {
+    fn escape_and_ctrl_g_cancel() {
         let mut prompt = Prompt::command("x");
         assert_eq!(prompt.handle_key(key(KeyCode::Esc)), PromptAction::Cancel);
-        assert_eq!(prompt.handle_key(ctrl('c')), PromptAction::Cancel);
         assert_eq!(prompt.handle_key(ctrl('g')), PromptAction::Cancel);
+    }
+
+    #[test]
+    fn ctrl_c_is_plain_text_not_a_cancel() {
+        // Ctrl-C no longer cancels anything; Esc owns that. Inside the prompt
+        // it must not even reach the text as a stray character.
+        let mut prompt = Prompt::command("x");
+        assert_eq!(prompt.handle_key(ctrl('c')), PromptAction::Continue);
+        assert_eq!(prompt.text, "x");
     }
 
     #[test]

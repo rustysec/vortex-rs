@@ -40,11 +40,14 @@ diagnostic-float = true       # show the full message when the caret rests on on
 # tab-width = 2
 
 # ---------------------------------------------------------------------------
-# status area
+# status row
+#
+# One row, always: it says what is true of the buffer.  Messages, key echoes and
+# prompts are transient, so they float on a card over the panes instead of
+# taking a row that would have to be cleared and restored underneath them.
 # ---------------------------------------------------------------------------
 [status]
 position = "bottom"           # "top" | "bottom"
-height = 1                    # 1 - 6 rows
 show-mode = true              # "normal" / "insert" / "visual" / "command"
 show-pane-name = true         # label of the focused text pane
 show-diagnostics = true       # lsp / spell rollup: "2e 1w"
@@ -219,23 +222,216 @@ prompt = ""
 # ---------------------------------------------------------------------------
 # keymap
 #
+# Vortex binds nothing on its own: a key does what a line below says, and
+# otherwise does nothing at all.  There is no hidden set of built-ins waiting to
+# be shadowed, so `:map` shows your configuration and `vortex --list-actions`
+# lists the names it can take.  The one exception is text input in insert mode —
+# printable characters, backspace, enter and the arrow keys are how you write,
+# not commands, and they work with an empty file (a line claiming one of them
+# still wins).
+#
 # Keys are written in kebab-case: "ctrl-s", "shift-tab", "g g" (a sequence),
-# "<", ">".  Values are action names (`:help keys` lists them all) or `:`
-# command names, with or without the colon ("save", "bnext" and ":bnext" all
-# work); "none" unbinds a default.  These examples are all no-ops unless you
-# uncomment them.
+# "<", ">".  Values are action names (`vortex --list-actions` prints them all) or
+# `:` command names, with or without the colon ("save", "bnext" and ":bnext" all
+# work); "none" unbinds a key.  A `[keymap.normal]` motion also works in visual
+# mode (where it extends the selection) and while an operator waits for its
+# motion, so `d` plus anything below deletes; `[keymap.visual]` and
+# `[keymap.operator]` add to that or override it.
+#
+# What follows is the vim-style starter `vortex --write-config` gives you.  Cut
+# it down freely — an unbound key costs nothing but the key.
 # ---------------------------------------------------------------------------
 [keymap.normal]
-# ";" = "find-char-back"          # override a default binding
-# "ctrl-s" = "save"
-# "<space>" = "command-palette"
-# "gb" = "bnext"                  # any `:` command works as an action too
+# movement
+"h" = "move-left"
+"j" = "move-down"
+"k" = "move-up"
+"l" = "move-right"
+"0" = "line-start"
+"^" = "first-non-blank"
+"$" = "line-end"
+"_" = "line-end-non-blank"
+"|" = "column"
+"w" = "word-forward"
+"b" = "word-back"
+"e" = "word-end"
+"ge" = "word-end-back"
+"W" = "big-word-forward"
+"B" = "big-word-back"
+"E" = "big-word-end"
+"gE" = "big-word-end-back"
+"f" = "find-char"
+"F" = "find-char-back"
+"t" = "till-char"
+"T" = "till-char-back"
+";" = "repeat-find"
+"," = "repeat-find-reverse"
+"gg" = "document-start"
+"G" = "document-end"
+"H" = "view-top"
+"M" = "view-middle"
+"L" = "view-bottom"
+"}" = "paragraph-next"
+"{" = "paragraph-prev"
+")" = "sentence-next"
+"(" = "sentence-prev"
+"%" = "match-bracket"
+"n" = "search-next"
+"N" = "search-prev"
+"pageup" = "page-up"
+"pagedown" = "page-down"
+"ctrl-b" = "page-up"
+"ctrl-f" = "page-down"
+"ctrl-u" = "half-page-up"
+"ctrl-d" = "half-page-down"
+"ctrl-y" = "scroll-line-up"
+"ctrl-e" = "scroll-line-down"
+"ctrl-o" = "jump-back"
+"ctrl-i" = "jump-forward"
+"z z" = "recenter"
+"z t" = "scroll-to-top"
+"z b" = "scroll-to-bottom"
+# text objects
+# insert / mode
+"i" = "insert"
+"gi" = "insert-previous"
+"a" = "append"
+"A" = "append-line-end"
+"I" = "insert-line-start"
+"o" = "open-below"
+"O" = "open-above"
+"v" = "visual"
+"V" = "visual-line"
+"ctrl-v" = "visual-block"
+"esc" = "cancel"
+# operators
+"d" = "delete"
+"c" = "change"
+"y" = "yank"
+"r" = "replace"
+"J" = "join"
+">" = "indent"
+"<" = "unindent"
+"=" = "reindent"
+"~" = "swap-case-char"
+"g~" = "swap-case"
+"gU" = "uppercase"
+"gu" = "lowercase"
+"gc" = "toggle-comment"
+"x" = "delete-char"
+"X" = "delete-char-back"
+"s" = "change-char"
+"S" = "change-line"
+"D" = "delete-to-line-end"
+"C" = "change-to-line-end"
+"Y" = "yank-line"
+"p" = "paste-after"
+"P" = "paste-before"
+"u" = "undo"
+"ctrl-r" = "redo"
+"." = "repeat"
+"m" = "set-mark"
+"`" = "goto-mark-char"
+"'" = "goto-mark-line"
+"gp" = "paste-after"
+"gs" = "duplicate-line"
+# search & prompts
+"/" = "search-forward"
+"?" = "search-backward"
+"*" = "find-word-forward"
+"#" = "find-word-backward"
+":" = "command-mode"
+# files & panes (space is the leader)
+"ctrl-s" = "save"
+"space p" = "command-palette"
+"space f" = "find-files"
+"space s" = "grep-project"
+"space b" = "switch-buffer"
+"space w" = "save"
+"space q" = "quit"
+"space d" = "show-diagnostics"
+"]d" = "diagnostic-next"
+"[d" = "diagnostic-prev"
+# vim's `K` keyword lookup, answered by the language server.
+"K" = "hover"
+"space a" = "code-action"
+"space e" = "spell-suggest"
+# vim's spelling suggestion key.
+"z=" = "spell-suggest"
+"space x" = "clear-search-highlight"
+"space F" = "format-buffer"
+# layout
+"space o" = "only-pane"
+"space z" = "zoom-pane"
+"space v" = "split-vertical"
+"space h" = "split-horizontal"
+"space n" = "split-auto"
+"space c" = "close-pane"
+"space =" = "equalize-panes"
+# `ctrl-w` then a direction moves between panes, as in vim.
+"ctrl-w h" = "focus-left"
+"ctrl-w j" = "focus-down"
+"ctrl-w k" = "focus-up"
+"ctrl-w l" = "focus-right"
+"space left" = "focus-left"
+"space right" = "focus-right"
+"space up" = "focus-up"
+"space down" = "focus-down"
+"space tab" = "focus-next"
+"shift-tab" = "focus-prev"
+"space H" = "move-left"
+"space J" = "move-down"
+"space K" = "move-up"
+"space L" = "move-right"
+"space ctrl-h" = "resize-left"
+"space ctrl-j" = "resize-down"
+"space ctrl-k" = "resize-up"
+"space ctrl-l" = "resize-right"
+"space plus" = "resize-right"
+"space minus" = "resize-left"
+"space g e" = "layout-equal"
+"space g g" = "layout-golden"
+# toggles
+"space t n" = "toggle-line-numbers"
+"space t c" = "toggle-cursorline"
+"space t w" = "toggle-wrap"
+"space t s" = "toggle-spell"
+"space t f" = "toggle-auto-format"
+"space t m" = "toggle-mouse"
 
 [keymap.insert]
-# "esc" = "exit-insert"
+"esc" = "exit-insert"
+"ctrl-[" = "exit-insert"
+"enter" = "insert-newline"
+"ctrl-j" = "insert-newline"
+"tab" = "insert-tab"
+"shift-tab" = "insert-backtab"
+"backspace" = "insert-backspace"
+"ctrl-h" = "insert-backspace"
+"delete" = "insert-delete"
+"ctrl-w" = "insert-delete-word"
+"ctrl-u" = "insert-delete-line-start"
+"ctrl-t" = "insert-indent-line"
+"ctrl-o" = "normal-once"
+"left" = "move-left"
+"right" = "move-right"
+"up" = "move-up"
+"down" = "move-down"
+"home" = "line-start"
+"end" = "line-end"
 
 [keymap.visual]
-# "<" = "unindent"
+"v" = "visual"
+"V" = "visual-line"
+"ctrl-v" = "visual-block"
+"o" = "swap-anchor"
+"esc" = "normal"
+"i" = "inside"
+"a" = "around"
 
-[keymap.command]
-# "tab" = "complete"
+[keymap.operator]
+# `i` / `a` introduce text objects here rather than insert mode.
+"i" = "inside"
+"a" = "around"
+"t" = "till-char"
+"T" = "till-char-back"
