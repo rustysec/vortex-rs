@@ -518,6 +518,19 @@ impl Buffer {
         self.last_group_at = None;
     }
 
+    /// Drop the incremental change log and demand a whole-document resync.
+    ///
+    /// Undo / redo walk text back without recording ranged edits, so the log no
+    /// longer describes how our buffer differs from the server's copy.  Leaving
+    /// it empty would make `notify_lsp_change` see "nothing changed" and send no
+    /// `didChange` at all: the server keeps analysing the pre-undo text, and its
+    /// stale diagnostics never clear.  The next drain reports `None`, which the
+    /// app answers by resending the whole document.
+    fn invalidate_change_log(&mut self) {
+        self.pending_changes.clear();
+        self.changes_overflowed = true;
+    }
+
     /// Undo one step; returns the selection to restore.
     ///
     /// A formatter run is not something the user did, so it never costs a `u` of
@@ -525,8 +538,7 @@ impl Buffer {
     /// underneath them and walked back in the same press.  That is what "back to
     /// before I did that" means when the buffer was reformatted after the edit —
     /// undoing only the edit would leave the text in a state nobody typed.
-    pub fn undo(&mut self) -> Option<UndoOutcome> {
-        // Newest first: the automatic runs sit on top of the change they follow.
+    pub fn undo(&mut self) -> Option<UndoOutcome> {        // Newest first: the automatic runs sit on top of the change they follow.
         let mut batch: Vec<UndoItem> = Vec::new();
         while self
             .history
@@ -552,6 +564,7 @@ impl Buffer {
                 self.map_diagnostics(range, change.removed.len());
             }
         }
+        self.invalidate_change_log();
         self.version += 1;
         let restored = batch.last().expect("a non-empty batch").before.clone();
         // Redo walks forward, so the oldest item has to end up on top; every
@@ -586,6 +599,7 @@ impl Buffer {
                 self.map_diagnostics(range, change.inserted.len());
             }
         }
+        self.invalidate_change_log();
         self.version += 1;
         let restored = batch.last().expect("a non-empty batch").after.clone();
         for item in batch {
@@ -1737,6 +1751,33 @@ mod tests {
         );
         // The flag is consumed, so the next drain is a normal empty one.
         assert_eq!(buffer.take_changes().expect("tracked"), Vec::new());
+    }
+
+    #[test]
+    fn undo_and_redo_ask_for_a_full_resync() {
+        // Undo walks text back without recording ranged edits.  If the drain
+        // came back empty, `notify_lsp_change` would send no `didChange`, the
+        // server would keep analysing the pre-undo text, and its diagnostics
+        // for the undone edit would never clear.
+        let mut buffer = buffer_with("alpha\n");
+        insert(&mut buffer, 5, " beta", ChangeGroup::Insert);
+        buffer.take_changes().expect("the edit itself is tracked");
+
+        buffer.undo().expect("undo the insert");
+        assert_eq!(buffer.text(), "alpha\n");
+        assert_eq!(
+            buffer.take_changes(),
+            None,
+            "an undo resyncs the whole document"
+        );
+
+        buffer.redo().expect("redo the insert");
+        assert_eq!(buffer.text(), "alpha beta\n");
+        assert_eq!(
+            buffer.take_changes(),
+            None,
+            "a redo resyncs the whole document too"
+        );
     }
 
     #[test]
