@@ -78,6 +78,23 @@ pub struct Picker<'a> {
     pub items: &'a [prompt::Item],
     /// Index into `visible` of the highlighted row.
     pub selected: usize,
+    /// The selected candidate's file, shown syntax-highlighted on the right
+    /// half of the card.  Only the search pickers populate it; a plain list
+    /// keeps the full-width layout.
+    pub preview: Option<FilePreview<'a>>,
+}
+
+/// A file preview drawn beside the search pickers' candidate list.
+///
+/// The runs are pre-highlighted by the app (the renderer must not read files or
+/// parse), so this is just text split into styled segments, one entry per line.
+pub struct FilePreview<'a> {
+    /// Path shown above the pane, relative to the search root where possible.
+    pub path: &'a str,
+    /// One row of runs per file line; each run is `(text, highlight group)`.
+    pub lines: &'a [Vec<(String, syntax::Hl)>],
+    /// Index into `lines` of the line to mark and scroll to (the grep hit).
+    pub focus: usize,
 }
 
 /// A completion popup drawn next to the caret.
@@ -1291,9 +1308,16 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
     if screen.width < 12 || screen.height < 5 {
         return None;
     }
-    let width = (screen.width as usize * 3 / 4)
-        .clamp(30.min(screen.width as usize), screen.width as usize)
-        .min(screen.width as usize);
+    // A card that carries a file preview wants more of the screen than a plain
+    // list does; without the extra width the two columns are useless.  The
+    // renderer only splits at 90 columns (below), so do not widen for less.
+    let width = if picker.preview.is_some() && screen.width >= 100 {
+        screen.width as usize * 9 / 10
+    } else {
+        (screen.width as usize * 3 / 4).max(30.min(screen.width as usize))
+    }
+    .clamp(30.min(screen.width as usize), screen.width as usize)
+    .min(screen.width as usize);
     // The selected row's preview, wrapped to the card.  It is computed before
     // the height so the card can reserve rows for it: a preview that pushed the
     // list off the bottom would be worse than no preview at all.  The cap also
@@ -1363,6 +1387,16 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         theme.label_focused,
     );
 
+    // A file preview turns the card into two columns: candidates on the left,
+    // source on the right, divided by a vertical rule.  Narrow screens keep the
+    // single-column layout — a preview three characters wide helps nobody.
+    let show_preview = picker.preview.is_some() && area.width >= 90;
+    let split_x = if show_preview {
+        area.x + (area.width as usize * 45 / 100) as u16
+    } else {
+        area.right()
+    };
+
     // Input row.  The glyph is the prompt itself — `:` for a command or one of
     // its parameters, `>` for a plain list — so the popup reads as the line it
     // replaced rather than as a search box.
@@ -1420,10 +1454,10 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         } else {
             theme.text
         };
-        for column in (area.x + 2)..area.right().saturating_sub(1) {
+        for column in (area.x + 2)..split_x.min(area.right().saturating_sub(1)) {
             buf[(column, y)].set_style(if selected { theme.selection } else { style });
         }
-        let label_limit = area.right().saturating_sub(area.x + 3) as usize;
+        let label_limit = split_x.saturating_sub(area.x + 3) as usize;
         emit(buf, area.x + 3, y, &item.label, base, 0, label_limit);
         if let Some(detail) = &item.detail {
             let used = item.label.chars().count() + 2;
@@ -1467,6 +1501,18 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         }
     }
 
+    // The file-preview column: a rule, then the selected hit's file painted on
+    // its right.  The app pre-highlights it (the renderer never reads disk), so
+    // this only windows and colours the runs it is given.
+    if let Some(preview) = picker.preview.as_ref().filter(|_| show_preview) {
+        for y in list_top..count_y {
+            buf[(split_x, y)]
+                .set_symbol(set.vertical_left)
+                .set_style(style);
+        }
+        draw_file_preview(buf, area, split_x, list_top, count_y, preview, theme);
+    }
+
     // Count line.
     emit(
         buf,
@@ -1482,6 +1528,105 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         x: text_x + typed.min(limit) as u16,
         y: input_y,
     })
+}
+
+/// Draw the selected file, syntax-highlighted, in the right-hand column of a
+/// search picker's card.
+///
+/// The app pre-highlights the file (the renderer never reads disk or parses),
+/// so this only windows the lines around the hit and paints the runs.  The
+/// window follows `preview.focus` the way the candidate list follows its own
+/// selection: the hit line must be on screen, everything else is context.
+fn draw_file_preview(
+    buf: &mut Buffer,
+    area: Rect,
+    split_x: u16,
+    top: u16,
+    bottom: u16,
+    preview: &FilePreview,
+    theme: &Theme,
+) {
+    let x = split_x + 2;
+    let right = area.right().saturating_sub(2);
+    if right <= x || top >= bottom || preview.lines.is_empty() {
+        return;
+    }
+    // Header: the file's path, dimmed, on the pane's first row.
+    emit(
+        buf,
+        x,
+        top,
+        preview.path,
+        theme.status_inactive,
+        0,
+        (right - x) as usize,
+    );
+
+    let text_top = top + 1;
+    let rows = bottom.saturating_sub(text_top) as usize;
+    if rows == 0 {
+        return;
+    }
+    // Centre the window on the hit line where the file allows it.
+    let focus = preview.focus.min(preview.lines.len() - 1);
+    let first = focus
+        .saturating_sub(rows / 2)
+        .min(preview.lines.len().saturating_sub(rows));
+
+    // The line-number gutter is as wide as the largest number on screen.
+    let last_line = (first + rows).min(preview.lines.len());
+    let gutter = digit_width(last_line.max(1)) as u16;
+
+    for (row, index) in (first..preview.lines.len()).take(rows).enumerate() {
+        let y = text_top + row as u16;
+        // Clear the row first: a shorter line must not leave its predecessor.
+        for column in (x - 1)..right {
+            buf[(column, y)].set_symbol(" ").set_style(theme.overlay);
+        }
+        let focused = index == focus;
+        let number = format!("{:>w$}", index + 1, w = gutter as usize);
+        emit(
+            buf,
+            x,
+            y,
+            &number,
+            if focused {
+                theme.label_focused
+            } else {
+                theme.status_inactive
+            },
+            0,
+            (gutter + 1) as usize,
+        );
+        let text_x = x + gutter + 1;
+        let limit = right.saturating_sub(text_x) as usize;
+        let mut column = 0usize;
+        for (text, hl) in &preview.lines[index] {
+            if column >= limit {
+                break;
+            }
+            let style = theme.highlight(*hl);
+            // The hit line gets the cursor-line background so it can be found
+            // at a glance without hiding its syntax colours.
+            let style = if focused {
+                style.patch(theme.cursor_line)
+            } else {
+                style
+            };
+            column += emit(buf, text_x, y, text, style, column, limit);
+        }
+    }
+}
+
+/// Decimal digits in `n`, for sizing the preview's line-number gutter.
+fn digit_width(n: usize) -> usize {
+    let mut width = 1;
+    let mut value = n / 10;
+    while value > 0 {
+        width += 1;
+        value /= 10;
+    }
+    width
 }
 
 /// Paint a solid bordered card and return the area inside it.
@@ -2255,6 +2400,7 @@ mod tests {
             visible: &[0, 1],
             items: &items,
             selected: 0,
+            preview: None,
         };
         let cursor = draw_picker(&mut buffer, area, &picker, &theme).expect("a cursor");
         let rendered = frame_text(&buffer);
@@ -2283,6 +2429,7 @@ mod tests {
             visible: &[0, 1],
             items: &items,
             selected: 0,
+            preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
         let rendered = frame_text(&buffer);
@@ -2310,6 +2457,7 @@ mod tests {
             visible: &[0, 1],
             items: &items,
             selected: 1,
+            preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
         let rendered = frame_text(&buffer);
@@ -2335,11 +2483,84 @@ mod tests {
             visible: &visible,
             items: &items,
             selected: 0,
+            preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
         let rendered = frame_text(&buffer);
         // All ten rows fit in a 20-row screen with no preview.
         assert!(rendered.contains("src/file9.rs"), "{rendered}");
+    }
+
+    #[test]
+    fn a_search_picker_draws_its_file_preview_on_the_right() {
+        // The find/grep pickers show the selected hit's file beside the list.
+        let area = Rect::new(0, 0, 120, 20);
+        let mut buffer = Buffer::empty(area);
+        let items = vec![
+            prompt::Item::new("src/main.rs:2"),
+            prompt::Item::new("src/lib.rs:1"),
+        ];
+        let lines: Vec<Vec<(String, syntax::Hl)>> = (0..40)
+            .map(|index| vec![(format!("let hit{index} = true;"), syntax::Hl::None)])
+            .collect();
+        let preview = FilePreview {
+            path: "src/main.rs",
+            lines: &lines,
+            focus: 20,
+        };
+        let picker = Picker {
+            prompt: "> ",
+            title: "grep",
+            input: "",
+            caret: 0,
+            suffix: "",
+            visible: &[0, 1],
+            items: &items,
+            selected: 0,
+            preview: Some(preview),
+        };
+        draw_picker(&mut buffer, area, &picker, &Theme::default());
+        let rendered = frame_text(&buffer);
+        // The list keeps the left column and the file the right one.
+        assert!(rendered.contains("src/main.rs:2"), "{rendered}");
+        assert!(
+            rendered.contains("let hit20"),
+            "window centred on the hit:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("let hit0 "),
+            "the top of the file is off-window:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_screen_drops_the_preview_column() {
+        // Below 90 columns there is no room for two columns; the list wins.
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(area);
+        let items = vec![prompt::Item::new("src/main.rs:2")];
+        let lines: Vec<Vec<(String, syntax::Hl)>> =
+            vec![(vec![("let previewed = true;".to_string(), syntax::Hl::None)])];
+        let preview = FilePreview {
+            path: "src/main.rs",
+            lines: &lines,
+            focus: 0,
+        };
+        let picker = Picker {
+            prompt: "> ",
+            title: "grep",
+            input: "",
+            caret: 0,
+            suffix: "",
+            visible: &[0],
+            items: &items,
+            selected: 0,
+            preview: Some(preview),
+        };
+        draw_picker(&mut buffer, area, &picker, &Theme::default());
+        let rendered = frame_text(&buffer);
+        assert!(rendered.contains("src/main.rs:2"), "{rendered}");
+        assert!(!rendered.contains("let previewed"), "{rendered}");
     }
 
     #[test]
@@ -2393,6 +2614,7 @@ mod tests {
             visible: &visible,
             items: &items,
             selected: 499,
+            preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
         let rendered = frame_text(&buffer);
@@ -2432,6 +2654,7 @@ mod tests {
             visible: &[0],
             items: &items,
             selected: 0,
+            preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
 
@@ -2617,6 +2840,7 @@ mod tests {
             visible: &[0],
             items: &items,
             selected: 0,
+            preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
         let top = (0..area.height)

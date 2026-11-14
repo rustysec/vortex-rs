@@ -251,6 +251,61 @@ pub fn highlights(buffer: &Buffer, range: Span, lang_id: &str) -> Vec<Highlight>
     out
 }
 
+/// Split a buffer's text into per-line runs of highlight groups.
+///
+/// The picker file previews need the work done once per file rather than once
+/// per frame, and they outlive the parse that produced them, so every run
+/// carries owned text.  Tabs are expanded because the preview renderer counts
+/// characters, not display cells; alignment across runs inside one line is
+/// approximate, which a glance-sized pane can live with.
+pub fn line_runs(buffer: &Buffer, lang_id: &str) -> Vec<Vec<(String, Hl)>> {
+    let marks = highlights(buffer, Span::new(0, buffer.len_bytes()), lang_id);
+    let mut out = Vec::with_capacity(buffer.line_count());
+    // `highlights` emits leaf tokens in document order: sorted and disjoint, so
+    // one cursor walks the whole file.  A mark that spans several lines (a
+    // block comment) stays under the cursor until its last line is drawn.
+    let mut mark = 0;
+    for line in 0..buffer.line_count() {
+        let start = buffer.line_start(line);
+        let end = buffer.line_end(line);
+        while mark < marks.len() && marks[mark].span.end <= start {
+            mark += 1;
+        }
+        let text = buffer.slice(Span::new(start, end));
+        let mut runs: Vec<(String, Hl)> = Vec::new();
+        let mut at = start;
+        while mark < marks.len() && marks[mark].span.start < end {
+            let m = &marks[mark];
+            let from = m.span.start.max(start);
+            let to = m.span.end.min(end);
+            if from > at {
+                runs.push((expand_tabs(&text[at - start..from - start]), Hl::None));
+            }
+            if to > from {
+                runs.push((expand_tabs(&text[from - start..to - start]), m.hl));
+                at = to;
+            }
+            if m.span.end > end {
+                break; // continues on the next line
+            }
+            mark += 1;
+        }
+        if at < end {
+            runs.push((expand_tabs(&text[at - start..end - start]), Hl::None));
+        }
+        out.push(runs);
+    }
+    out
+}
+
+fn expand_tabs(text: &str) -> String {
+    if text.contains('\t') {
+        text.replace('\t', "    ")
+    } else {
+        text.to_string()
+    }
+}
+
 fn descend(
     buffer: &Buffer,
     cursor: &mut tree_sitter::TreeCursor<'_>,
@@ -1073,6 +1128,63 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn line_runs_split_the_highlights_per_line() {
+        // The picker preview needs one row of runs per file line, and a run
+        // that spans several lines (a block comment) must repeat on each.
+        let buffer = rust("fn main() {\n    /* a\n       note */\n}\n");
+        let runs = line_runs(&buffer, buffer.language.id);
+        // Four text lines plus the empty one after the final newline.
+        assert_eq!(runs.len(), 5, "{runs:?}");
+        // Every line's runs concatenate back to the line itself.
+        let joined: Vec<String> = runs
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(joined[0], "fn main() {");
+        assert_eq!(joined[1], "    /* a");
+        assert_eq!(joined[3], "}");
+        // The keyword on line one and the comment fragment on line two keep
+        // their groups.
+        assert!(
+            runs[0]
+                .iter()
+                .any(|(t, hl)| t == "fn" && *hl == Hl::Keyword)
+        );
+        assert!(
+            runs[1]
+                .iter()
+                .any(|(t, hl)| t.contains("/* a") && *hl == Hl::Comment),
+            "{:?}",
+            runs[1]
+        );
+        assert!(
+            runs[2]
+                .iter()
+                .any(|(t, hl)| t.contains("note */") && *hl == Hl::Comment),
+            "{:?}",
+            runs[2]
+        );
+    }
+
+    #[test]
+    fn line_runs_expand_tabs() {
+        // Plain text has no grammar, so every byte is one unstyled run — but a
+        // tab still must not reach the renderer, which counts characters.
+        let buffer = Buffer::new(
+            BufferId(1),
+            Some(std::path::PathBuf::from("sample.txt")),
+            "a\tb".to_string(),
+            &EditorConfig::default(),
+        );
+        let runs = line_runs(&buffer, buffer.language.id);
+        assert_eq!(runs[0][0].0, "a    b");
     }
 
     #[test]

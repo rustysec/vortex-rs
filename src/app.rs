@@ -16,7 +16,7 @@ use ratatui::layout::Position;
 use ratatui::layout::Rect;
 
 use crate::action::Cmd;
-use crate::buffer::BufferId;
+use crate::buffer::{Buffer, BufferId};
 use crate::command::{self, Command, ConfigAction, SetOutcome, SplitDirection};
 use crate::config::Background;
 use crate::config::Config;
@@ -171,6 +171,11 @@ pub struct HitPayload {
     pub line: usize,
 }
 
+/// The file shown beside the search pickers: its path, the label drawn above
+/// the pane, and its lines pre-split into highlight runs (see
+/// [`crate::syntax::line_runs`]).
+type PreviewCache = (PathBuf, String, Vec<Vec<(String, syntax::Hl)>>);
+
 /// A diagnostic row picked from `:error`-style list.
 #[derive(Debug, Clone)]
 pub struct DiagnosticPayload {
@@ -212,6 +217,11 @@ pub struct App {
     pub terminal: Terminal,
     pub _terminal_guard: TerminalGuard,
     pub prompt: Option<(PromptKind, Prompt)>,
+    /// The file shown beside the search pickers' list: its path, the label
+    /// drawn above it, and its pre-highlighted lines.  Rebuilt when the
+    /// selection moves to another file — reading and parsing happen here, not
+    /// in the renderer, which must stay a pure function of the frame.
+    preview_cache: Option<PreviewCache>,
     pub message: Option<(StatusLevel, String)>,
     pub message_expiry: Option<Instant>,
     pub cwd: PathBuf,
@@ -303,6 +313,7 @@ impl App {
             terminal,
             _terminal_guard: guard,
             prompt: None,
+            preview_cache: None,
             message: None,
             message_expiry: None,
             cwd,
@@ -940,6 +951,65 @@ impl App {
             }
         }
         self.needs_redraw = true;
+    }
+
+    /// Read a file and split it into per-line highlight runs for the picker's
+    /// preview pane.  Returns nothing when the file cannot be shown: a preview
+    /// is a convenience, and a huge or unreadable one must not stall a frame.
+    fn load_preview(&self, path: &Path) -> Vec<Vec<(String, syntax::Hl)>> {
+        const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
+
+        let Ok(meta) = std::fs::metadata(path) else {
+            return Vec::new();
+        };
+        if meta.len() > MAX_PREVIEW_BYTES {
+            return Vec::new();
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        // A scratch buffer: the preview parses on its own tree and never joins
+        // the editor's list, so only the path matters — it is what picks the
+        // language.  The id is one no real buffer will ever take.
+        let mut buffer = Buffer::new(
+            BufferId(u32::MAX),
+            Some(path.to_path_buf()),
+            text,
+            &self.editor.config.editor,
+        );
+        syntax::parse_in_place(&mut buffer);
+        syntax::line_runs(&buffer, buffer.language.id)
+    }
+
+    /// Point the preview cache at the file under the picker's selection.
+    ///
+    /// Reading and parsing happen here rather than in the renderer, which must
+    /// stay a pure function of the frame; the cache means walking through hits
+    /// inside one file costs no I/O at all.
+    fn refresh_preview(&mut self) {
+        let hit = match self.prompt.as_ref() {
+            Some((PromptKind::FindFiles | PromptKind::Grep, prompt)) => prompt
+                .visible()
+                .get(prompt.selected)
+                .and_then(|index| prompt.items.get(*index))
+                .and_then(|item| item.payload_as::<HitPayload>())
+                .map(|payload| payload.path.clone()),
+            _ => None,
+        };
+        let Some(path) = hit else {
+            self.preview_cache = None;
+            return;
+        };
+        if self
+            .preview_cache
+            .as_ref()
+            .is_some_and(|(cached, _, _)| *cached == path)
+        {
+            return;
+        }
+        let display = path.display().to_string();
+        let lines = self.load_preview(&path);
+        self.preview_cache = Some((path, display, lines));
     }
 
     fn open_picker(
@@ -3042,6 +3112,12 @@ impl App {
 
         let status = Snapshot::collect(&self.editor, self.message.clone(), &self.cwd);
 
+        // The search pickers show the selected hit's file beside the list.  It
+        // is refreshed here rather than in the renderer — which must stay a
+        // pure function of the frame — and cached by path so walking through
+        // hits inside one file costs no I/O.
+        self.refresh_preview();
+
         // Borrow the pieces the screen needs without holding `self` mutably.
         let editor = &self.editor;
         let theme = &self.theme;
@@ -3060,6 +3136,9 @@ impl App {
                 tone: NoticeTone::Prompt,
             });
 
+        // Bound here so the picker closure borrows only this field: capturing
+        // all of `self` would collide with the `&mut self.terminal` below.
+        let preview_cache = self.preview_cache.as_ref();
         let picker: Option<Picker> = self
             .prompt
             .as_ref()
@@ -3080,6 +3159,24 @@ impl App {
                 visible: prompt.visible(),
                 items: &prompt.items,
                 selected: prompt.selected,
+                // The search pickers preview the file under the selection; the
+                // cache was pointed at it above.  `line` is 1-based, and the
+                // renderer clamps a focus past a short file back into it.
+                preview: match kind {
+                    PromptKind::FindFiles | PromptKind::Grep => preview_cache
+                        .filter(|(_, _, lines)| !lines.is_empty())
+                        .map(|(_, display, lines)| ui::FilePreview {
+                            path: display.as_str(),
+                            lines,
+                            focus: prompt
+                                .visible()
+                                .get(prompt.selected)
+                                .and_then(|index| prompt.items.get(*index))
+                                .and_then(|item| item.payload_as::<HitPayload>())
+                                .map_or(0, |payload| payload.line.saturating_sub(1)),
+                        }),
+                    _ => None,
+                },
             });
 
         let completion: Option<ui::CompletionView> = self
