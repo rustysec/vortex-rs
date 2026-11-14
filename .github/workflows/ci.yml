@@ -16,6 +16,14 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show
 
+      # The live language-server tests drive a real server, and `rust-toolchain.toml`
+      # deliberately carries only rustfmt and clippy.  Without this step they skip,
+      # which is correct on a laptop but would leave their coverage silently absent
+      # from CI; the pinned toolchain also means a stray `rust-analyzer` proxy on
+      # PATH is a stub that exits non-zero rather than a usable server.
+      - name: Install rust-analyzer for the live LSP tests
+        run: rustup component add rust-analyzer
+
       - name: Formatting
         run: cargo fmt --all --check
 

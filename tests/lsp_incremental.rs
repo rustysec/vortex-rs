@@ -6,9 +6,11 @@
 //! diagnostic, completion and hover is answered against text that no longer
 //! exists, with no error to notice.
 //!
-//! The tests skip when `rust-analyzer` is not installed, so they stay portable.
+//! The tests skip when no usable `rust-analyzer` is installed, so they stay
+//! portable.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -20,11 +22,61 @@ use vortex::lsp::{self, ClientHandle, LspEvent, ServerSpec};
 /// project on first run, which is not instant.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// A usable `rust-analyzer`, or nothing if this machine has no working one.
+///
+/// Checking that a file called `rust-analyzer` sits on `PATH` is not enough.
+/// rustup installs a proxy for it regardless of whether the active toolchain
+/// carries the component, and that proxy exits non-zero instead of speaking LSP:
+/// CI is exactly that case, since `rust-toolchain.toml` pins only rustfmt and
+/// clippy.  Every test here then ran, spawned nothing but a dying proxy, and
+/// failed on "the server never became ready" — which reads like a desync bug and
+/// is really a missing binary.  Ask the binary itself; it answers `--version`.
 fn rust_analyzer() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
+    // The same lookup `Command::new("rust-analyzer")` performs: first match wins,
+    // so a working copy further along PATH does not rescue a broken one in front
+    // of it — the client would still spawn the broken one.
+    let candidate = std::env::split_paths(&paths)
         .map(|dir| dir.join("rust-analyzer"))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| candidate.is_file())?;
+    runs_as_server(&candidate).then_some(candidate)
+}
+
+/// Whether this path is a server we can talk to rather than a stub that fails.
+fn runs_as_server(program: &Path) -> bool {
+    std::process::Command::new(program)
+        .arg("--version")
+        // A proxy that cannot resolve the component prints its own advice; it is
+        // not something a test run should interleave with results.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The reason the tests are being skipped, for the one line they print.
+fn skip_reason() -> &'static str {
+    let paths = match std::env::var_os("PATH") {
+        Some(paths) => paths,
+        None => return "PATH is unset",
+    };
+    if std::env::split_paths(&paths).any(|dir| dir.join("rust-analyzer").is_file()) {
+        // A file named rust-analyzer exists but would not run: a rustup proxy
+        // whose component is missing, the case that used to look like a bug.
+        "the rust-analyzer on PATH does not run for this toolchain (rustup component add rust-analyzer)"
+    } else {
+        "rust-analyzer is not installed"
+    }
+}
+
+/// Skip the test out loud when there is no server to drive.
+macro_rules! require_rust_analyzer {
+    () => {
+        if crate::rust_analyzer().is_none() {
+            eprintln!("skipping: {}", crate::skip_reason());
+            return;
+        }
+    };
 }
 
 /// A scratch crate, removed when the test ends.
@@ -95,6 +147,10 @@ impl Session {
     }
 
     /// Wait for the first event `want` accepts, or give up at the deadline.
+    ///
+    /// A server that could not start is reported as `Failed`; that is treated as
+    /// end of story here, because nothing later can arrive either and the caller's
+    /// own message would blame the sync logic for a missing binary.
     async fn wait_for<F>(&mut self, mut want: F) -> Option<LspEvent>
     where
         F: FnMut(&LspEvent) -> bool,
@@ -109,12 +165,25 @@ impl Session {
                 Ok(Some(event)) => event,
                 _ => return None,
             };
-            if let Event::Async(AsyncEvent::Lsp(event)) = event
-                && want(&event)
-            {
-                return Some(event);
+            if let Event::Async(AsyncEvent::Lsp(event)) = event {
+                if let LspEvent::Failed { language, error } = &event {
+                    panic!("the {language} server failed: {error}");
+                }
+                if want(&event) {
+                    return Some(event);
+                }
             }
         }
+    }
+
+    /// Wait for the handshake, with the message every test wants on failure.
+    async fn wait_until_ready(&mut self) {
+        assert!(
+            self.wait_for(|event| matches!(event, LspEvent::Ready { .. }))
+                .await
+                .is_some(),
+            "the server never became ready"
+        );
     }
 
     /// Wait for a published diagnostic whose message mentions `needle`.
@@ -181,19 +250,10 @@ const INSERTED: &str = "fn added() -> u32 { 1 }\n";
 
 #[tokio::test]
 async fn an_incremental_edit_reaches_the_server() {
-    if rust_analyzer().is_none() {
-        eprintln!("skipping: rust-analyzer is not installed");
-        return;
-    }
+    require_rust_analyzer!();
     let scratch = Scratch::new("incremental");
     let mut session = Session::start(&scratch.root, LspSync::Incremental);
-    assert!(
-        session
-            .wait_for(|event| matches!(event, LspEvent::Ready { .. }))
-            .await
-            .is_some(),
-        "the server never became ready"
-    );
+    session.wait_until_ready().await;
 
     let uri = lsp::uri_for(&scratch.file());
     session
@@ -222,19 +282,10 @@ async fn an_incremental_edit_reaches_the_server() {
 async fn a_full_sync_edit_reaches_the_server() {
     // The escape hatch has to work too: it is what a user is told to try when
     // incremental sync looks wrong.
-    if rust_analyzer().is_none() {
-        eprintln!("skipping: rust-analyzer is not installed");
-        return;
-    }
+    require_rust_analyzer!();
     let scratch = Scratch::new("full");
     let mut session = Session::start(&scratch.root, LspSync::Full);
-    assert!(
-        session
-            .wait_for(|event| matches!(event, LspEvent::Ready { .. }))
-            .await
-            .is_some(),
-        "the server never became ready"
-    );
+    session.wait_until_ready().await;
 
     let uri = lsp::uri_for(&scratch.file());
     session
@@ -255,19 +306,10 @@ async fn a_sequence_of_incremental_edits_stays_in_step() {
     // One edit can be right by luck; a run of them is what catches an offset
     // that drifts.  Each edit is expressed against the text the previous one
     // produced, which is exactly how the buffer records them.
-    if rust_analyzer().is_none() {
-        eprintln!("skipping: rust-analyzer is not installed");
-        return;
-    }
+    require_rust_analyzer!();
     let scratch = Scratch::new("sequence");
     let mut session = Session::start(&scratch.root, LspSync::Incremental);
-    assert!(
-        session
-            .wait_for(|event| matches!(event, LspEvent::Ready { .. }))
-            .await
-            .is_some(),
-        "the server never became ready"
-    );
+    session.wait_until_ready().await;
 
     let uri = lsp::uri_for(&scratch.file());
     session
@@ -309,22 +351,13 @@ async fn a_broken_file_publishes_a_diagnostic() {
     // path — envelope decode, URI match, and the version gate.  Every one of
     // those has silently dropped diagnostics at some point, and each time the
     // unit tests kept passing because they never ran the path end to end.
-    if rust_analyzer().is_none() {
-        eprintln!("skipping: rust-analyzer is not installed");
-        return;
-    }
+    require_rust_analyzer!();
     // `undefined_name` is never declared, so rust-analyzer reports
     // "cannot find value `undefined_name` in this scope".
     let source = "fn main() {\n    let _ = undefined_name;\n}\n";
     let scratch = Scratch::with_source("diagnostics", source);
     let mut session = Session::start(&scratch.root, LspSync::Incremental);
-    assert!(
-        session
-            .wait_for(|event| matches!(event, LspEvent::Ready { .. }))
-            .await
-            .is_some(),
-        "the server never became ready"
-    );
+    session.wait_until_ready().await;
 
     let uri = lsp::uri_for(&scratch.file());
     session
@@ -363,20 +396,11 @@ async fn an_unsaved_error_is_pulled_from_the_server() {
     // `workspace/diagnostic/refresh`.  A push-only client therefore shows a
     // clean file that is full of unsaved type errors — the exact case a user
     // hits the moment they type.
-    if rust_analyzer().is_none() {
-        eprintln!("skipping: rust-analyzer is not installed");
-        return;
-    }
+    require_rust_analyzer!();
     // The file on disk is clean; the error exists only in the buffer.
     let scratch = Scratch::with_source("unsaved", "fn main() {}\n");
     let mut session = Session::start(&scratch.root, LspSync::Incremental);
-    assert!(
-        session
-            .wait_for(|event| matches!(event, LspEvent::Ready { .. }))
-            .await
-            .is_some(),
-        "the server never became ready"
-    );
+    session.wait_until_ready().await;
 
     let uri = lsp::uri_for(&scratch.file());
     session
@@ -407,6 +431,9 @@ async fn an_unsaved_error_is_pulled_from_the_server() {
             _ => panic!("no pulled diagnostic for an unsaved error"),
         };
         match event {
+            Event::Async(AsyncEvent::Lsp(LspEvent::Failed { language, error })) => {
+                panic!("the {language} server failed: {error}");
+            }
             Event::Async(AsyncEvent::Lsp(LspEvent::DiagnosticsRefresh { .. })) => {
                 session.handle.pull_diagnostics(uri.clone(), request, 2);
                 request += 1;
