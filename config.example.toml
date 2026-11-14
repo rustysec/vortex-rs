@@ -159,6 +159,7 @@ sync = "incremental"
 [spell]
 enable = true
 command = "auto"              # "auto" | "aspell" | "hunspell" | "off"
+language = "auto"             # dictionary for aspell/hunspell, e.g. "en_GB"; "auto" asks the engine
 only-comments = true          # only check comments and strings
 min-len = 4                   # ignore short words
 ignore-camel-case = true      # ignore IdentifiersLikeThis

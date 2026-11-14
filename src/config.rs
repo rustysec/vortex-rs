@@ -514,8 +514,14 @@ impl Default for LspServer {
 #[serde(default, rename_all = "kebab-case")]
 pub struct SpellConfig {
     pub enable: bool,
-    /// `"auto"`, `"aspell"`, `"hunspell"` or `"off"`.
+    /// Which checker runs: `"auto"` (an installed aspell or hunspell, else the
+    /// embedded list), `"aspell"`, `"hunspell"`, or `"off"`/`"builtin"` for the
+    /// embedded list alone.  See [`crate::spell::resolve_engine`].
     pub command: String,
+    /// Dictionary an external engine should use: `"auto"` sends no language flag
+    /// and lets aspell/hunspell pick their own default; anything else is passed
+    /// through (`--lang=` / `-d`).  The embedded list is English either way.
+    pub language: String,
     /// Only check comments and strings (uses the tree-sitter tree).
     pub only_comments: bool,
     /// Minimum word length to check.
@@ -534,6 +540,7 @@ impl Default for SpellConfig {
         Self {
             enable: true,
             command: "auto".into(),
+            language: "auto".into(),
             only_comments: true,
             min_len: 4,
             ignore_camel_case: true,
@@ -853,7 +860,19 @@ impl Config {
             "format.on-idle" => self.format.on_idle = duration(key, value)?,
             "format.on-save" => self.format.on_save = boolean(key, value)?,
             "spell.enable" => self.spell.enable = boolean(key, value)?,
-            "spell.command" => self.spell.command = text(key, value)?,
+            "spell.command" => {
+                let requested = text(key, value)?.trim().to_lowercase();
+                if !matches!(
+                    requested.as_str(),
+                    "" | "auto" | "aspell" | "hunspell" | "off" | "none" | "builtin" | "internal"
+                ) {
+                    return Err(format!(
+                        "spell.command expects auto, aspell, hunspell or off, got \"{requested}\""
+                    ));
+                }
+                self.spell.command = requested;
+            }
+            "spell.language" => self.spell.language = text(key, value)?,
             "spell.only-comments" => self.spell.only_comments = boolean(key, value)?,
             "spell.min-len" => self.spell.min_len = number(key, value)?,
             "spell.ignore-camel-case" => self.spell.ignore_camel_case = boolean(key, value)?,
@@ -924,6 +943,7 @@ impl Config {
             "format.on-save" => on_off(self.format.on_save),
             "spell.enable" => on_off(self.spell.enable),
             "spell.command" => self.spell.command.clone(),
+            "spell.language" => self.spell.language.clone(),
             "spell.only-comments" => on_off(self.spell.only_comments),
             "spell.min-len" => self.spell.min_len.to_string(),
             "spell.ignore-camel-case" => on_off(self.spell.ignore_camel_case),

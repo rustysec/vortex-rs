@@ -1868,15 +1868,20 @@ impl App {
             }) => {
                 self.editor
                     .job_finished(buffer, crate::editor::JobKind::Spell);
-                if let Some(error) = error {
-                    self.set_message(StatusLevel::Warn, format!("spell check: {error}"));
-                } else if self
+                // A failed run carries no diagnostics on purpose, so applying them
+                // is also what clears the hints a *previous* engine left behind:
+                // underlines from a checker that is no longer configured would read
+                // as findings the current one agreed with.
+                if self
                     .editor
                     .buffer(buffer)
                     .is_some_and(|candidate| candidate.version == version)
                 {
                     self.editor
                         .set_diagnostics(buffer, DiagnosticSource::Spell, diagnostics);
+                }
+                if let Some(error) = error {
+                    self.set_message(StatusLevel::Warn, format!("spell check: {error}"));
                 }
                 self.needs_redraw = true;
             }

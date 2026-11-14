@@ -979,6 +979,7 @@ fn vim_option(name: &str) -> Option<&'static str> {
         "status-position" => "status.position",
         "spell" => "spell.enable",
         "spell-command" => "spell.command",
+        "spell-language" => "spell.language",
         "only-comments" => "spell.only-comments",
         "min-len" => "spell.min-len",
         "ignore-camel-case" => "spell.ignore-camel-case",
