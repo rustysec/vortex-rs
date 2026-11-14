@@ -269,7 +269,12 @@ fn descend(
     // A comment is one token even when the grammar exposes its `//` marker as a
     // child, so style the whole node and do not descend into it.  Without this
     // the marker is painted as punctuation and the comment text unstyled.
-    if node.child_count() == 0 || node.kind().contains("comment") {
+    //
+    // Strings are the same in grammars that build them from parts (TOML's
+    // `string` wraps its quotes and content as children): descending would
+    // paint the quotes as punctuation and leave the content unstyled, so style
+    // the whole node instead.
+    if node.child_count() == 0 || node.kind().contains("comment") || node.kind() == "string" {
         let hl = highlight_of(buffer, node, lang_id, cursor.field_name());
         if hl != Hl::None {
             let start = node_range.start.max(range.start);
@@ -336,6 +341,12 @@ fn highlight_of(buffer: &Buffer, node: Node<'_>, lang_id: &str, field: Option<&s
     // and only the parent knows which.
     if let Some(hl) = role_highlight(node, field) {
         return hl;
+    }
+
+    // TOML keys are `bare_key` tokens; every one is a property name, whether it
+    // sits in a `pair`, a `dotted_key` or a `[table]` header.
+    if lang_id == "toml" && kind == "bare_key" {
+        return Hl::Property;
     }
 
     if kind == "ERROR" || kind == "MISSING" || kind.contains("error") || kind.contains("missing") {
@@ -1109,6 +1120,47 @@ mod tests {
         assert!(
             second.iter().all(|highlight| highlight.span.start >= 11),
             "{second:?}"
+        );
+    }
+
+    #[test]
+    fn toml_keys_strings_and_tables_are_highlighted() {
+        let mut buffer = Buffer::new(
+            BufferId(1),
+            Some(std::path::PathBuf::from("sample.toml")),
+            "[editor]\ntab-width = 4\nexpand-tab = true\nname = \"hello\"\n# a comment\n"
+                .to_string(),
+            &EditorConfig::default(),
+        );
+        assert!(buffer.reparse_now(), "the TOML grammar should parse");
+        let groups = groups(&buffer);
+
+        // Keys are properties, whether in a pair or a `[table]` header.
+        for key in ["editor", "tab-width", "expand-tab", "name"] {
+            assert!(
+                groups
+                    .iter()
+                    .any(|(hl, text)| *hl == Hl::Property && text == key),
+                "key {key:?} should be a property in {groups:?}"
+            );
+        }
+        // A string is one run including its quotes, not just punctuation.
+        assert!(
+            groups
+                .iter()
+                .any(|(hl, text)| *hl == Hl::String && text == "\"hello\""),
+            "{groups:?}"
+        );
+        assert!(groups.iter().any(|(hl, _)| *hl == Hl::Number), "{groups:?}");
+        assert!(
+            groups
+                .iter()
+                .any(|(hl, text)| *hl == Hl::Constant && text == "true"),
+            "{groups:?}"
+        );
+        assert!(
+            groups.iter().any(|(hl, _)| *hl == Hl::Comment),
+            "{groups:?}"
         );
     }
 }
