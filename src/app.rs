@@ -20,12 +20,13 @@ use crate::buffer::BufferId;
 use crate::command::{self, Command, ConfigAction, SetOutcome, SplitDirection};
 use crate::config::Background;
 use crate::config::Config;
-use crate::diagnostic::{DiagnosticScope, DiagnosticSource};
+use crate::diagnostic::{Diagnostic, DiagnosticScope, DiagnosticSource, ProjectDiagnostic};
 use crate::editor::{Editor, Intent, PromptSpec, StatusLevel};
 use crate::event::{AsyncEvent, Event, Events};
 use crate::format::{self, Formatter};
 use crate::input::Keymaps;
 use crate::input::Mode;
+use crate::lang;
 use crate::layout::Axis;
 use crate::lsp::{self, Clients, LspEvent, ServerSpec};
 use crate::prompt::{self, Prompt, PromptAction};
@@ -48,6 +49,92 @@ const FORMAT_FALLBACK_IDLE: Duration = Duration::from_millis(500);
 const COMPLETION_IDLE: Duration = Duration::from_millis(90);
 /// How long the caret must rest on a diagnostic before its message is shown.
 const DIAGNOSTIC_HOLD: Duration = Duration::from_millis(500);
+
+/// Convert LSP diagnostics for an unopened workspace file into project entries.
+///
+/// A buffer converts ranges against its rope; these files have no buffer, so the
+/// on-disk text does that job.  `line` and `column` are computed here too — a
+/// picker row needs them to show a location without opening the file first.
+fn project_diagnostics_from_items(
+    text: &str,
+    path: &Path,
+    source: DiagnosticSource,
+    items: &[lsp::DiagnosticItem],
+) -> Vec<ProjectDiagnostic> {
+    let line_starts = lsp::line_starts(text);
+    let tab_width = 4;
+    items
+        .iter()
+        .map(|item| {
+            let span = lsp::range_to_span(
+                text,
+                &line_starts,
+                (item.range.0, item.range.1),
+                (item.range.2, item.range.3),
+            );
+            let line = text[..span.start].bytes().filter(|&b| b == b'\n').count();
+            let column_start = text[..span.start]
+                .rfind('\n')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let column = crate::buffer::display_width(&text[column_start..span.start], tab_width);
+            ProjectDiagnostic {
+                path: path.to_path_buf(),
+                offset: span.start,
+                line,
+                column,
+                diagnostic: Diagnostic::new(
+                    span,
+                    item.severity,
+                    format!("{}: {}", item.source, item.message),
+                    source,
+                )
+                .with_code(item.code.clone())
+                .with_tags(item.tags.clone()),
+            }
+        })
+        .collect()
+}
+
+/// Append picker rows for one buffer's diagnostics.
+///
+/// Ordered by position, like the jump keys, so the list reads as a walk through
+/// the text rather than publication order.  The headline carries the severity and
+/// the server's code, so `error[E0308]` is visible without opening the message.
+fn append_buffer_diagnostics(
+    items: &mut Vec<prompt::Item>,
+    buffer: &crate::buffer::Buffer,
+    project_scope: bool,
+) {
+    let mut diagnostics: Vec<&Diagnostic> = buffer.diagnostics.iter().collect();
+    diagnostics.sort_by_key(|diagnostic| diagnostic.range.start);
+    for diagnostic in diagnostics {
+        let line = buffer.line_of(diagnostic.range.start) + 1;
+        let column = buffer.display_col(diagnostic.range.start) + 1;
+        // Project rows carry the file name — the point of the wider scope is
+        // that the target may not be where the caret is.
+        let label = if project_scope {
+            format!("{}:{line}:{column}", buffer.display_name())
+        } else {
+            format!("{line}:{column}")
+        };
+        let mut preview = diagnostic.headline();
+        for (message, span) in &diagnostic.related {
+            let related_line = buffer.line_of(span.start) + 1;
+            preview.push_str(&format!("\n  {related_line}: {message}"));
+        }
+        items.push(
+            prompt::Item::new(label)
+                .detail(diagnostic.headline())
+                .preview(preview)
+                .payload(DiagnosticPayload {
+                    buffer: Some(buffer.id),
+                    path: buffer.path().map(Path::to_path_buf).unwrap_or_default(),
+                    offset: diagnostic.range.start,
+                }),
+        );
+    }
+}
 
 /// What the open prompt collects; drives how submission is interpreted.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,7 +174,11 @@ pub struct HitPayload {
 /// A diagnostic row picked from `:error`-style list.
 #[derive(Debug, Clone)]
 pub struct DiagnosticPayload {
-    pub buffer: BufferId,
+    /// The buffer to focus when the file is open; `None` for a workspace file
+    /// that has no buffer yet (the picker opens it on selection).
+    pub buffer: Option<BufferId>,
+    /// Absolute path of the file this diagnostic belongs to.
+    pub path: PathBuf,
     pub offset: usize,
 }
 
@@ -254,6 +345,10 @@ impl App {
             }
             app.notify_lsp_open(id);
         }
+        // Register every workspace source file with its language server so the
+        // project scope sees diagnostics across the whole tree from the start,
+        // not just for files that happen to be open.
+        app.register_workspace();
         for warning in keymap_warnings.iter().take(3) {
             app.set_message(StatusLevel::Warn, warning.clone());
         }
@@ -742,6 +837,13 @@ impl App {
                     // pre-cut pane area would subtract the chrome twice.
                     let area = self.last_frame;
                     self.editor.ensure_visible(area);
+                }
+                Intent::OpenDiagnosticFile { path, offset } => {
+                    self.open_diagnostic(DiagnosticPayload {
+                        buffer: None,
+                        path,
+                        offset,
+                    });
                 }
                 Intent::ReloadConfig => self.reload_config(),
                 Intent::Quit => self.quit = true,
@@ -1271,11 +1373,7 @@ impl App {
                     .and_then(|item| item.payload_as::<DiagnosticPayload>())
                     .cloned();
                 match payload {
-                    Some(payload) => {
-                        self.editor.focus_buffer(payload.buffer);
-                        self.editor.set_cursor(payload.offset);
-                        self.apply_intents(vec![Intent::EnsureVisible]);
-                    }
+                    Some(payload) => self.open_diagnostic(payload),
                     None => self.set_message(StatusLevel::Warn, "no diagnostic selected"),
                 }
             }
@@ -1311,6 +1409,33 @@ impl App {
             return;
         }
         self.set_message(StatusLevel::Info, title);
+        self.apply_intents(vec![Intent::EnsureVisible]);
+    }
+
+    /// Jump to a diagnostic row picked from the list.
+    ///
+    /// A buffer-backed row focuses its existing buffer; a workspace file that
+    /// has no buffer yet is opened first (which also registers it with the
+    /// server through `notify_lsp_open`), then the caret lands on the offset.
+    fn open_diagnostic(&mut self, payload: DiagnosticPayload) {
+        let id = match payload.buffer {
+            Some(id) => id,
+            None => {
+                if payload.path.as_os_str().is_empty() {
+                    self.set_message(StatusLevel::Warn, "no diagnostic selected");
+                    return;
+                }
+                let id = self.editor.open_file(&payload.path);
+                self.spawn_parse(id);
+                if self.editor.config.spell.enable {
+                    self.spawn_spell(id);
+                }
+                self.notify_lsp_open(id);
+                id
+            }
+        };
+        self.editor.focus_buffer(id);
+        self.editor.set_cursor(payload.offset);
         self.apply_intents(vec![Intent::EnsureVisible]);
     }
 
@@ -1985,6 +2110,29 @@ impl App {
                 let Some(path) = lsp::path_for_uri(&uri) else {
                     return;
                 };
+                // An `unchanged` pull answer means the previous set still
+                // stands; replacing it with nothing would erase live errors.
+                if unchanged {
+                    return;
+                }
+                let source = match origin {
+                    lsp::DiagnosticOrigin::Push => DiagnosticSource::Lsp,
+                    lsp::DiagnosticOrigin::Pull => DiagnosticSource::LspPull,
+                };
+                // A file registered at startup but not open as a buffer: its
+                // diagnostics go into the project store, keyed by path.  Without
+                // this branch every such report was dropped as "no such buffer",
+                // which is exactly why only opened files ever showed up.
+                if self.editor.buffer_by_path(&path).is_none() {
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        return;
+                    };
+                    let diagnostics = project_diagnostics_from_items(&text, &path, source, &items);
+                    self.editor
+                        .set_project_diagnostics(path.clone(), source, diagnostics);
+                    self.needs_redraw = true;
+                    return;
+                }
                 let Some(id) = self.editor.buffer_by_path(&path) else {
                     return;
                 };
@@ -1998,11 +2146,6 @@ impl App {
                 if version.is_some_and(|version| version < buffer.version as i64) {
                     return;
                 }
-                // An `unchanged` pull answer means the previous set still
-                // stands; replacing it with nothing would erase live errors.
-                if unchanged {
-                    return;
-                }
                 // Push and pull describe different text cuts (saved file vs.
                 // edited buffer), so each replaces only its own set.  Merging
                 // them is what makes an unsaved error show up next to the
@@ -2010,10 +2153,6 @@ impl App {
                 // `set_diagnostics` retains by, so the items must carry it —
                 // storing a pull under `Lsp` would leave the previous pull in
                 // place and the list would grow on every keystroke.
-                let source = match origin {
-                    lsp::DiagnosticOrigin::Push => DiagnosticSource::Lsp,
-                    lsp::DiagnosticOrigin::Pull => DiagnosticSource::LspPull,
-                };
                 let diagnostics: Vec<_> = items
                     .iter()
                     .map(|item| item.to_diagnostic(buffer, source))
@@ -2699,6 +2838,17 @@ impl App {
         if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
             client.did_open(uri, &language, text, version);
         }
+        // The server already published diagnostics for this file while it was
+        // only registered (not open), and rust-analyzer will not republish
+        // unchanged content on a re-open.  Move the stored set onto the buffer
+        // so they show immediately instead of waiting for an edit.
+        let migrated = self.editor.take_project_diagnostics(&path);
+        if !migrated.is_empty() {
+            let diagnostics: Vec<Diagnostic> =
+                migrated.into_iter().map(|entry| entry.diagnostic).collect();
+            self.editor
+                .set_diagnostics(id, DiagnosticSource::Lsp, diagnostics);
+        }
     }
 
     fn notify_lsp_save(&mut self, id: BufferId) {
@@ -2712,6 +2862,59 @@ impl App {
         let uri = lsp::uri_for(path);
         if let Some(client) = self.clients.get(&root) {
             client.did_save(uri);
+        }
+    }
+
+    /// Register every workspace source file with its language server, without
+    /// opening a buffer for it.
+    ///
+    /// A server only analyses documents it has been told about via `didOpen`, so
+    /// the project scope used to be limited to files vortex had opened.  Walking
+    /// the tree and sending `didOpen` for each matching file makes rust-analyzer
+    /// (and friends) report diagnostics across the whole workspace from the very
+    /// first frame, instead of only once a file happened to be reached.
+    ///
+    /// Files are read straight off disk — no buffer is created — so a large tree
+    /// costs transient reads rather than permanent buffers.
+    fn register_workspace(&mut self) {
+        if !self.editor.config.lsp.enable || self.search_root.as_os_str().is_empty() {
+            return;
+        }
+        let root = self.search_root.clone();
+        // Collect the files first so we are not holding a borrow of `self` while
+        // sending to clients.
+        let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+        for entry in ignore::WalkBuilder::new(&root).build().flatten() {
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let path = entry.into_path();
+            // Only files whose language has a configured server are worth
+            // registering; everything else would just be sent to nothing.
+            let language = lang::detect(Some(&path), None).id.to_string();
+            if self.server_spec_for(&language).is_none() {
+                continue;
+            }
+            candidates.push((path, language));
+        }
+        for (path, language) in candidates {
+            // A file already open as a buffer is registered through the normal
+            // `notify_lsp_open` path; registering it again would be redundant.
+            if self.editor.buffer_by_path(&path).is_some() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(spec) = self.server_spec_for(&language) else {
+                continue;
+            };
+            let root = search::project_root(Some(&path));
+            let uri = lsp::uri_for(&path);
+            let sender = self.events.sender();
+            if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
+                client.did_open(uri, &language, text, 1);
+            }
         }
     }
 
@@ -2994,42 +3197,43 @@ impl App {
     /// project.  Project rows carry the file name — the point of the wider
     /// scope is that the target may not be where the caret is.
     fn diagnostic_items(&self, scope: DiagnosticScope) -> Vec<prompt::Item> {
-        let buffers: Vec<&crate::buffer::Buffer> = match scope {
-            DiagnosticScope::Buffer => self.editor.current_buffer().into_iter().collect(),
-            DiagnosticScope::Project => self.editor.buffers().iter().collect(),
-        };
         let mut items = Vec::new();
-        for buffer in buffers {
-            // Ordered by position, like the jump keys, so the picker reads as
-            // a walk through the text rather than publication order.
-            let mut diagnostics: Vec<&crate::diagnostic::Diagnostic> =
-                buffer.diagnostics.iter().collect();
-            diagnostics.sort_by_key(|diagnostic| diagnostic.range.start);
-            for diagnostic in diagnostics {
-                let line = buffer.line_of(diagnostic.range.start) + 1;
-                let column = buffer.display_col(diagnostic.range.start) + 1;
-                let label = match scope {
-                    DiagnosticScope::Buffer => format!("{line}:{column}"),
-                    DiagnosticScope::Project => {
-                        format!("{}:{line}:{column}", buffer.display_name())
-                    }
-                };
-                // The headline carries the severity and the server's code, so
-                // `error[E0308]` is visible without opening the message.
-                let mut preview = diagnostic.headline();
-                for (message, span) in &diagnostic.related {
-                    let line = buffer.line_of(span.start) + 1;
-                    preview.push_str(&format!("\n  {line}: {message}"));
+        match scope {
+            DiagnosticScope::Buffer => {
+                if let Some(buffer) = self.editor.current_buffer() {
+                    append_buffer_diagnostics(&mut items, buffer, false);
                 }
-                items.push(
-                    prompt::Item::new(label)
-                        .detail(diagnostic.headline())
-                        .preview(preview)
-                        .payload(DiagnosticPayload {
-                            buffer: buffer.id,
-                            offset: diagnostic.range.start,
-                        }),
-                );
+            }
+            DiagnosticScope::Project => {
+                for buffer in self.editor.buffers() {
+                    append_buffer_diagnostics(&mut items, buffer, true);
+                }
+                // Workspace files that are not open as buffers.  Their
+                // diagnostics were stored keyed by path at startup; without this
+                // the project scope would only ever show opened files.
+                for (path, entries) in &self.editor.project_diagnostics {
+                    if self.editor.buffer_by_path(path).is_some() {
+                        continue;
+                    }
+                    let mut sorted: Vec<&ProjectDiagnostic> = entries.iter().collect();
+                    sorted.sort_by_key(|entry| entry.offset);
+                    for entry in sorted {
+                        // `line`/`column` are 0-based; the picker shows them
+                        // 1-based like every other location.
+                        let label =
+                            format!("{}:{}:{}", path.display(), entry.line + 1, entry.column + 1);
+                        items.push(
+                            prompt::Item::new(label)
+                                .detail(entry.diagnostic.headline())
+                                .preview(entry.diagnostic.headline())
+                                .payload(DiagnosticPayload {
+                                    buffer: None,
+                                    path: entry.path.clone(),
+                                    offset: entry.offset,
+                                }),
+                        );
+                    }
+                }
             }
         }
         items

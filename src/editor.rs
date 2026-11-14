@@ -7,7 +7,7 @@
 //! terminal, and background work never blocks a key press.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
@@ -17,7 +17,7 @@ use crate::action::{
 };
 use crate::buffer::{Buffer, BufferId, Change, ChangeGroup, expand_home, next_char_boundary};
 use crate::config::{Config, LineNumber};
-use crate::diagnostic::{Diagnostic, DiagnosticScope, DiagnosticSource};
+use crate::diagnostic::{Diagnostic, DiagnosticScope, DiagnosticSource, ProjectDiagnostic};
 use crate::event::{AsyncEvent, JobId};
 use crate::input::motions::{self, Dest, Env, Kind, SearchQuery};
 use crate::input::operators::{self, Case, Region};
@@ -58,6 +58,12 @@ pub enum Intent {
     ReloadConfig,
     /// Keep the cursor on screen after a move.
     EnsureVisible,
+    /// Open a workspace file (not yet a buffer) and put the caret at `offset`.
+    ///
+    /// Used by project-scope diagnostic jumps: the target may live in a file
+    /// vortex has no buffer for, so the app layer opens it — which also registers
+    /// it with its language server — before the editor can focus it.
+    OpenDiagnosticFile { path: PathBuf, offset: usize },
     /// Leave the editor.
     Quit,
 }
@@ -357,6 +363,12 @@ pub struct Editor {
     /// is a change they made, so unlike an automatic one it gets its own undo
     /// step; the flag is consumed when the formatter result lands.
     pub format_requested: Option<BufferId>,
+    /// Diagnostics for workspace files that are not open as buffers, keyed by
+    /// absolute path.  The language server analyses every source file in the
+    /// project, so this holds what it reports about the ones vortex has no
+    /// buffer for — which is how `:diagnostic list project` sees the whole
+    /// workspace from the start instead of only the open files.
+    pub project_diagnostics: HashMap<PathBuf, Vec<ProjectDiagnostic>>,
     /// Terminal area of the last frame, so commands can ask for geometry.
     last_area: AreaCell,
 }
@@ -384,6 +396,7 @@ impl Editor {
             format_due: None,
             format_held: None,
             format_requested: None,
+            project_diagnostics: HashMap::new(),
             last_area: AreaCell::default(),
         }
     }
@@ -2776,6 +2789,10 @@ impl Editor {
     /// pairs over every buffer, so the walk continues into the next file
     /// instead of stopping at the end of this one.
     fn diagnostic_jump_project(&mut self, forward: bool, area: Rect) -> Vec<Intent> {
+        // Buffer targets keep their index so ordering and wrap match what they
+        // always did.  Workspace files with no open buffer get indices after the
+        // last buffer, so a forward walk exhausts open buffers first then moves
+        // into unopened project files (and wraps back to them).
         let mut targets: Vec<(usize, usize, String)> = Vec::new();
         for (index, buffer) in self.buffers.iter().enumerate() {
             let mut starts: Vec<usize> = buffer
@@ -2801,6 +2818,30 @@ impl Editor {
                     .unwrap_or_default();
                 targets.push((index, start, message));
             }
+        }
+        // Stored diagnostics for files that are not open as buffers.  They sort
+        // after every buffer so the walk reads "open files first, then the rest
+        // of the workspace".
+        let mut file_targets: Vec<(PathBuf, usize, String)> = self
+            .project_diagnostics
+            .iter()
+            .filter(|(path, _)| self.buffer_by_path(path).is_none())
+            .flat_map(|(path, entries)| {
+                let mut sorted: Vec<&ProjectDiagnostic> = entries.iter().collect();
+                sorted.sort_by_key(|entry| entry.offset);
+                sorted
+                    .into_iter()
+                    .map(move |entry| (path.clone(), entry.offset, entry.diagnostic.headline()))
+            })
+            .collect();
+        file_targets.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let base = self.buffers.len();
+        for (index, (path, offset, message)) in file_targets.iter().enumerate() {
+            targets.push((
+                base + index,
+                *offset,
+                format!("{}: {}", path.display(), message),
+            ));
         }
         if targets.is_empty() {
             return vec![Intent::Message(
@@ -2835,6 +2876,15 @@ impl Editor {
                 .unwrap_or(targets.last().expect("non-empty"))
         };
         let (index, offset, message) = (target.0, target.1, target.2.clone());
+        // A file with no open buffer: hand it to the app layer to open and
+        // register before we can focus it.
+        if index >= base {
+            let path = &file_targets[index - base].0;
+            return vec![Intent::OpenDiagnosticFile {
+                path: path.clone(),
+                offset,
+            }];
+        }
         let id = self.buffers[index].id;
         if self.current_buffer_id() != Some(id) && !self.focus_buffer(id) {
             // Cross-buffer: focus first so the scroll lands in the right pane.
@@ -3149,6 +3199,31 @@ impl Editor {
                 .retain(|existing| existing.source != source);
             buffer.diagnostics.extend(diagnostics);
         }
+    }
+
+    /// Store diagnostics for a workspace file that has no open buffer, replacing
+    /// that source's set.  Keyed by absolute path so the project scope can find
+    /// them without holding every file as a buffer.
+    pub fn set_project_diagnostics(
+        &mut self,
+        path: PathBuf,
+        source: DiagnosticSource,
+        diagnostics: Vec<ProjectDiagnostic>,
+    ) {
+        let entry = self.project_diagnostics.entry(path).or_default();
+        entry.retain(|existing| existing.diagnostic.source != source);
+        entry.extend(diagnostics);
+    }
+
+    /// Diagnostics for a workspace file that is not open as a buffer.
+    pub fn project_diagnostics(&self, path: &Path) -> Option<&[ProjectDiagnostic]> {
+        self.project_diagnostics.get(path).map(Vec::as_slice)
+    }
+
+    /// Drop the stored diagnostics for `path`, returning them so a caller can
+    /// move them onto a buffer that just opened.
+    pub fn take_project_diagnostics(&mut self, path: &Path) -> Vec<ProjectDiagnostic> {
+        self.project_diagnostics.remove(path).unwrap_or_default()
     }
 
     /// Suggestions for the word under the cursor.
@@ -4167,6 +4242,107 @@ mod tests {
                 "each pull must replace the last, not stack on it"
             );
         }
+    }
+
+    #[test]
+    fn project_d_jumps_into_a_stored_workspace_diagnostic() {
+        // A workspace file with no open buffer: its diagnostics live in the
+        // path-keyed store.  `]d` must hand them to the app layer as an
+        // OpenDiagnosticFile intent rather than dropping them.
+        let mut fixture = Fixture::new("one\ntwo\n");
+        mark_lines(&mut fixture, &[0]);
+        let path = std::path::PathBuf::from("/tmp/project/lib.rs");
+        let entry = ProjectDiagnostic {
+            path: path.clone(),
+            offset: 4,
+            line: 1,
+            column: 2,
+            diagnostic: Diagnostic::new(
+                crate::selection::Span::point(4),
+                crate::diagnostic::Severity::Error,
+                "problem in lib.rs",
+                DiagnosticSource::Lsp,
+            ),
+        };
+        fixture
+            .editor
+            .set_project_diagnostics(path.clone(), DiagnosticSource::Lsp, vec![entry]);
+        let intents = fixture
+            .editor
+            .run_cmd(Cmd::DiagnosticNext(DiagnosticScope::Project), fixture.area);
+        assert!(
+            intents.iter().any(|intent| matches!(
+                intent,
+                Intent::OpenDiagnosticFile { path: p, offset }
+                    if *p == path && *offset == 4
+            )),
+            "expected an OpenDiagnosticFile intent for the stored file: {intents:?}"
+        );
+    }
+
+    #[test]
+    fn set_project_diagnostics_replaces_its_source() {
+        // Like buffers, a repeated store of one source must replace rather than
+        // accumulate; otherwise every publish would stack on the last.
+        let mut fixture = Fixture::new("x\n");
+        let path = std::path::PathBuf::from("/tmp/project/a.rs");
+        for count in 1..=3 {
+            let entries: Vec<_> = (0..count)
+                .map(|i| ProjectDiagnostic {
+                    path: path.clone(),
+                    offset: i,
+                    line: i,
+                    column: 0,
+                    diagnostic: Diagnostic::new(
+                        crate::selection::Span::point(i),
+                        crate::diagnostic::Severity::Error,
+                        format!("problem {i}"),
+                        DiagnosticSource::Lsp,
+                    ),
+                })
+                .collect();
+            fixture
+                .editor
+                .set_project_diagnostics(path.clone(), DiagnosticSource::Lsp, entries);
+            let stored = fixture
+                .editor
+                .project_diagnostics(&path)
+                .unwrap_or_default()
+                .len();
+            assert_eq!(stored, count, "each store must replace the last");
+        }
+    }
+
+    #[test]
+    fn take_project_diagnostics_moves_them_out_of_the_store() {
+        // Opening a file that was only registered (never opened) must move its
+        // stored diagnostics onto the buffer; rust-analyzer will not republish
+        // unchanged content on a re-open, so leaving them in the store would
+        // orphan them and show nothing until an edit.
+        let mut fixture = Fixture::new("x\n");
+        let path = std::path::PathBuf::from("/tmp/project/a.rs");
+        fixture.editor.set_project_diagnostics(
+            path.clone(),
+            DiagnosticSource::Lsp,
+            vec![ProjectDiagnostic {
+                path: path.clone(),
+                offset: 0,
+                line: 1,
+                column: 2,
+                diagnostic: Diagnostic::new(
+                    crate::selection::Span::point(4),
+                    crate::diagnostic::Severity::Error,
+                    "problem",
+                    DiagnosticSource::Lsp,
+                ),
+            }],
+        );
+        let taken = fixture.editor.take_project_diagnostics(&path);
+        assert_eq!(taken.len(), 1, "the stored set is returned");
+        assert!(
+            fixture.editor.project_diagnostics(&path).is_none(),
+            "the store entry is gone once moved"
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! status area shows a rollup of the counts.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use crate::selection::Span;
 
@@ -191,6 +192,33 @@ impl Diagnostic {
         out.push_str(": ");
         out.push_str(&self.message);
         out
+    }
+}
+
+/// A diagnostic for a workspace file that is not open as a buffer.
+///
+/// The language server analyses every source file in the project, but vortex
+/// only holds buffers for files the user has opened.  Diagnostics for the rest
+/// are kept here, keyed by absolute path, so `:diagnostic list project` and the
+/// `]d` / `[d` jumps see the whole workspace from the start rather than just the
+/// open buffers.
+#[derive(Debug, Clone)]
+pub struct ProjectDiagnostic {
+    /// Absolute path of the file this belongs to.
+    pub path: PathBuf,
+    /// Byte offset into the on-disk text (for jumping once opened).
+    pub offset: usize,
+    /// 0-based line and display column, computed from disk text so a picker row
+    /// can show a location without opening the file.
+    pub line: usize,
+    pub column: usize,
+    pub diagnostic: Diagnostic,
+}
+
+impl ProjectDiagnostic {
+    /// The path this belongs to, as a `&Path`.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
