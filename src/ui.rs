@@ -853,7 +853,10 @@ impl Gutter {
         if self.sign_width > 0 {
             let sign = self.signs.get(line).copied().flatten();
             let (symbol, style) = match sign {
-                Some(severity) => (severity_sign(severity), severity_style(severity, theme)),
+                Some(severity) => (
+                    severity_sign(severity),
+                    severity_style(severity, theme).remove_modifier(Modifier::UNDERLINED),
+                ),
                 None => (' ', theme.gutter),
             };
             buf.set_stringn(x, y, symbol.to_string(), 1, style);
@@ -1047,27 +1050,33 @@ fn draw_frame(
     let content = if plain || area.width < 2 || area.height < 2 {
         area
     } else {
+        // The style goes on every cell of the frame, not just the top row:
+        // a border that colours three sides differently from the fourth reads
+        // as damage, not design.
         for x in area.left()..area.right() {
-            buf[(x, area.y)].set_symbol(set.horizontal_top);
-            buf[(x, area.bottom() - 1)].set_symbol(set.horizontal_bottom);
+            buf[(x, area.y)]
+                .set_symbol(set.horizontal_top)
+                .set_style(border_style);
+            buf[(x, area.bottom() - 1)]
+                .set_symbol(set.horizontal_bottom)
+                .set_style(border_style);
         }
         for y in area.top()..area.bottom() {
-            buf[(area.x, y)].set_symbol(set.vertical_left);
-            buf[(area.right() - 1, y)].set_symbol(set.vertical_right);
+            buf[(area.x, y)]
+                .set_symbol(set.vertical_left)
+                .set_style(border_style);
+            buf[(area.right() - 1, y)]
+                .set_symbol(set.vertical_right)
+                .set_style(border_style);
         }
-        buf[(area.x, area.y)].set_symbol(set.top_left);
-        buf[(area.right() - 1, area.y)].set_symbol(set.top_right);
-        buf[(area.x, area.bottom() - 1)].set_symbol(set.bottom_left);
-        buf[(area.right() - 1, area.bottom() - 1)].set_symbol(set.bottom_right);
-        buf.set_style(
-            Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: 1,
-            },
-            border_style,
-        );
+        for (x, y, symbol) in [
+            (area.x, area.y, set.top_left),
+            (area.right() - 1, area.y, set.top_right),
+            (area.x, area.bottom() - 1, set.bottom_left),
+            (area.right() - 1, area.bottom() - 1, set.bottom_right),
+        ] {
+            buf[(x, y)].set_symbol(symbol).set_style(border_style);
+        }
         Rect {
             x: area.x + 1,
             y: area.y + 1,
@@ -1290,7 +1299,7 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
     // list off the bottom would be worse than no preview at all.  The cap also
     // leaves room for the border, the input row, one list row and the count
     // line, so a short terminal still shows a usable list.
-    let max_preview = MAX_PREVIEW_ROWS.min((screen.height as usize).saturating_sub(7));
+    let max_preview = MAX_PREVIEW_ROWS.min((screen.height as usize).saturating_sub(8));
     let preview_lines = picker
         .visible
         .get(picker.selected)
@@ -1300,17 +1309,20 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         .map(|text| wrap_preview(text, width.saturating_sub(4), max_preview))
         .unwrap_or_default();
     let preview_rows = preview_lines.len();
-    // Leave room for the status row at the bottom, and for the preview when
-    // there is one.
+    // Leave room for the status row at the bottom plus a one-row buffer, and
+    // for the preview when there is one: a card whose border sits flush on the
+    // status line reads as part of it.  The card grows from the bottom of the
+    // frame, so the two reserved rows are that gap — however tall the list,
+    // the card never touches the status row.
     let list_rows = picker
         .visible
         .len()
-        .min((screen.height as usize).saturating_sub(7 + preview_rows))
+        .min((screen.height as usize).saturating_sub(8 + preview_rows))
         .max(1);
-    let height = (list_rows + 4 + preview_rows).min(screen.height.saturating_sub(1) as usize);
+    let height = (list_rows + 4 + preview_rows).min(screen.height.saturating_sub(2) as usize);
     let area = Rect {
         x: screen.x + screen.width.saturating_sub(width as u16) / 2,
-        y: screen.y + screen.height.saturating_sub(height as u16 + 1),
+        y: screen.y + screen.height.saturating_sub(height as u16 + 2),
         width: width as u16,
         height: height as u16,
     };
@@ -2562,6 +2574,65 @@ mod tests {
         let (buffer, _) = render_to(40, 6, &editor);
         let top = row_text(&buffer, 0);
         assert!(top.contains("+"), "modified flag missing: {top:?}");
+    }
+
+    #[test]
+    fn pane_border_style_covers_every_side() {
+        // A border that colours only its top row reads as damage: the focus
+        // style has to reach the sides and the bottom too.
+        let editor = editor_with("hello\n");
+        let config = Config::default();
+        let theme = Theme::default();
+        let (buffer, _) = render_to(40, 8, &editor);
+        let (_, pane_area) = areas(Rect::new(0, 0, 40, 8), &config);
+        let expected = theme
+            .border_focused
+            .fg
+            .expect("the focused border carries a colour");
+        let left = (pane_area.x, pane_area.y + pane_area.height / 2);
+        let right = (pane_area.right() - 1, pane_area.y + pane_area.height / 2);
+        let bottom = (pane_area.x + pane_area.width / 2, pane_area.bottom() - 1);
+        for (x, y) in [left, right, bottom] {
+            assert_eq!(
+                buffer[(x, y)].fg,
+                expected,
+                "border cell ({x},{y}) missed the focus style"
+            );
+        }
+    }
+
+    #[test]
+    fn the_picker_leaves_a_row_between_itself_and_the_status_area() {
+        // The card grows from the bottom of the frame; its border must not sit
+        // flush on the status row, which reads as one continuous line.
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(area);
+        let items = vec![prompt::Item::new("src/main.rs")];
+        let picker = Picker {
+            prompt: "> ",
+            title: "find",
+            input: "",
+            caret: 0,
+            suffix: "",
+            visible: &[0],
+            items: &items,
+            selected: 0,
+        };
+        draw_picker(&mut buffer, area, &picker, &Theme::default());
+        let top = (0..area.height)
+            .find(|&row| (0..area.width).any(|c| buffer[(c, row)].symbol() == "\u{256d}"))
+            .expect("the picker draws a top border");
+        let left = (0..area.width)
+            .find(|&column| buffer[(column, top)].symbol() == "\u{256d}")
+            .expect("left corner");
+        let bottom = (top..area.height)
+            .find(|&row| buffer[(left, row)].symbol() == "\u{2570}")
+            .expect("bottom border");
+        // Two rows below the card: one of buffer, one for the status area.
+        assert!(
+            area.height - 1 - bottom >= 2,
+            "card ends at row {bottom}, leaving no buffer above the status row"
+        );
     }
 
     #[test]
