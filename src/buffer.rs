@@ -538,7 +538,8 @@ impl Buffer {
     /// underneath them and walked back in the same press.  That is what "back to
     /// before I did that" means when the buffer was reformatted after the edit —
     /// undoing only the edit would leave the text in a state nobody typed.
-    pub fn undo(&mut self) -> Option<UndoOutcome> {        // Newest first: the automatic runs sit on top of the change they follow.
+    pub fn undo(&mut self) -> Option<UndoOutcome> {
+        // Newest first: the automatic runs sit on top of the change they follow.
         let mut batch: Vec<UndoItem> = Vec::new();
         while self
             .history
