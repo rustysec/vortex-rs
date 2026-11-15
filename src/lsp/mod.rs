@@ -837,6 +837,8 @@ impl Handshake {
 /// A handle to a running server.
 pub struct ClientHandle {
     pub language: String,
+    /// The server program's name, for the status row ("rust-analyzer").
+    pub server: String,
     pub root: PathBuf,
     outgoing: mpsc::UnboundedSender<Outgoing>,
     failed: Arc<std::sync::atomic::AtomicBool>,
@@ -845,12 +847,14 @@ pub struct ClientHandle {
 impl ClientHandle {
     fn new(
         language: String,
+        server: String,
         root: PathBuf,
         outgoing: mpsc::UnboundedSender<Outgoing>,
         failed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             language,
+            server,
             root,
             outgoing,
             failed,
@@ -991,6 +995,7 @@ pub fn spawn_client(tx: EventTx, spec: ServerSpec, root: PathBuf, job: JobId) ->
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = ClientHandle::new(
         spec.language.clone(),
+        spec.command.clone(),
         root.clone(),
         outgoing_tx,
         Arc::clone(&failed),
@@ -1634,6 +1639,14 @@ impl Clients {
 
     pub fn get(&mut self, root: &Path) -> Option<&mut ClientHandle> {
         self.by_root.get_mut(root)
+    }
+
+    /// The server program attached for `language`, if a live client serves it.
+    pub fn attached(&self, language: &str) -> Option<&str> {
+        self.by_root
+            .values()
+            .find(|client| client.is_alive() && client.language == language)
+            .map(|client| client.server.as_str())
     }
 
     pub fn shutdown_all(&mut self) {

@@ -255,6 +255,14 @@ pub struct Theme {
     pub overlay: Style,
     pub status: Style,
     pub status_inactive: Style,
+    /// Base fill of the angled status row: the bar behind the segments.
+    pub status_bar: Style,
+    /// A filled primary segment (file name, cursor position).
+    pub status_segment: Style,
+    /// A quieter filled segment (encoding, language, split mode …).
+    pub status_soft: Style,
+    /// Accent-filled segment: git branch and the attached language server.
+    pub status_mark: Style,
     pub error: Style,
     keyword: Style,
     string: Style,
@@ -343,6 +351,27 @@ impl Theme {
             overlay: Style::default().bg(hue(Color::Black, Color::White)),
             status: Style::default().add_modifier(Modifier::BOLD),
             status_inactive: Style::default().add_modifier(Modifier::DIM),
+            // The angled bar: a dark/light strip the segments sit on.  Primary
+            // segments are filled one shade off the bar so the separators read;
+            // `status_soft` keeps the fill but dims the text, and
+            // `status_mark` carries the scheme accent.
+            status_bar: Style::default()
+                .fg(if dark { Color::White } else { Color::Black })
+                .bg(hue(Color::Black, Color::White)),
+            status_segment: Style::default()
+                .fg(if dark { Color::White } else { Color::Black })
+                .bg(hue(Color::DarkGray, Color::Gray))
+                .add_modifier(Modifier::BOLD),
+            // Its own shade between the primary fill and the bar, so the
+            // alternating cycle never puts two neighbours in one colour.
+            status_soft: Style::default()
+                .fg(if dark { Color::White } else { Color::Black })
+                .bg(hue(Color::Indexed(236), Color::Indexed(252)))
+                .add_modifier(Modifier::DIM),
+            status_mark: Style::default()
+                .fg(scheme.accent())
+                .bg(hue(Color::DarkGray, Color::Gray))
+                .add_modifier(Modifier::BOLD),
             error: bold(red),
             keyword: bold(magenta),
             string: Style::default().fg(green),
@@ -398,6 +427,32 @@ impl Theme {
             if unset(&config.border) {
                 theme.border = Style::default().fg(to_color(mix(ink, background, 0.55)));
             }
+            // The status bar follows the terminal: the strip is the measured
+            // background itself, and the segment fill a shade off it, so the
+            // angled separators read without inventing colours.
+            if unset(&config.status_bar) {
+                theme.status_bar = Style::default().fg(to_color(ink)).bg(to_color(background));
+            }
+            if unset(&config.status_segment) {
+                let fill = to_color(mix(background, ink, 0.18));
+                theme.status_segment = Style::default()
+                    .fg(to_color(ink))
+                    .bg(fill)
+                    .add_modifier(Modifier::BOLD);
+                if unset(&config.status_soft) {
+                    // A lighter shade than the primary fill — and off the bar
+                    // itself — so alternating chips stay distinguishable.
+                    theme.status_soft = Style::default()
+                        .fg(to_color(mix(ink, background, 0.35)))
+                        .bg(to_color(mix(background, ink, 0.09)));
+                }
+                if unset(&config.status_mark) {
+                    theme.status_mark = Style::default()
+                        .fg(scheme.accent())
+                        .bg(fill)
+                        .add_modifier(Modifier::BOLD);
+                }
+            }
         }
         // The focused pane gets the accent colour, unless the user styled the
         // border or the label themselves.
@@ -407,6 +462,10 @@ impl Theme {
         }
         if unset(&config.label_focused) {
             theme.label_focused = bold(accent);
+        }
+        // The branch/LSP chips follow the accent colour too.
+        if unset(&config.status_mark) {
+            theme.status_mark = theme.status_mark.fg(accent);
         }
         theme.scheme = scheme;
         theme.apply_overrides(config);
@@ -459,6 +518,10 @@ impl Theme {
         override_style(&mut theme.diagnostic_hint, &config.diagnostic_hint);
         override_style(&mut theme.search_match, &config.search_match);
         override_style(&mut theme.prompt, &config.prompt);
+        override_style(&mut theme.status_bar, &config.status_bar);
+        override_style(&mut theme.status_segment, &config.status_segment);
+        override_style(&mut theme.status_soft, &config.status_soft);
+        override_style(&mut theme.status_mark, &config.status_mark);
     }
 
     /// Style for a syntax highlight group.

@@ -10,6 +10,7 @@ that never answers must cost a few milliseconds and nothing else.
 """
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -54,8 +55,11 @@ def run(binary, label, answer_colors):
             "derived blend": b"48;2;" in raw,
             # Dark-scheme accent on the focused pane border (bright cyan).
             "dark accent": b"38;5;14" in raw,
-            # Light-scheme comments are grey (index 8), the dark scheme uses cyan.
-            "light comment": b"38;5;8" in raw,
+            # Light-scheme comments are grey (index 8) on the plain terminal
+            # background; the dark scheme uses cyan.  The angled status chips
+            # legitimately paint index-8 fills, so only bare grey text counts:
+            # `38;5;8` not followed by a `48;…` segment fill.
+            "light comment": re.search(rb"38;5;8(?!\d)(?!;48)", raw) is not None,
         }
         check("%s: file is drawn" % label, "note the numbers" in screen, screen)
         check("%s: editor is alive" % label, "NORMAL" in screen, screen[-200:])

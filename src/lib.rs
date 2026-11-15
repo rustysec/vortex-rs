@@ -10,6 +10,7 @@
 //! * [`crate::ui`] — rendering: panes, borders, status area, prompts
 //! * [`crate::syntax`] — tree-sitter parsing + highlighting (async)
 //! * [`crate::search`] — ripgrep backed file/content search (async)
+//! * [`crate::git`] — git branch probe for the status row (async)
 //! * [`crate::format`] — async language formatters
 //! * [`crate::lsp`] — scaffolding for a language server client
 
@@ -25,6 +26,7 @@ pub mod error;
 pub mod event;
 pub mod format;
 pub mod fuzzy;
+pub mod git;
 pub mod indent;
 pub mod input;
 pub mod lang;

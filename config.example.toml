@@ -48,11 +48,15 @@ diagnostic-float = true       # show the full message when the caret rests on on
 # ---------------------------------------------------------------------------
 [status]
 position = "bottom"           # "top" | "bottom"
+separators = "angled"         # "angled" (powerline segments) | "plain"
 show-mode = true              # "normal" / "insert" / "visual" / "command"
+show-git-branch = true        # git branch of the focused file's repository
 show-pane-name = true         # label of the focused text pane
 show-diagnostics = true       # lsp / spell rollup: "2e 1w"
 show-position = true          # line:col
 show-language = true          # detected language
+show-encoding = true          # "utf-8", or "binary" for undecodable bytes
+show-lsp = true               # language server attached to the focused pane
 show-percentage = true        # how far through the file
 message-timeout = "6s"        # how long status messages stay up
 
@@ -194,6 +198,14 @@ mode-normal = ""
 mode-insert = ""
 mode-visual = ""
 mode-command = ""
+# Angled status row (see [status] separators): the strip behind the segments,
+# the filled primary segments (file name, cursor position), the quieter ones
+# (encoding, language …) and the accent chips (git branch, language server).
+# The mode chip fills with its own mode-<name> colour.
+status-bar = ""
+status-segment = ""
+status-soft = ""
+status-mark = ""
 border = ""
 border-focused = ""
 label = ""

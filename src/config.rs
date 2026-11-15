@@ -22,6 +22,18 @@ pub enum StatusPosition {
     Bottom,
 }
 
+/// How segments in the status row are separated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatusSeparators {
+    /// Powerline-style filled segments with angled `\u{e0b0}` separators.
+    /// Needs a font with the Powerline glyphs.
+    #[default]
+    Angled,
+    /// Plain space-separated sections — works in any terminal.
+    Plain,
+}
+
 impl StatusPosition {
     pub fn is_top(self) -> bool {
         self == StatusPosition::Top
@@ -280,13 +292,22 @@ impl EditorConfig {
 pub struct StatusConfig {
     /// `"top"` or `"bottom"`.
     pub position: StatusPosition,
+    /// `"angled"` (powerline separators) or `"plain"`.
+    pub separators: StatusSeparators,
     pub show_mode: bool,
+    /// Show the git branch of the focused pane's file.
+    pub show_git_branch: bool,
     /// Show the label (name) of the focused text pane.
     pub show_pane_name: bool,
     /// Show the rollup of lsp diagnostics.
     pub show_diagnostics: bool,
     pub show_position: bool,
     pub show_language: bool,
+    /// Show the buffer's text encoding (`utf-8`, or `binary` when the file
+    /// held bytes that are not valid UTF-8).
+    pub show_encoding: bool,
+    /// Show the language server attached to the focused pane's language.
+    pub show_lsp: bool,
     pub show_percentage: bool,
     /// Milliseconds before a status message disappears.
     pub message_timeout: DurationMs,
@@ -296,11 +317,15 @@ impl Default for StatusConfig {
     fn default() -> Self {
         Self {
             position: StatusPosition::default(),
+            separators: StatusSeparators::default(),
             show_mode: true,
+            show_git_branch: true,
             show_pane_name: true,
             show_diagnostics: true,
             show_position: true,
             show_language: true,
+            show_encoding: true,
+            show_lsp: true,
             show_percentage: true,
             message_timeout: DurationMs(6_000),
         }
@@ -614,6 +639,18 @@ pub struct ThemeConfig {
     pub diagnostic_info: String,
     pub search_match: String,
     pub prompt: String,
+    /// Base fill of the status row in angled mode (`""` = chosen per scheme).
+    #[serde(default)]
+    pub status_bar: String,
+    /// Filled segments (file name, cursor position) in angled mode.
+    #[serde(default)]
+    pub status_segment: String,
+    /// Quieter filled segments (encoding, language …) in angled mode.
+    #[serde(default)]
+    pub status_soft: String,
+    /// Accent-filled chips (git branch, language server) in angled mode.
+    #[serde(default)]
+    pub status_mark: String,
 }
 
 /// The whole configuration file.
@@ -835,10 +872,24 @@ impl Config {
                 }
             }
             "status.show-mode" => self.status.show_mode = boolean(key, value)?,
+            "status.separators" => {
+                self.status.separators = match text(key, value)?.as_str() {
+                    "angled" => StatusSeparators::Angled,
+                    "plain" => StatusSeparators::Plain,
+                    other => {
+                        return Err(format!(
+                            "status.separators expects angled or plain, got \"{other}\""
+                        ));
+                    }
+                }
+            }
+            "status.show-git-branch" => self.status.show_git_branch = boolean(key, value)?,
             "status.show-pane-name" => self.status.show_pane_name = boolean(key, value)?,
             "status.show-diagnostics" => self.status.show_diagnostics = boolean(key, value)?,
             "status.show-position" => self.status.show_position = boolean(key, value)?,
             "status.show-language" => self.status.show_language = boolean(key, value)?,
+            "status.show-encoding" => self.status.show_encoding = boolean(key, value)?,
+            "status.show-lsp" => self.status.show_lsp = boolean(key, value)?,
             "status.show-percentage" => self.status.show_percentage = boolean(key, value)?,
             "status.message-timeout" => self.status.message_timeout = duration(key, value)?,
             "search.ripgrep" => self.search.ripgrep = text(key, value)?,
@@ -928,10 +979,14 @@ impl Config {
             "layout.min-width" => self.layout.min_width.to_string(),
             "status.position" => format!("{:?}", self.status.position).to_lowercase(),
             "status.show-mode" => on_off(self.status.show_mode),
+            "status.separators" => format!("{:?}", self.status.separators).to_lowercase(),
+            "status.show-git-branch" => on_off(self.status.show_git_branch),
             "status.show-pane-name" => on_off(self.status.show_pane_name),
             "status.show-diagnostics" => on_off(self.status.show_diagnostics),
             "status.show-position" => on_off(self.status.show_position),
             "status.show-language" => on_off(self.status.show_language),
+            "status.show-encoding" => on_off(self.status.show_encoding),
+            "status.show-lsp" => on_off(self.status.show_lsp),
             "status.show-percentage" => on_off(self.status.show_percentage),
             "search.ripgrep" => self.search.ripgrep.clone(),
             "search.ignore-case" => on_off(self.search.ignore_case),

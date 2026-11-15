@@ -66,6 +66,8 @@ pub enum AsyncEvent {
     Spelled(SpellResult),
     /// Language server traffic (scaffolded).
     Lsp(LspEvent),
+    /// The git branch probe finished (`None` outside a repository).
+    GitBranch(Option<String>),
     /// A one-off message from a background task.
     Message(String),
     /// A background task failed in a way the user should hear about.

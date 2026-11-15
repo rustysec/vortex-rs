@@ -49,6 +49,9 @@ const FORMAT_FALLBACK_IDLE: Duration = Duration::from_millis(500);
 const COMPLETION_IDLE: Duration = Duration::from_millis(90);
 /// How long the caret must rest on a diagnostic before its message is shown.
 const DIAGNOSTIC_HOLD: Duration = Duration::from_millis(500);
+/// How often the git branch behind the status row is re-probed; a branch
+/// switch happens outside vortex, so only time can notice it.
+const GIT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Convert LSP diagnostics for an unopened workspace file into project entries.
 ///
@@ -230,6 +233,11 @@ pub struct App {
     pub search_history: Vec<String>,
     pub search_job: Option<SearchHandle>,
     pub search_root: PathBuf,
+    /// The git branch of the focused buffer's repository, from the last probe.
+    git_branch: Option<String>,
+    /// Which file the current branch was probed for and when: a new file or an
+    /// old answer schedules a fresh probe.
+    git_probe: Option<(Option<PathBuf>, Instant)>,
     pub clients: Clients,
     pub quit: bool,
     needs_redraw: bool,
@@ -322,6 +330,8 @@ impl App {
             search_history: Vec::new(),
             search_job: None,
             search_root,
+            git_branch: None,
+            git_probe: None,
             clients: Clients::new(),
             quit: false,
             needs_redraw: true,
@@ -2082,6 +2092,13 @@ impl App {
             }
             AsyncEvent::Search(search) => self.on_search(search),
             AsyncEvent::Lsp(event) => self.on_lsp(event),
+            AsyncEvent::GitBranch(branch) => {
+                // Only a finished probe speaks for the row: an older answer
+                // still in flight just overwrites the last one, which is fine
+                // for something this cosmetic.
+                self.git_branch = branch;
+                self.needs_redraw = true;
+            }
             AsyncEvent::Message(text) => self.set_message(StatusLevel::Info, text),
             AsyncEvent::Failed { what, error } => {
                 self.set_message(StatusLevel::Error, format!("{what} failed: {error}"));
@@ -3096,6 +3113,34 @@ impl App {
         panes
     }
 
+    /// Schedule a git branch probe when it is due: the focused buffer moved to
+    /// another file, or nobody has looked in a while.  Outside a repository no
+    /// process runs at all — the segment simply stays away.
+    fn maybe_probe_git(&mut self) {
+        if !self.editor.config.status.show_git_branch {
+            return;
+        }
+        let path = self
+            .editor
+            .current_buffer()
+            .and_then(|buffer| buffer.path())
+            .map(Path::to_path_buf);
+        let due = match &self.git_probe {
+            Some((probed, at)) => *probed != path || at.elapsed() >= GIT_PROBE_INTERVAL,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.git_probe = Some((path.clone(), Instant::now()));
+        let root = search::project_root(path.as_deref());
+        if !root.join(".git").exists() {
+            self.git_branch = None;
+            return;
+        }
+        crate::git::probe_branch(self.events.sender(), root);
+    }
+
     /// Build the frame contents and draw them.
     fn draw(&mut self) -> crate::error::Result<()> {
         let size = self.terminal.size()?;
@@ -3110,7 +3155,22 @@ impl App {
         let shape = self.cursor_shape();
         term::set_cursor_shape(shape);
 
-        let status = Snapshot::collect(&self.editor, self.message.clone(), &self.cwd);
+        // The git branch lives outside vortex's own state, so it is probed off
+        // the event loop; this schedules a fresh read when the focused file
+        // changes or the last answer grows old.
+        self.maybe_probe_git();
+        let mut status = Snapshot::collect(&self.editor, self.message.clone(), &self.cwd);
+        if self.editor.config.status.show_git_branch {
+            status.git_branch = self.git_branch.clone();
+        }
+        if self.editor.config.status.show_lsp && self.editor.config.lsp.enable {
+            if let Some(buffer) = self.editor.current_buffer() {
+                status.lsp = self
+                    .clients
+                    .attached(buffer.language.name)
+                    .map(str::to_string);
+            }
+        }
 
         // The search pickers show the selected hit's file beside the list.  It
         // is refreshed here rather than in the renderer — which must stay a
