@@ -48,6 +48,12 @@ diagnostic-float = true       # show the full message when the caret rests on on
 # ---------------------------------------------------------------------------
 [status]
 position = "bottom"           # "top" | "bottom"
+notice-position = "bottom"    # where the message / prompt / key-echo card
+                              # floats over the panes: "top", "top-right",
+                              # "right", "bottom-right", "bottom",
+                              # "bottom-left", "left", "top-left".  The card
+                              # always keeps one clear row between itself and
+                              # the status bar on that side.
 separators = "angled"         # "angled" (powerline segments) | "plain"
 show-mode = true              # "normal" / "insert" / "visual" / "command"
 show-git-branch = true        # git branch of the focused file's repository
@@ -371,6 +377,8 @@ prompt = ""
 # vim's goto-definition; `space r` lists every reference in a grep-style popup.
 "gd" = "goto-definition"
 "space r" = "find-references"
+# rename the symbol under the cursor everywhere, buffers and files alike.
+"space m" = "rename-symbol"
 "space e" = "spell-suggest"
 # vim's spelling suggestion key.
 "z=" = "spell-suggest"

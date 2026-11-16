@@ -40,6 +40,79 @@ impl StatusPosition {
     }
 }
 
+/// Where the transient notice card — a message, the echo of a partial key
+/// sequence, or the search / rename line — floats over the panes.
+///
+/// Named as a compass: the side of the pane the card hugs, refined by a
+/// corner.  `left` and `right` hug the side and sit vertically centred;
+/// `top` and `bottom` hug the edge and sit horizontally centred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NoticePosition {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    /// The default: against the bottom of the panes, centred.
+    #[default]
+    Bottom,
+    BottomLeft,
+    BottomRight,
+    Right,
+}
+
+impl NoticePosition {
+    pub fn is_top_anchored(self) -> bool {
+        matches!(self, Self::Top | Self::TopLeft | Self::TopRight)
+    }
+
+    pub fn is_bottom_anchored(self) -> bool {
+        matches!(self, Self::Bottom | Self::BottomLeft | Self::BottomRight)
+    }
+
+    /// A card anchored to the bottom edge moves to the top of the panes while
+    /// a picker is open: the picker card covers the middle and bottom, and a
+    /// warning must not be buried under the thing that caused it.  The corner
+    /// stays; only the edge flips.
+    pub fn avoid_picker(self) -> Self {
+        match self {
+            Self::Bottom => Self::Top,
+            Self::BottomLeft => Self::TopLeft,
+            Self::BottomRight => Self::TopRight,
+            other => other,
+        }
+    }
+
+    /// Parse a `:set status.notice-position=…` value.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "top-left" => Self::TopLeft,
+            "top" => Self::Top,
+            "top-right" => Self::TopRight,
+            "left" => Self::Left,
+            "bottom" => Self::Bottom,
+            "bottom-left" => Self::BottomLeft,
+            "bottom-right" => Self::BottomRight,
+            "right" => Self::Right,
+            _ => return None,
+        })
+    }
+
+    /// The name `parse` accepts, for `:set` output and error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TopLeft => "top-left",
+            Self::Top => "top",
+            Self::TopRight => "top-right",
+            Self::Left => "left",
+            Self::Bottom => "bottom",
+            Self::BottomLeft => "bottom-left",
+            Self::BottomRight => "bottom-right",
+            Self::Right => "right",
+        }
+    }
+}
+
 /// Line number gutter style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -292,6 +365,9 @@ impl EditorConfig {
 pub struct StatusConfig {
     /// `"top"` or `"bottom"`.
     pub position: StatusPosition,
+    /// Where the transient notice card floats: `top`, `top-right`, `right`,
+    /// `bottom-right`, `bottom`, `bottom-left`, `left` or `top-left`.
+    pub notice_position: NoticePosition,
     /// `"angled"` (powerline separators) or `"plain"`.
     pub separators: StatusSeparators,
     pub show_mode: bool,
@@ -317,6 +393,7 @@ impl Default for StatusConfig {
     fn default() -> Self {
         Self {
             position: StatusPosition::default(),
+            notice_position: NoticePosition::default(),
             separators: StatusSeparators::default(),
             show_mode: true,
             show_git_branch: true,
@@ -872,6 +949,18 @@ impl Config {
                 }
             }
             "status.show-mode" => self.status.show_mode = boolean(key, value)?,
+            "status.notice-position" => {
+                let text = text(key, value)?;
+                match NoticePosition::parse(&text) {
+                    Some(place) => self.status.notice_position = place,
+                    None => {
+                        return Err(format!(
+                            "status.notice-position expects one of top, top-right, right, \
+                             bottom-right, bottom, bottom-left, left, top-left, got \"{text}\""
+                        ));
+                    }
+                }
+            }
             "status.separators" => {
                 self.status.separators = match text(key, value)?.as_str() {
                     "angled" => StatusSeparators::Angled,
@@ -978,6 +1067,7 @@ impl Config {
             "layout.min-height" => self.layout.min_height.to_string(),
             "layout.min-width" => self.layout.min_width.to_string(),
             "status.position" => format!("{:?}", self.status.position).to_lowercase(),
+            "status.notice-position" => self.status.notice_position.as_str().to_string(),
             "status.show-mode" => on_off(self.status.show_mode),
             "status.separators" => format!("{:?}", self.status.separators).to_lowercase(),
             "status.show-git-branch" => on_off(self.status.show_git_branch),
@@ -1170,6 +1260,39 @@ mod tests {
         let text = Config::default().to_toml_string();
         let (_config, warnings) = Config::parse(&text).expect("round trips");
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn notice_position_round_trips_through_set() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.value_of("status.notice-position").as_deref(),
+            Some("bottom")
+        );
+        for place in [
+            "top",
+            "top-right",
+            "right",
+            "bottom-right",
+            "bottom",
+            "bottom-left",
+            "left",
+            "top-left",
+        ] {
+            config
+                .set_value("status.notice-position", place)
+                .expect(place);
+            assert_eq!(
+                config.value_of("status.notice-position").as_deref(),
+                Some(place),
+                "{place} should read back as written"
+            );
+        }
+        // A nonsense side is refused, naming the accepted ones.
+        let error = config
+            .set_value("status.notice-position", "sideways")
+            .expect_err("not a side");
+        assert!(error.contains("top-left"), "{error}");
     }
 
     #[test]

@@ -885,6 +885,7 @@ pub const OPTION_KEYS: &[&str] = &[
     "layout.min-width",
     "layout.min-height",
     "status.position",
+    "status.notice-position",
     "spell.enable",
     "spell.only-comments",
     "spell.case-sensitive",

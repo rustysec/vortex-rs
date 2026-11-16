@@ -541,3 +541,68 @@ async fn definitions_and_references_come_back_as_locations() {
         "references should cover the declaration and the call: {locations:?}"
     );
 }
+
+/// Rename: the server answers with a workspace edit that covers every
+/// occurrence, in positions the editor can resolve against its own text.
+#[tokio::test]
+async fn a_rename_answers_with_a_workspace_edit() {
+    require_rust_analyzer!();
+    let source = "fn target() -> u32 { 1 }\nfn main() { let _ = target(); }\n";
+    let scratch = Scratch::with_source("rename", source);
+    let mut session = Session::start(&scratch.root, LspSync::Full);
+    session.wait_until_ready().await;
+
+    let path = scratch.file();
+    let uri = lsp::uri_for(&path);
+    session
+        .handle
+        .did_open(uri.clone(), "rust", source.into(), 1);
+
+    let mut answer = None;
+    let mut last_error = None;
+    for attempt in 0..10 {
+        let request = 400 + attempt;
+        session.handle.rename(
+            uri.clone(),
+            request,
+            1,
+            22, // the call's `target`
+            "renamed".into(),
+        );
+        if let Some(LspEvent::Renamed { changes, error, .. }) = session
+            .wait_for(
+                |event| matches!(event, LspEvent::Renamed { request: id, .. } if *id == request),
+            )
+            .await
+        {
+            // An answer while rust-analyzer is still loading the project can
+            // come back refused ("no references" until it has indexed the
+            // file); retry rather than take the first no as the final word,
+            // the same rule the hover and navigation waits follow.
+            last_error = error;
+            let count: usize = changes.iter().map(|doc| doc.edits.len()).sum();
+            if count >= 2 {
+                answer = Some(changes);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let changes = answer.unwrap_or_else(|| {
+        panic!("rust-analyzer never answered rename with the occurrences: {last_error:?}")
+    });
+    assert_eq!(changes.len(), 1, "one document, one share of the edit");
+    let document = &changes[0];
+    assert_eq!(document.uri, uri);
+    assert!(
+        document.edits.iter().all(|e| e.new_text == "renamed"),
+        "every edit writes the new name: {:?}",
+        document.edits
+    );
+    assert!(
+        document.edits.iter().any(|e| e.start.0 == 0)
+            && document.edits.iter().any(|e| e.start.0 == 1),
+        "the declaration and the call both take an edit: {:?}",
+        document.edits
+    );
+}

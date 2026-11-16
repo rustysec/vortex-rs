@@ -144,6 +144,21 @@ pub enum LspEvent {
         request: i64,
         locations: Vec<Location>,
     },
+    /// The rewritten documents a `textDocument/rename` asks for.
+    ///
+    /// The edits stay in LSP coordinates (line / UTF-16 column) rather than
+    /// byte spans like `Formatted`: a rename can span the whole workspace,
+    /// and most of those documents are not buffers here.  Each receiver
+    /// resolves the positions against the text it actually holds — the
+    /// buffer for an open file, the disk for the rest.  `error` is the
+    /// server's refusal (an illegal name, say), in which case `changes` is
+    /// empty and nothing must be applied.
+    Renamed {
+        uri: String,
+        request: i64,
+        changes: Vec<DocumentEdits>,
+        error: Option<String>,
+    },
     /// A server exited; it will be restarted the next time it is needed.
     Closed { language: String, code: Option<i32> },
 }
@@ -699,6 +714,7 @@ pub enum PendingKind {
     CodeAction,
     Definition,
     References,
+    Rename,
     /// A `textDocument/diagnostic` pull, whose answer is a whole set for the
     /// document rather than something tied to the caret.
     PullDiagnostics,
@@ -739,6 +755,110 @@ pub struct Location {
     pub uri: String,
     pub line: usize,
     pub character: usize,
+}
+
+/// One text replacement in the LSP's own coordinates: both positions are
+/// 0-based lines and UTF-16 columns, unresolved against any particular copy
+/// of the text.  The receiver turns them into byte offsets for whatever it
+/// holds — a buffer, or a file read from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionedEdit {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub new_text: String,
+}
+
+/// One document's share of a workspace edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentEdits {
+    pub uri: String,
+    pub edits: Vec<PositionedEdit>,
+}
+
+/// Decode a `WorkspaceEdit`, as returned by `textDocument/rename`.
+///
+/// The spec gives it two shapes and servers use both: a `changes` map from
+/// document URI to edits, and `documentChanges`, an ordered list whose text
+/// entries carry `textDocument` plus `edits`.  The list form can also hold
+/// file creations, renames and deletes, which vortex does not perform — an
+/// entry without `edits` is skipped, and the rename is applied to the text it
+/// can.  `null` (nothing to change) decodes to an empty list.
+pub fn workspace_edit(result: &Value) -> Vec<DocumentEdits> {
+    let mut documents: Vec<DocumentEdits> = Vec::new();
+    let mut push = |uri: String, items: &[Value]| {
+        let edits: Vec<PositionedEdit> = items.iter().filter_map(positioned_edit).collect();
+        if edits.is_empty() {
+            return;
+        }
+        match documents.iter_mut().find(|doc| doc.uri == uri) {
+            Some(doc) => doc.edits.extend(edits),
+            None => documents.push(DocumentEdits { uri, edits }),
+        }
+    };
+    if let Some(changes) = result.get("changes").and_then(Value::as_object) {
+        for (uri, items) in changes {
+            let Some(items) = items.as_array() else {
+                continue;
+            };
+            push(uri.clone(), items);
+        }
+    }
+    if let Some(items) = result.get("documentChanges").and_then(Value::as_array) {
+        for item in items {
+            // A TextDocumentEdit; a file operation has no `edits`.
+            let Some(uri) = item.pointer("/textDocument/uri").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(edits) = item.get("edits").and_then(Value::as_array) else {
+                continue;
+            };
+            push(uri.to_string(), edits);
+        }
+    }
+    documents
+}
+
+/// One `TextEdit` object as raw LSP positions.
+fn positioned_edit(value: &Value) -> Option<PositionedEdit> {
+    Some(PositionedEdit {
+        start: position(value.pointer("/range/start")?)?,
+        end: position(value.pointer("/range/end")?)?,
+        new_text: value
+            .get("newText")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+/// Apply positioned edits to a plain text, returning the new text and how
+/// many edits landed.
+///
+/// This is the file-on-disk path of a workspace edit — an open buffer has its
+/// own machinery (`Editor::apply_edits`) for undo and language-server sync.
+/// Edits go in reverse position order so each splice still sees the offsets
+/// of everything before it; an edit that overlaps one already applied (the
+/// server should never send one, but a half-synced document can make a
+/// plausible-looking lie) is skipped rather than corrupting the text.
+pub fn apply_edits_to_text(text: &str, edits: &[PositionedEdit]) -> (String, usize) {
+    let mut ordered: Vec<&PositionedEdit> = edits.iter().collect();
+    ordered.sort_by_key(|edit| std::cmp::Reverse((edit.start, edit.end)));
+    let mut updated = text.to_string();
+    let mut applied = 0usize;
+    // Byte offset of the start of everything applied so far; an edit whose
+    // end reaches past it overlaps a change already made.
+    let mut frontier = usize::MAX;
+    for edit in ordered {
+        let start = byte_at_utf16_position(&updated, edit.start);
+        let end = byte_at_utf16_position(&updated, edit.end).max(start);
+        if end > frontier || start > updated.len() {
+            continue;
+        }
+        updated.replace_range(start..end, &edit.new_text);
+        frontier = start;
+        applied += 1;
+    }
+    (updated, applied)
 }
 
 /// Decode a `textDocument/definition` or `textDocument/references` result.
@@ -871,6 +991,14 @@ enum Outgoing {
         request: i64,
         line: usize,
         character: usize,
+    },
+    /// Ask to rename the symbol at a position through the whole workspace.
+    Rename {
+        uri: String,
+        request: i64,
+        line: usize,
+        character: usize,
+        new_name: String,
     },
     /// Ask the server for its own analysis of a document.
     ///
@@ -1076,6 +1204,26 @@ impl ClientHandle {
         });
     }
 
+    /// Ask to rename the symbol at a position, everywhere the server says it
+    /// occurs.  The answer is a workspace edit to apply, not the rename
+    /// itself: the client performs it.
+    pub fn rename(
+        &self,
+        uri: String,
+        request: i64,
+        line: usize,
+        character: usize,
+        new_name: String,
+    ) {
+        let _ = self.outgoing.send(Outgoing::Rename {
+            uri,
+            request,
+            line,
+            character,
+            new_name,
+        });
+    }
+
     pub fn shutdown(&self) {
         let _ = self.outgoing.send(Outgoing::Shutdown);
     }
@@ -1174,6 +1322,9 @@ async fn session(
                     // server the client actually asks.
                     "definition": { "dynamicRegistration": false },
                     "references": { "dynamicRegistration": false },
+                    // Rename: we apply the returned WorkspaceEdit ourselves,
+                    // and do not support the prepareRename round trip.
+                    "rename": { "dynamicRegistration": false, "prepareSupport": false },
                     // Pull diagnostics.  Declaring `diagnostic` here is not
                     // optional: rust-analyzer checks it before sending
                     // `workspace/diagnostic/refresh`.  Without it the only
@@ -1323,6 +1474,15 @@ async fn session(
                                             uri: request_uri,
                                             request: id,
                                             locations: found,
+                                        }
+                                    }
+                                    PendingKind::Rename => {
+                                        let changes = workspace_edit(&result);
+                                        LspEvent::Renamed {
+                                            uri: request_uri,
+                                            request: id,
+                                            changes,
+                                            error,
                                         }
                                     }
                                     PendingKind::PullDiagnostics => {
@@ -1670,6 +1830,32 @@ async fn send_outgoing(
             );
             let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
         }
+        Outgoing::Rename {
+            uri,
+            request,
+            line,
+            character,
+            new_name,
+        } => {
+            pending.insert(
+                request,
+                PendingRequest {
+                    kind: PendingKind::Rename,
+                    uri: uri.clone(),
+                    version: None,
+                },
+            );
+            let request_message = jsonrpc::request(
+                request,
+                "textDocument/rename",
+                Some(json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                    "newName": new_name
+                })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
+        }
         Outgoing::Format {
             uri,
             request,
@@ -1933,6 +2119,92 @@ mod tests {
         assert!(locations(&Value::Null, fallback).is_empty());
         assert!(locations(&json!([]), fallback).is_empty());
         assert!(locations(&json!([{}]), fallback).is_empty());
+    }
+
+    #[test]
+    fn decodes_both_shapes_of_workspace_edit() {
+        // The `changes` map, keyed by document URI.
+        let changes = json!({
+            "changes": {
+                "file:///p/src/app.rs": [
+                    { "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 1, "character": 9 } }, "newText": "count" },
+                ],
+                "file:///p/src/lib.rs": [
+                    { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }, "newText": "count" },
+                    { "range": { "start": { "line": 3, "character": 2 }, "end": { "line": 3, "character": 7 } }, "newText": "count" },
+                ],
+            }
+        });
+        let documents = workspace_edit(&changes);
+        assert_eq!(documents.len(), 2);
+        let lib = documents
+            .iter()
+            .find(|doc| doc.uri.ends_with("lib.rs"))
+            .expect("lib.rs edits");
+        assert_eq!(lib.edits.len(), 2);
+        assert_eq!(lib.edits[0].start, (0, 0));
+        assert_eq!(lib.edits[0].new_text, "count");
+
+        // The `documentChanges` list, with a file creation that must be
+        // skipped rather than applied as a text edit.
+        let list = json!({
+            "documentChanges": [
+                {
+                    "textDocument": { "uri": "file:///p/src/app.rs", "version": 2 },
+                    "edits": [
+                        { "range": { "start": { "line": 9, "character": 1 }, "end": { "line": 9, "character": 6 } }, "newText": "count" },
+                    ]
+                },
+                { "kind": "create", "uri": "file:///p/src/new.rs" },
+            ]
+        });
+        let documents = workspace_edit(&list);
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].edits[0].start, (9, 1));
+
+        // Null (nothing to change) and empty shapes decode to nothing.
+        assert!(workspace_edit(&Value::Null).is_empty());
+        assert!(workspace_edit(&json!({ "changes": {} })).is_empty());
+    }
+
+    #[test]
+    fn positioned_edits_apply_last_first_and_skip_overlaps() {
+        let text = "fn lookup() { lookup(); lookup(); }\n";
+        let edit = |sl, sc, el, ec| PositionedEdit {
+            start: (sl, sc),
+            end: (el, ec),
+            new_text: "find".into(),
+        };
+        // Same line, three places, given out of order: all three land.
+        let edits = vec![edit(0, 24, 0, 30), edit(0, 3, 0, 9), edit(0, 14, 0, 20)];
+        let (updated, applied) = apply_edits_to_text(text, &edits);
+        assert_eq!(applied, 3);
+        assert_eq!(updated, "fn find() { find(); find(); }\n");
+
+        // An edit reaching into one already applied is skipped whole.
+        let overlapping = vec![edit(0, 3, 0, 9), edit(0, 7, 0, 12)];
+        let (updated, applied) = apply_edits_to_text(text, &overlapping);
+        assert_eq!(applied, 1, "the overlap must not corrupt: {updated}");
+
+        // Multi-byte text: columns are UTF-16 units, not bytes or chars.
+        // The emoji is one char but two UTF-16 units, so a naive count puts
+        // every later column off by one.
+        let text = "let 🔍_lookup = 1; // 🔍_lookup\n";
+        let edits = vec![
+            PositionedEdit {
+                start: (0, 4),
+                end: (0, 13),
+                new_text: "telescope".into(),
+            },
+            PositionedEdit {
+                start: (0, 22),
+                end: (0, 31),
+                new_text: "telescope".into(),
+            },
+        ];
+        let (updated, applied) = apply_edits_to_text(text, &edits);
+        assert_eq!(applied, 2, "utf-16 columns must line up: {updated}");
+        assert_eq!(updated, "let telescope = 1; // telescope\n");
     }
 
     #[test]

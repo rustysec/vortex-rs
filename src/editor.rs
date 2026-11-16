@@ -106,6 +106,8 @@ pub enum PromptSpec {
     },
     /// Diagnostics of the current buffer.
     Diagnostics(DiagnosticScope),
+    /// Rename the symbol under the cursor; `symbol` names it in the label.
+    Rename { symbol: String },
     /// `:substitute` — a second argument line.
     Substitute(String),
 }
@@ -1709,6 +1711,31 @@ impl Editor {
             Cmd::CodeAction => intents.push(Intent::CodeAction),
             Cmd::GotoDefinition => intents.push(Intent::GotoDefinition),
             Cmd::FindReferences => intents.push(Intent::FindReferences),
+            Cmd::RenameSymbol => {
+                // Say why early when the rename cannot happen at all: a key
+                // that silently opens nothing reads as a broken key.
+                if !self.config.lsp.enable {
+                    intents.push(Intent::Message(
+                        StatusLevel::Info,
+                        "renaming needs [lsp] enable = true".into(),
+                    ));
+                } else if self.current_buffer().and_then(|b| b.path()).is_none() {
+                    intents.push(Intent::Message(
+                        StatusLevel::Info,
+                        "renaming needs a file on disk (the server keys documents by path)".into(),
+                    ));
+                } else {
+                    // The label names the symbol so the user knows which one
+                    // the server will rewrite; the line starts empty, as for
+                    // every prompt — a name to fix is one Backspace away, a
+                    // name to delete-then-type is a typo waiting.
+                    let symbol = self
+                        .current_buffer()
+                        .and_then(|buffer| buffer.word_under_cursor(self.cursor()))
+                        .unwrap_or_default();
+                    intents.push(Intent::OpenPrompt(PromptSpec::Rename { symbol }));
+                }
+            }
             Cmd::SpellSuggest => intents.extend(self.spell_suggest()),
             Cmd::FormatBuffer => {
                 if let Some(id) = self.current_buffer_id() {
@@ -3883,6 +3910,50 @@ mod tests {
         assert!(intents.contains(&Intent::EnsureVisible));
         assert_eq!(fixture.text(), "let value = compute(1);\nsecond\n");
         assert_eq!(fixture.cursor(), 22);
+    }
+
+    #[test]
+    fn rename_says_why_when_lsp_is_off() {
+        // The starter keeps `[lsp] enable = false`; the key must explain why
+        // nothing opens, not sit silent.
+        let mut fixture = Fixture::new("alpha\n");
+        let intents = fixture.editor.run_cmd(Cmd::RenameSymbol, fixture.area);
+        let messages = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                Intent::Message(_, text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            messages.contains("[lsp] enable = true"),
+            "expected an explanation, got: {messages}"
+        );
+    }
+
+    #[test]
+    fn rename_prompts_with_the_symbol_named_in_the_label() {
+        // With LSP on and a real file, the rename prompt opens; its label
+        // names the word under the caret so the user knows what gets rewritten.
+        let dir = std::env::temp_dir().join(format!("vortex-rename-{}", std::process::id()));
+        let path = dir.join("symbol.txt");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(&path, "lookup and more\n").expect("temp file");
+        let mut fixture = Fixture::new("scratch\n");
+        fixture.editor.config.lsp.enable = true;
+        let (id, _) = fixture.editor.open_path(&path);
+        fixture.editor.focus_buffer(id);
+        fixture.editor.set_cursor(3); // on `lookup`
+        let intents = fixture.editor.run_cmd(Cmd::RenameSymbol, fixture.area);
+        let symbol = intents
+            .iter()
+            .find_map(|intent| match intent {
+                Intent::OpenPrompt(PromptSpec::Rename { symbol }) => Some(symbol.clone()),
+                _ => None,
+            })
+            .expect("a rename prompt");
+        assert_eq!(symbol, "lookup");
     }
 
     #[test]

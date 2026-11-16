@@ -19,7 +19,7 @@ use ratatui::symbols::border;
 
 use crate::action::VisualKind;
 use crate::buffer::Buffer as TextBuffer;
-use crate::config::{BorderStyle, Config, LineNumber};
+use crate::config::{BorderStyle, Config, LineNumber, NoticePosition};
 use crate::diagnostic::{Diagnostic, DiagnosticTag, Severity};
 use crate::editor::{Editor, StatusLevel};
 use crate::prompt;
@@ -224,15 +224,22 @@ pub fn draw(frame: &mut Frame, screen: &Screen) -> Option<Position> {
     );
 
     // Transient text — a message or the echo of a partial key sequence — floats on
-    // a card over the panes.  The status row keeps its own contents whatever
-    // happens, which is the point of not having a command row: nothing has to be
-    // cleared and restored, and the file you are reading is only ever covered for
-    // as long as the message lasts.  It sits against the status row, except while
-    // a list card is open — those grow up from there — when it moves to the far
-    // edge of the panes so a warning is not buried under the thing that caused it.
+    // a card over the panes at `[status] notice-position`.  The status row keeps
+    // its own contents whatever happens, which is the point of not having a
+    // command row: nothing has to be cleared and restored, and the file you are
+    // reading is only ever covered for as long as the message lasts.  While a
+    // list card is open, a bottom-anchored notice flips to the top edge so a
+    // warning is not buried under the thing that caused it.
     if let Some(card) = screen.notice() {
-        let anchor_top = screen.picker.is_some() || screen.config.status.position.is_top();
-        if let Some(position) = draw_notice(buf, pane_area, &card, anchor_top, screen.theme) {
+        let place = if screen.picker.is_some() {
+            screen.config.status.notice_position.avoid_picker()
+        } else {
+            screen.config.status.notice_position
+        };
+        let status_on_top = screen.config.status.position.is_top();
+        if let Some(position) =
+            draw_notice(buf, pane_area, &card, place, status_on_top, screen.theme)
+        {
             cursor = Some(position);
         }
     }
@@ -1228,20 +1235,23 @@ pub fn pane_content(area: Rect, config: &Config) -> Rect {
 
 // ------------------------------------------------------------------ overlays
 
-/// Draw one transient line — a prompt, an echo or a message — on a card pinned
-/// to the bottom of the panes (or the top when `[status] position = "top"`).
+/// Draw one transient line — a prompt, an echo or a message — on a card
+/// floating over the panes at `[status] notice-position`.
 ///
 /// The card is one row tall inside its border: this text is read in a glance, and
 /// a taller box would cover the file for no reason.  It is as wide as the text
 /// needs up to most of the pane, so a long path or error still reads in one
 /// piece while a short "42 lines yanked" leaves the buffer visible around it.
+/// On the edge where the status row sits the card keeps one clear row between
+/// its border and the bar — two borders stacked read as one broken line.
 /// The return value is where the terminal cursor goes: inside the card when the
 /// user is typing into it, nowhere otherwise.
 fn draw_notice(
     buf: &mut Buffer,
     pane_area: Rect,
     notice: &Notice,
-    anchor_top: bool,
+    place: NoticePosition,
+    status_on_top: bool,
     theme: &Theme,
 ) -> Option<Position> {
     if pane_area.width < 8 || pane_area.height < 3 {
@@ -1252,16 +1262,33 @@ fn draw_notice(
     let width = (wanted as u16)
         .min(pane_area.width.saturating_sub(2).max(8))
         .max(12.min(pane_area.width));
-    let height = 3.min(pane_area.height);
-    // The card sits against the status row, wherever `[status] position` put it.
-    let top_of_card = if anchor_top {
-        pane_area.y
+    // The clear row is only due on the status side, and only when the pane
+    // has room for the card plus the gap; a clipped card is worse than a
+    // flush one on a tiny terminal.
+    let on_status_edge = (status_on_top && place.is_top_anchored())
+        || (!status_on_top && place.is_bottom_anchored());
+    let gap = u16::from(on_status_edge).min(pane_area.height.saturating_sub(3));
+    let height = 3.min(pane_area.height - gap);
+    let y = if place.is_top_anchored() {
+        pane_area.y + gap
+    } else if place.is_bottom_anchored() {
+        pane_area.bottom().saturating_sub(height + gap)
     } else {
-        pane_area.bottom().saturating_sub(height)
+        // Left / Right: vertically centred, so no edge is shared with the bar.
+        pane_area.y + pane_area.height.saturating_sub(height) / 2
+    };
+    let x = match place {
+        NoticePosition::TopLeft | NoticePosition::BottomLeft | NoticePosition::Left => pane_area.x,
+        NoticePosition::TopRight | NoticePosition::BottomRight | NoticePosition::Right => {
+            pane_area.right().saturating_sub(width)
+        }
+        NoticePosition::Top | NoticePosition::Bottom => {
+            pane_area.x + pane_area.width.saturating_sub(width) / 2
+        }
     };
     let area = Rect {
-        x: pane_area.x + pane_area.width.saturating_sub(width) / 2,
-        y: top_of_card,
+        x,
+        y,
         width,
         height,
     };
@@ -2325,7 +2352,14 @@ mod tests {
         // No caret: a message takes no input, so the terminal cursor stays on the
         // text it belongs to rather than jumping into the card.
         assert_eq!(
-            draw_notice(&mut buffer, pane_area, &notice, false, &theme),
+            draw_notice(
+                &mut buffer,
+                pane_area,
+                &notice,
+                NoticePosition::Bottom,
+                false,
+                &theme
+            ),
             None
         );
         status::render(
@@ -2375,12 +2409,147 @@ mod tests {
         let notice = screen.notice().expect("the prompt is the notice");
         assert_eq!(notice.text, "vortex", "the message waits its turn");
         let (_, pane_area) = areas(area, &config);
-        let caret = draw_notice(&mut buffer, pane_area, &notice, false, &theme).expect("a caret");
+        let caret = draw_notice(
+            &mut buffer,
+            pane_area,
+            &notice,
+            NoticePosition::Bottom,
+            false,
+            &theme,
+        )
+        .expect("a caret");
         let rendered = frame_text(&buffer);
         assert!(rendered.contains("/vortex"), "{rendered}");
         assert!(!rendered.contains("older news"), "{rendered}");
-        // The cursor lands after the six characters typed.
-        assert_eq!(caret.y, pane_area.bottom() - 2);
+        // The cursor lands after the six characters typed, on the card's text
+        // row — one clear row above sits between the card and the status row.
+        assert_eq!(caret.y, pane_area.bottom() - 3);
+    }
+
+    /// The notice card as `(left, top, right, bottom)`, found by its corners.
+    fn card_box(buffer: &Buffer) -> (u16, u16, u16, u16) {
+        let area = buffer.area;
+        let top = (0..area.height)
+            .find(|&row| (0..area.width).any(|column| buffer[(column, row)].symbol() == "\u{256d}"))
+            .expect("the card draws a top border");
+        let left = (0..area.width)
+            .find(|&column| buffer[(column, top)].symbol() == "\u{256d}")
+            .expect("left corner");
+        let right = (left..area.width)
+            .find(|&column| buffer[(column, top)].symbol() == "\u{256e}")
+            .expect("right corner");
+        let bottom = (top..area.height)
+            .find(|&row| buffer[(left, row)].symbol() == "\u{2570}")
+            .expect("bottom border");
+        (left, top, right, bottom)
+    }
+
+    /// A notice card over the default screen; returns the buffer and pane area.
+    fn notice_over_message(place: NoticePosition, status_top: bool) -> (Buffer, Rect) {
+        let editor = editor_with("alpha\nbeta\n");
+        let area = Rect::new(0, 0, 60, 12);
+        let mut config = Config::default();
+        config.status.position = if status_top {
+            crate::config::StatusPosition::Top
+        } else {
+            crate::config::StatusPosition::Bottom
+        };
+        let theme = Theme::default();
+        let mut snapshot = Snapshot::collect(&editor, None, std::path::Path::new("/tmp"));
+        snapshot.message = Some((StatusLevel::Info, "search highlight cleared".into()));
+        let screen = Screen {
+            editor: &editor,
+            config: &config,
+            theme: &theme,
+            status: snapshot,
+            prompt: None,
+            picker: None,
+            completion: None,
+            diagnostic_float: None,
+            hover: None,
+        };
+        let (_, pane_area) = areas(area, &config);
+        let mut buffer = Buffer::empty(area);
+        let notice = screen.notice().expect("the message is the notice");
+        draw_notice(&mut buffer, pane_area, &notice, place, status_top, &theme);
+        (buffer, pane_area)
+    }
+
+    #[test]
+    fn the_notice_keeps_a_clear_row_from_the_status_bar() {
+        // Two borders stacked read as one broken line: the card must leave a
+        // full row between itself and the bar, on whichever edge the bar is.
+        // On the opposite edge there is no bar to keep clear of, and the card
+        // sits flush.
+        for status_top in [false, true] {
+            let (buffer, pane_area) = notice_over_message(NoticePosition::Bottom, status_top);
+            let (_, _, _, bottom) = card_box(&buffer);
+            let gap = u16::from(!status_top);
+            assert_eq!(
+                bottom,
+                pane_area.bottom() - 1 - gap,
+                "bottom-anchored card, status_top={status_top}"
+            );
+
+            let (buffer, pane_area) = notice_over_message(NoticePosition::Top, status_top);
+            let (_, top, _, _) = card_box(&buffer);
+            let gap = u16::from(status_top);
+            assert_eq!(
+                top,
+                pane_area.y + gap,
+                "top-anchored card, status_top={status_top}"
+            );
+        }
+    }
+
+    #[test]
+    fn notice_positions_place_the_card_where_they_say() {
+        let cases = [
+            (NoticePosition::Top, true, None),
+            (NoticePosition::TopLeft, true, Some(true)),
+            (NoticePosition::TopRight, true, Some(false)),
+            (NoticePosition::Bottom, false, None),
+            (NoticePosition::BottomLeft, false, Some(true)),
+            (NoticePosition::BottomRight, false, Some(false)),
+        ];
+        for (place, top_edge, left_edge) in cases {
+            let (buffer, pane_area) = notice_over_message(place, false);
+            let (left, top, right, bottom) = card_box(&buffer);
+            if top_edge {
+                assert_eq!(top, pane_area.y, "{place:?} hugs the top edge");
+            } else {
+                assert_eq!(
+                    bottom,
+                    pane_area.bottom() - 2,
+                    "{place:?} hugs the bottom edge"
+                );
+            }
+            match left_edge {
+                Some(true) => assert_eq!(left, pane_area.x, "{place:?} hugs the left"),
+                Some(false) => assert_eq!(right, pane_area.right() - 1, "{place:?} hugs the right"),
+                None => {
+                    let left_margin = left - pane_area.x;
+                    let right_margin = pane_area.right() - 1 - right;
+                    assert_eq!(left_margin, right_margin, "{place:?} is centred");
+                }
+            }
+        }
+        // Left and Right: vertically centred, hugging the named side.
+        for (place, expect_left) in [(NoticePosition::Left, true), (NoticePosition::Right, false)] {
+            let (buffer, pane_area) = notice_over_message(place, false);
+            let (left, top, right, bottom) = card_box(&buffer);
+            if expect_left {
+                assert_eq!(left, pane_area.x);
+            } else {
+                assert_eq!(right, pane_area.right() - 1);
+            }
+            let above = top - pane_area.y;
+            let below = pane_area.bottom() - 1 - bottom;
+            assert!(
+                below.abs_diff(above) <= 1,
+                "{place:?} should sit vertically centred: {top}..{bottom} in {pane_area:?}"
+            );
+        }
     }
 
     /// Locate a drawn picker's card by its rounded corners.

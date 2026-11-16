@@ -75,6 +75,7 @@ line does nothing:
 | `Space d` | diagnostics at the cursor |
 | `gd` | jump to the definition of the symbol under the cursor |
 | `Space r` | list every reference to it, picker like the grep results |
+| `Space m` | rename the symbol everywhere — buffers and plain files alike |
 | `z=` or `Space e` | spelling suggestions |
 | `Space x` | clear the search highlight |
 | `Space v` / `Space h` | split right / split below |
@@ -365,9 +366,9 @@ the bug is "the file was empty" or "the leader key did nothing".
 ## Limitations worth knowing
 
 * LSP covers diagnostics (pushed and pulled), insert-mode completion, hover,
-  quick fixes, go-to-definition and find-references.  Rename is not wired up;
-  formatting prefers the language formatter (the server is used when it has
-  one).
+  quick fixes, go-to-definition, find-references and rename across the
+  workspace.  Formatting prefers the language formatter (the server is used
+  when it has one).
 * The spell dictionary is embedded and modest. It favours false negatives over
   nagging; add words to `.vortex-words` when it matters.
 * No tab page concept — buffers, not tabs.

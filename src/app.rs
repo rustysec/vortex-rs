@@ -166,6 +166,8 @@ pub enum PromptKind {
         span: crate::selection::Span,
     },
     Diagnostics,
+    /// The new name asked for by a rename; submitting sends the request.
+    Rename,
     /// Quick fixes offered by the language server.
     CodeActions,
 }
@@ -275,6 +277,10 @@ pub struct App {
     /// an answer whose id is no longer the pending one is dropped exactly as a
     /// stale hover is — asking `gd` twice in a row just discards the first.
     navigation_pending: Option<(i64, BufferId)>,
+    /// The rename request in flight: `(id, buffer, new name, buffer version)`.
+    /// The name is what the completion message quotes back; the version drops
+    /// an answer the user has since typed past.
+    rename_pending: Option<(i64, BufferId, String, u64)>,
     /// The quick fixes the last code-action answer offered, indexed by the
     /// picker's payload.
     code_actions: Vec<lsp::CodeAction>,
@@ -357,6 +363,7 @@ impl App {
             format_pending: None,
             code_action_pending: None,
             navigation_pending: None,
+            rename_pending: None,
             code_actions: Vec::new(),
             diagnostic_hold: None,
             diagnostic_float_shown: false,
@@ -965,6 +972,17 @@ impl App {
                 };
                 self.open_picker(PromptKind::Diagnostics, title, "", items);
             }
+            PromptSpec::Rename { symbol } => {
+                // The label names the symbol the server will rewrite; the
+                // line itself starts empty like every other prompt.
+                let label = if symbol.is_empty() {
+                    "rename".to_string()
+                } else {
+                    format!("rename {symbol}: ")
+                };
+                let prompt = Prompt::new(label);
+                self.prompt = Some((PromptKind::Rename, prompt));
+            }
             PromptSpec::Substitute(_) => {
                 self.set_message(
                     StatusLevel::Warn,
@@ -1269,6 +1287,7 @@ impl App {
             | PromptKind::Palette
             | PromptKind::Spell { .. }
             | PromptKind::References
+            | PromptKind::Rename
             | PromptKind::Diagnostics
             | PromptKind::CodeActions => {}
         }
@@ -1433,6 +1452,14 @@ impl App {
                 match payload {
                     Some(payload) => self.open_hit(&payload),
                     None => self.set_message(StatusLevel::Warn, "no location selected"),
+                }
+            }
+            PromptKind::Rename => {
+                let new_name = text.trim().to_string();
+                if new_name.is_empty() {
+                    self.set_message(StatusLevel::Warn, "no new name given");
+                } else {
+                    self.request_rename(new_name);
                 }
             }
             PromptKind::SwitchBuffer => {
@@ -2312,6 +2339,14 @@ impl App {
             } => {
                 self.on_references(uri, request, locations);
             }
+            LspEvent::Renamed {
+                uri,
+                request,
+                changes,
+                error,
+            } => {
+                self.on_renamed(uri, request, changes, error);
+            }
         }
     }
 
@@ -2686,6 +2721,148 @@ impl App {
             // `didOpen`ed before its own server answers anything about it.
             self.notify_lsp_open(id);
         }
+    }
+
+    // --------------------------------------------------------------- rename
+
+    /// Send the rename the prompt asked for, at the caret the prompt opened on
+    /// (nothing moves the caret while a prompt is up).
+    ///
+    /// The buffer version travels with the request: a rename answer describes
+    /// the text as the server last saw it, and applying it after the user
+    /// typed would rewrite that typing at now-wrong offsets — the same rule
+    /// formatting follows.
+    fn request_rename(&mut self, new_name: String) {
+        let Some(id) = self.editor.current_buffer_id() else {
+            return;
+        };
+        let Some(buffer) = self.editor.buffer(id) else {
+            return;
+        };
+        let Some(path) = buffer.path().map(|path| path.to_path_buf()) else {
+            self.set_message(
+                StatusLevel::Warn,
+                "renaming needs a file on disk (the server keys documents by path)",
+            );
+            return;
+        };
+        let language = buffer.language.id.to_string();
+        let Some(spec) = self.server_spec_for(&language) else {
+            self.set_message(
+                StatusLevel::Info,
+                format!("no language server configured for {language}"),
+            );
+            return;
+        };
+        let cursor = self.editor.cursor();
+        let line = buffer.line_of(cursor);
+        let character = buffer.utf16_col_in_line(cursor);
+        let version = buffer.version;
+        let root = search::project_root(Some(&path));
+        let uri = lsp::uri_for(&path);
+        let request = self.next_request;
+        self.next_request += 1;
+        let sender = self.events.sender();
+        if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
+            client.rename(uri, request, line, character, new_name.clone());
+            self.rename_pending = Some((request, id, new_name, version));
+        }
+    }
+
+    /// The server answered a rename with a workspace edit; perform it.
+    ///
+    /// Open files go through the editor, so the rename lands as one undo step
+    /// and the change syncs back to the server like any other edit.  Files
+    /// vortex has no buffer for are patched on disk: with no buffer there are
+    /// no unsaved changes, so the file *is* the text the server edited, and
+    /// writing it back cannot clobber anything.
+    fn on_renamed(
+        &mut self,
+        uri: String,
+        request: i64,
+        changes: Vec<lsp::DocumentEdits>,
+        error: Option<String>,
+    ) {
+        let Some((pending, buffer, new_name, version)) = self.rename_pending.take() else {
+            return;
+        };
+        if pending != request {
+            return;
+        }
+        let Some(path) = self.editor.buffer(buffer).and_then(|b| b.path()) else {
+            return;
+        };
+        if lsp::uri_for(path) != uri {
+            return;
+        }
+        if let Some(error) = error {
+            self.set_message(StatusLevel::Warn, format!("rename failed: {error}"));
+            self.needs_redraw = true;
+            return;
+        }
+        if self
+            .editor
+            .buffer(buffer)
+            .is_some_and(|b| b.version != version)
+        {
+            self.set_message(
+                StatusLevel::Warn,
+                format!("the buffer changed while the server computed the rename; discarded \"{new_name}\""),
+            );
+            self.needs_redraw = true;
+            return;
+        }
+        let mut applied = 0usize;
+        let mut files = 0usize;
+        for document in &changes {
+            let Some(path) = lsp::path_for_uri(&document.uri) else {
+                continue;
+            };
+            if let Some(id) = self.editor.buffer_by_path(&path) {
+                // Positions against the text the buffer actually holds.
+                let edits: Vec<lsp::TextEdit> = {
+                    let Some(open) = self.editor.buffer(id) else {
+                        continue;
+                    };
+                    document
+                        .edits
+                        .iter()
+                        .map(|edit| lsp::TextEdit {
+                            range: crate::selection::Span::new(
+                                open.byte_at_utf16(edit.start.0, edit.start.1),
+                                open.byte_at_utf16(edit.end.0, edit.end.1),
+                            ),
+                            new_text: edit.new_text.clone(),
+                        })
+                        .collect()
+                };
+                let n = self
+                    .editor
+                    .apply_edits(id, &edits, crate::buffer::ChangeGroup::Command);
+                if n > 0 {
+                    files += 1;
+                    applied += n;
+                }
+            } else {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let (updated, n) = lsp::apply_edits_to_text(&text, &document.edits);
+                if n > 0 && std::fs::write(&path, &updated).is_ok() {
+                    files += 1;
+                    applied += n;
+                }
+            }
+        }
+        if applied == 0 {
+            self.set_message(StatusLevel::Warn, "the server sent nothing to change");
+        } else {
+            self.set_message(
+                StatusLevel::Info,
+                format!("renamed to {new_name}: {applied} edit(s) in {files} file(s)"),
+            );
+        }
+        self.needs_redraw = true;
     }
 
     /// Ask the server to format `id`, falling back to the external formatter.

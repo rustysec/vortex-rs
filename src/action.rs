@@ -215,6 +215,8 @@ pub enum Cmd {
     GotoDefinition,
     /// List every reference to the symbol under the caret.
     FindReferences,
+    /// Rename the symbol under the caret everywhere.
+    RenameSymbol,
     FormatBuffer,
     /// Run an ex command, used by keybindings such as `"bn" = "bnext"`.
     Ex(String),
@@ -1012,6 +1014,11 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
         "find-references",
         Action::Cmd(Cmd::FindReferences),
         "list every reference to the symbol",
+    ),
+    (
+        "rename-symbol",
+        Action::Cmd(Cmd::RenameSymbol),
+        "rename the symbol everywhere",
     ),
     (
         "format-buffer",
