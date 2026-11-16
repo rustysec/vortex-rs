@@ -1333,11 +1333,12 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         .map(|text| wrap_preview(text, width.saturating_sub(4), max_preview))
         .unwrap_or_default();
     let preview_rows = preview_lines.len();
-    // Leave room for the status row at the bottom plus a one-row buffer, and
-    // for the preview when there is one: a card whose border sits flush on the
-    // status line reads as part of it.  The card grows from the bottom of the
-    // frame, so the two reserved rows are that gap — however tall the list,
-    // the card never touches the status row.
+    // Leave room for the status row at the bottom: a card whose border sits
+    // flush on the status line reads as part of it.  The card is centred in
+    // what remains, so it sits where the eye already is rather than sliding
+    // up the screen as the list grows; the height is capped at
+    // `screen.height - 2` above, so even a maximum-height card keeps a clear
+    // row between its bottom border and the status row.
     let list_rows = picker
         .visible
         .len()
@@ -1346,7 +1347,7 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
     let height = (list_rows + 4 + preview_rows).min(screen.height.saturating_sub(2) as usize);
     let area = Rect {
         x: screen.x + screen.width.saturating_sub(width as u16) / 2,
-        y: screen.y + screen.height.saturating_sub(height as u16 + 2),
+        y: screen.y + screen.height.saturating_sub(height as u16) / 2,
         width: width as u16,
         height: height as u16,
     };
@@ -2380,6 +2381,54 @@ mod tests {
         assert!(!rendered.contains("older news"), "{rendered}");
         // The cursor lands after the six characters typed.
         assert_eq!(caret.y, pane_area.bottom() - 2);
+    }
+
+    /// Locate a drawn picker's card by its rounded corners.
+    fn card_rows(buffer: &Buffer, area: Rect) -> (u16, u16) {
+        let top = (0..area.height)
+            .find(|&row| (0..area.width).any(|column| buffer[(column, row)].symbol() == "\u{256d}"))
+            .expect("the picker draws a top border");
+        let left = (0..area.width)
+            .find(|&column| buffer[(column, top)].symbol() == "\u{256d}")
+            .expect("left corner");
+        let bottom = (top..area.height)
+            .find(|&row| buffer[(left, row)].symbol() == "\u{2570}")
+            .expect("bottom border");
+        (top, bottom)
+    }
+
+    #[test]
+    fn the_picker_is_centred_vertically() {
+        // The card floats in the middle of the screen rather than hugging the
+        // status row: a short list and a long one both open where the eye
+        // already is, and the top edge does not creep upward as hits arrive.
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        let items = vec![prompt::Item::new("src/main.rs")];
+        let picker = Picker {
+            prompt: "> ",
+            title: "find",
+            input: "",
+            caret: 0,
+            suffix: "",
+            visible: &[0],
+            items: &items,
+            selected: 0,
+            preview: None,
+        };
+        draw_picker(&mut buffer, area, &picker, &Theme::default());
+
+        let (top, bottom) = card_rows(&buffer, area);
+        let card = bottom - top + 1;
+        assert_eq!(
+            top as usize,
+            (area.height as usize - card as usize) / 2,
+            "the card should sit centred in the frame"
+        );
+        assert!(
+            (bottom as usize) < area.height as usize - 1,
+            "the card must not sit on the status row"
+        );
     }
 
     #[test]
