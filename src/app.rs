@@ -44,6 +44,10 @@ const PARSE_IDLE: Duration = Duration::from_millis(120);
 const SPELL_IDLE: Duration = Duration::from_millis(1_500);
 /// Idle time before an auto-format runs.
 const FORMAT_FALLBACK_IDLE: Duration = Duration::from_millis(500);
+/// How long a `:write` waits for the `[format] on-save` run before writing
+/// anyway.  A formatter that has not answered by its own ten-second timeout is
+/// not going to, and a save must not be lost over the formatting.
+const SAVE_FORMAT_TIMEOUT: Duration = Duration::from_secs(12);
 /// Idle time before a completion request goes out, so typing a word sends one
 /// request rather than one per character.
 const COMPLETION_IDLE: Duration = Duration::from_millis(90);
@@ -269,6 +273,15 @@ pub struct App {
     /// lands after the buffer has moved on describes text that no longer
     /// exists, and applying it would rewrite the user's typing.
     format_pending: Option<(i64, BufferId, u64)>,
+    /// A `:write` waiting for the `[format] on-save` run to land:
+    /// `(buffer, target path, when it started waiting)`.
+    ///
+    /// The formatter has to run before the bytes go out, so the write is what
+    /// waits — on the event loop, never by blocking the key press.  It always
+    /// fires in the end: a formatter that fails, lands stale or never answers
+    /// must not cost the user their save, so [`App::on_tick`] writes it once the
+    /// formatter's own timeout has passed.
+    pending_save: Option<(BufferId, Option<PathBuf>, Instant)>,
     /// The code-action request in flight: `(id, buffer)`.
     code_action_pending: Option<(i64, BufferId)>,
     /// The navigation request in flight (definition or references): `(id, buffer)`.
@@ -361,6 +374,7 @@ impl App {
             hover: None,
             hover_pending: None,
             format_pending: None,
+            pending_save: None,
             code_action_pending: None,
             navigation_pending: None,
             rename_pending: None,
@@ -415,6 +429,11 @@ impl App {
             .ok_or_else(|| crate::error::Error::Terminal("events already taken".into()))?;
         loop {
             if self.quit {
+                // A quit can arrive while a `:write` is still waiting for the
+                // on-save format; the file must not silently stay unwritten.
+                if let Some((_, target, _)) = self.pending_save.take() {
+                    self.write_now(target);
+                }
                 break;
             }
             tokio::select! {
@@ -492,8 +511,38 @@ impl App {
         if let Some((due_buffer, due)) = self.editor.format_due {
             if now >= due {
                 self.editor.format_due = None;
-                self.spawn_format(due_buffer);
+                if self.editor.format_blocked(due_buffer) {
+                    // Still mid-gesture (`d` waiting for its motion, a picker
+                    // open): keep waiting rather than rewriting the text the
+                    // gesture is about to resolve against.
+                    self.editor.format_held = Some(due_buffer);
+                } else {
+                    self.spawn_format(due_buffer);
+                }
             }
+        }
+
+        // A format that was put on hold because a gesture was open in its buffer
+        // runs once that gesture closes.  Leaving insert mode arms it directly
+        // (`Editor::set_mode`); an operator that finished or timed out, a visual
+        // selection that ended and a prompt that closed all land here.
+        let held = self.editor.format_held;
+        if let Some(id) = held
+            && !self.editor.format_blocked(id)
+        {
+            self.editor.format_held = None;
+            self.editor.schedule_auto_format(id);
+        }
+
+        // A `:write` held for the on-save format must not wait forever: a server
+        // that never answers would otherwise leave the file unwritten.
+        let overdue = self
+            .pending_save
+            .as_ref()
+            .is_some_and(|(_, _, waited)| waited.elapsed() >= SAVE_FORMAT_TIMEOUT);
+        if overdue {
+            let (_, target, _) = self.pending_save.take().expect("checked above");
+            self.write_now(target);
         }
 
         // A completion request that was waiting for the typing to settle.
@@ -577,7 +626,17 @@ impl App {
             let previous = self.versions.insert(id, version);
             if previous.is_some_and(|previous| previous != version) {
                 self.last_change.insert(id, now);
-                self.editor.schedule_auto_format(id);
+                // A formatter's own rewrite is not a reason to format again: the
+                // run would arm the next one, and a formatter that does not agree
+                // with itself on the first pass would rewrite the buffer every
+                // `on-idle` interval forever.
+                let from_formatter = self
+                    .editor
+                    .buffer(id)
+                    .is_some_and(|buffer| buffer.was_formatted());
+                if !from_formatter {
+                    self.editor.schedule_auto_format(id);
+                }
                 // The server has to see the edit before it can answer about it.
                 self.notify_lsp_change(id);
             } else if previous.is_none() {
@@ -851,7 +910,9 @@ impl App {
                     self.run_command(parsed);
                 }
                 Intent::Parse(id) => self.spawn_parse(id),
-                Intent::Format(id) => self.spawn_format(id),
+                Intent::Format(id) => {
+                    self.spawn_format(id);
+                }
                 Intent::RangeFormat(id, span) => self.spawn_range_format(id, span),
                 Intent::Hover => self.request_hover(),
                 Intent::CodeAction => self.request_code_actions(),
@@ -1631,37 +1692,28 @@ impl App {
                     );
                     return;
                 }
-                // A save under a new name adopts that path: the language server
-                // has never seen the new URI, so it will need an open rather
-                // than only the save below.  Compute this before the write,
-                // which is what rewrites the buffer's path.
-                let renamed = match (&target, self.editor.current_buffer_id()) {
-                    (Some(path), Some(id)) => {
-                        self.editor.buffer(id).and_then(|b| b.path()) != Some(path.as_path())
-                    }
-                    _ => false,
-                };
-                if let Some(id) = self.editor.current_buffer_id() {
-                    self.notify_lsp_save(id);
-                }
-                let intent = match &target {
-                    Some(path) => Some(self.editor.write_to(path)),
-                    None => self.editor.save_now(),
-                };
-                if let Some(intent) = intent {
-                    self.apply_intents(vec![intent]);
-                }
-                if renamed {
+                // `[format] on-save` runs the formatter before the bytes go out,
+                // so the write waits for the result rather than writing first and
+                // being reformatted a moment later — which left an unformatted
+                // file on disk and the buffer dirty again right after saving.
+                // `:write!` means "now", and a buffer that still needs a name
+                // gets its path prompt straight away.
+                if !force
+                    && self.editor.config.format.on_save
+                    && self.write_worth_formatting(target.as_deref())
+                {
                     if let Some(id) = self.editor.current_buffer_id() {
-                        self.notify_lsp_open(id);
+                        if self.pending_save.is_some() {
+                            // A second `:w` while the first is still waiting: this
+                            // one supersedes it rather than queueing two writers.
+                            self.pending_save = None;
+                        } else if self.spawn_format(id) {
+                            self.pending_save = Some((id, target, Instant::now()));
+                            return;
+                        }
                     }
                 }
-                // `[format] on-save` formats before the write settles.
-                if self.editor.config.format.on_save && !force {
-                    if let Some(id) = self.editor.current_buffer_id() {
-                        self.spawn_format(id);
-                    }
-                }
+                self.write_now(target);
             }
             Command::WriteAll | Command::WriteQuit => {
                 let area = self.last_frame;
@@ -1985,22 +2037,89 @@ impl App {
         syntax::spawn_parse(self.events.sender(), id, version, language, text, slot);
     }
 
+    /// Does this `:write` have a buffer, somewhere to write, and changes worth
+    /// running the formatter over before the bytes go out?
+    fn write_worth_formatting(&self, target: Option<&Path>) -> bool {
+        let Some(buffer) = self.editor.current_buffer() else {
+            return false;
+        };
+        if !buffer.is_dirty() {
+            return false;
+        }
+        // A buffer with no name and no `:write <path>` opens the path prompt
+        // first; holding that behind a formatter would just delay the prompt.
+        target.is_some() || buffer.path().is_some()
+    }
+
+    /// The write itself, run once `[format] on-save` has landed or been given up
+    /// on.
+    fn write_now(&mut self, target: Option<PathBuf>) {
+        // A save under a new name adopts that path: the language server has
+        // never seen the new URI, so it will need an open rather than only the
+        // save below.  Compute this before the write, which is what rewrites the
+        // buffer's path.
+        let renamed = match (&target, self.editor.current_buffer_id()) {
+            (Some(path), Some(id)) => {
+                self.editor.buffer(id).and_then(|b| b.path()) != Some(path.as_path())
+            }
+            _ => false,
+        };
+        if let Some(id) = self.editor.current_buffer_id() {
+            self.notify_lsp_save(id);
+        }
+        let intent = match &target {
+            Some(path) => Some(self.editor.write_to(path)),
+            None => self.editor.save_now(),
+        };
+        if let Some(intent) = intent {
+            self.apply_intents(vec![intent]);
+        }
+        if renamed {
+            if let Some(id) = self.editor.current_buffer_id() {
+                self.notify_lsp_open(id);
+            }
+        }
+    }
+
+    /// Write the save an on-format wait was holding, when `buffer` is the buffer
+    /// that save was for.
+    ///
+    /// Called whatever the formatter did — rewrote the text, refused, landed
+    /// stale, or the server never answered: the format is a favour a `:write`
+    /// does the file, the write is the thing the user asked for.
+    fn finish_pending_save(&mut self, buffer: BufferId) {
+        let Some((id, target, waited)) = self.pending_save.take() else {
+            return;
+        };
+        if id != buffer {
+            // A format of some other buffer landing is not the signal this save
+            // is waiting for; keep the deadline it already had.
+            self.pending_save = Some((id, target, waited));
+            return;
+        }
+        self.write_now(target);
+    }
+
     /// Format `id`, preferring the language server over the external formatter.
     ///
     /// The server knows the language's own rules and can format a range, so it
     /// is asked first; the external formatter is the fallback for languages
     /// with no server, and for a server that refuses the request.
-    fn spawn_format(&mut self, id: BufferId) {
+    ///
+    /// Returns whether a run actually started.  `[format] on-save` holds the
+    /// write for the result, and a language with no formatter must write now
+    /// rather than wait for an answer that will never come.
+    fn spawn_format(&mut self, id: BufferId) -> bool {
         if self.request_lsp_format(id) {
-            return;
+            return true;
         }
-        self.spawn_external_format(id);
+        self.spawn_external_format(id)
     }
 
-    /// Run the configured external formatter for `id`.
-    fn spawn_external_format(&mut self, id: BufferId) {
+    /// Run the configured external formatter for `id`; true when it started.
+    fn spawn_external_format(&mut self, id: BufferId) -> bool {
         let Some(buffer) = self.editor.buffer(id) else {
-            return;
+            return false;
         };
         let language = buffer.language.id;
         let path = buffer.path().map(|path| path.to_path_buf());
@@ -2011,7 +2130,7 @@ impl App {
                 StatusLevel::Info,
                 format!("no formatter configured for {language}"),
             );
-            return;
+            return false;
         };
         let formatter: Formatter = formatter.resolved(path.as_deref(), language);
         self.editor.job_started(
@@ -2020,6 +2139,7 @@ impl App {
             crate::event::JobId(version),
         );
         format::spawn_format(self.events.sender(), id, version, formatter, text);
+        true
     }
 
     fn spawn_spell(&mut self, id: BufferId) {
@@ -2095,14 +2215,15 @@ impl App {
                     // The formatter read `result.version` of the buffer.  If the
                     // buffer has moved on it edited while rustfmt ran, and this
                     // text no longer describes it: drop the result and let the
-                    // idle timer try again.  Insert mode is the same hazard in
-                    // slow motion — a whole-buffer rewrite would yank the caret
-                    // out from under whoever is typing.
+                    // idle timer try again.  An open gesture is the same hazard
+                    // in slow motion — a whole-buffer rewrite would yank the
+                    // caret, or worse, move the text an armed `d` is about to
+                    // delete.
                     let edited = self
                         .editor
                         .buffer(result.buffer)
                         .is_none_or(|buffer| buffer.version != result.version);
-                    if edited || self.editor.mode == Mode::Insert {
+                    if edited || self.editor.format_blocked(result.buffer) {
                         self.editor.schedule_auto_format(result.buffer);
                     } else {
                         match self.editor.apply_format(result.buffer, &text) {
@@ -2115,6 +2236,9 @@ impl App {
                         }
                     }
                 }
+                // A `:write` may have been waiting on this run; it goes out now
+                // whether or not the formatter had anything to say.
+                self.finish_pending_save(result.buffer);
                 self.needs_redraw = true;
             }
             AsyncEvent::Spelled(SpellResult {
@@ -2960,22 +3084,28 @@ impl App {
         }
         self.format_pending = None;
         let Some(path) = self.editor.buffer(buffer).and_then(|b| b.path()) else {
+            self.finish_pending_save(buffer);
             return;
         };
         if lsp::uri_for(path) != uri {
+            self.finish_pending_save(buffer);
             return;
         }
         // The server formatted the text it was told about.  If the buffer has
         // moved on since, those edits describe text that no longer exists, and
         // applying them would rewrite whatever the user typed in the meantime.
-        // Insert mode is the same hazard in slow motion: a rewrite under the
-        // caret is exactly what the external formatter is held back for.
+        // An open gesture is the same hazard in slow motion: a rewrite under the
+        // caret, or under the offsets an armed `d` is about to delete, is exactly
+        // what the external formatter is held back for.
         let stale = self
             .editor
             .buffer(buffer)
             .is_none_or(|buffer| buffer.version != version);
-        if stale || self.editor.mode == Mode::Insert {
+        if stale || self.editor.format_blocked(buffer) {
             self.editor.schedule_auto_format(buffer);
+            // The retry is an idle-format matter, not a reason to hold the file
+            // open: the save goes out as it stands.
+            self.finish_pending_save(buffer);
             return;
         }
         if let Some(error) = error {
@@ -2986,11 +3116,17 @@ impl App {
                 StatusLevel::Warn,
                 format!("language server could not format: {error}"),
             );
-            self.spawn_external_format(buffer);
+            // The fallback reports through `Formatted`, which is what releases a
+            // waiting save; with nothing configured to run there is no result to
+            // wait for, so write here instead.
+            if !self.spawn_external_format(buffer) {
+                self.finish_pending_save(buffer);
+            }
             return;
         }
         if edits.is_empty() {
             // The server had nothing to change; that is not an error.
+            self.finish_pending_save(buffer);
             return;
         }
         // `:format` is something the user asked for, so it gets its own undo
@@ -3009,6 +3145,7 @@ impl App {
                 format!("formatted with the language server ({applied} edit(s))"),
             );
         }
+        self.finish_pending_save(buffer);
         self.needs_redraw = true;
     }
 

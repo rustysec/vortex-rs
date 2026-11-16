@@ -362,8 +362,9 @@ pub struct Editor {
     /// in one buffer must not format whichever buffer happens to be on screen
     /// when it fires.
     pub format_due: Option<(BufferId, std::time::Instant)>,
-    /// A buffer whose idle format is on hold because insert mode is open in it:
-    /// an automatic reformat must never rewrite text under the user's hands.
+    /// A buffer whose idle format is on hold because a gesture is open in it
+    /// (typing, an armed operator, a visual selection, a prompt): an automatic
+    /// reformat must never rewrite text under the user's hands.
     pub format_held: Option<BufferId>,
     /// Set when the user asked for the formatter by name (`:format`).  That run
     /// is a change they made, so unlike an automatic one it gets its own undo
@@ -3366,12 +3367,12 @@ impl Editor {
 
     /// Schedule an idle format if `[format] on-idle` is set.
     ///
-    /// Held while insert mode is open in the buffer: the formatter rewrites the
-    /// whole buffer and parks the caret back on its old line and column, so a
-    /// run that lands mid-typing deletes the line `o` has just opened.  Leaving
-    /// insert mode arms the same timer instead.
+    /// Held while a gesture is open in the buffer ([`Editor::format_blocked`]):
+    /// the formatter rewrites the whole buffer and parks the caret back on its
+    /// old line and column, so a run that lands mid-typing deletes the line `o`
+    /// has just opened.  Closing the gesture arms the same timer.
     pub fn schedule_auto_format(&mut self, id: BufferId) {
-        if self.mode == Mode::Insert && self.current_buffer_id() == Some(id) {
+        if self.format_blocked(id) {
             self.format_due = None;
             self.format_held = Some(id);
             return;
@@ -3392,6 +3393,20 @@ impl Editor {
             id,
             std::time::Instant::now() + std::time::Duration::from_millis(delay.as_millis()),
         ));
+    }
+
+    /// Would an automatic rewrite of `id` land under the user's hands?
+    ///
+    /// Insert mode is the obvious case, but an armed operator (`d` waiting for
+    /// its motion), an open visual selection and an open prompt are the same
+    /// hazard in another shape: the gesture resolves against offsets in the
+    /// text as it is now, and a whole-buffer rewrite moves those offsets while
+    /// the gesture is still open, so `d` deletes the line the rewrite moved
+    /// under the caret rather than the line that was there.  Only the buffer
+    /// the gesture is in is at risk; formatting another buffer is fine.
+    pub fn format_blocked(&self, id: BufferId) -> bool {
+        self.current_buffer_id() == Some(id)
+            && (self.mode != Mode::Normal || self.pending.is_active())
     }
 
     /// Background job bookkeeping.
@@ -4613,6 +4628,41 @@ mod tests {
         assert!(
             fixture.editor.format_due.is_some(),
             "hands off the keyboard: now it may run"
+        );
+    }
+
+    #[test]
+    fn an_armed_operator_holds_the_idle_format_until_it_resolves() {
+        // The rewrite that lands between `d` and its motion moves the line the
+        // delete was aimed at, so the caret ends up on whatever slid into place
+        // and a line the user never pointed at disappears.
+        let mut fixture = Fixture::new("fn main() {\n    let a = 1;\n}\n");
+        as_rust(&mut fixture);
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        fixture.feed("d");
+        assert!(
+            fixture.editor.pending.operator.is_some(),
+            "`d` is waiting for its motion"
+        );
+        fixture.editor.schedule_auto_format(id);
+        assert_eq!(
+            fixture.editor.format_held,
+            Some(id),
+            "the format waits for the delete instead of moving its line"
+        );
+        assert!(
+            fixture.editor.format_due.is_none(),
+            "nothing is armed while the gesture is open"
+        );
+
+        // `dd` resolves the operator; with the gesture closed the timer may arm,
+        // the way the event loop does it in `App::on_tick`.
+        fixture.feed("d");
+        assert!(fixture.editor.pending.operator.is_none());
+        fixture.editor.schedule_auto_format(id);
+        assert!(
+            fixture.editor.format_due.is_some(),
+            "hands off the gesture: now it may run"
         );
     }
 

@@ -122,9 +122,12 @@ highlight = true              # highlight search matches in the text
 # ---------------------------------------------------------------------------
 [format]
 on-idle = "500ms"             # format after this much typing silence ("off" disables)
-                              # held until insert mode ends: it never reformats under the caret,
+                              # held until the gesture in the buffer ends — insert mode, an
+                              # armed `d` waiting for its motion, a visual selection, an open
+                              # prompt: it never reformats text out from under your hands,
                               # and `u` walks back your edits, not the formatter's
-on-save = true                # format before writing
+on-save = true                # format before writing: the write waits for the formatter,
+                              # and still happens if the formatter fails or never answers
 
 # Formatter commands per language.  The buffer is piped to stdin and the formatted
 # text is read back from stdout.  "" disables a language, "!" runs via the shell.

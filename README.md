@@ -285,9 +285,13 @@ line) at the working directory.
   `clang-format`, `taplo`, `ruff` …), triggered by `:format`, `space F`,
   `[format] on-save` or `on-idle`. Only the changed middle of the file is
   rewritten, so undo stays granular and the cursor keeps its place. An automatic
-  run never lands while insert mode is open — the timer starts when you leave it
-  — and a result describing text you have edited since it started is dropped
-  instead of applied. Automatic formatting is not an undo step of its own either:
+  run never lands while a gesture is open in its buffer — typing, an armed `d`
+  waiting for its motion, a visual selection, an open prompt; the timer starts
+  when the gesture ends — and a result describing text you have edited since it
+  started is dropped instead of applied. `on-save` runs the formatter before the
+  bytes go out: the write waits for the result, but it always happens, so a
+  formatter that fails or never answers cannot lose a save. Automatic formatting
+  is not an undo step of its own either:
   `u` walks back your edits and takes the formatting that followed each one with
   it. `:format` is an edit you asked for, so it undoes on its own.
 * **Spelling.** A self-contained English checker for comments and strings,

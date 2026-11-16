@@ -217,6 +217,9 @@ pub struct Buffer {
     pub marks: std::collections::HashMap<char, usize>,
     history: History,
     last_group_at: Option<Instant>,
+    /// What kind of change moved `version` last, so the idle formatter can tell
+    /// its own rewrite from something the user did.
+    last_change_group: Option<ChangeGroup>,
     /// Where the last change happened, for `` `. `` and `gi`.
     pub last_change_pos: Option<usize>,
     /// mtime of the file the last time the buffer matched it, so `:write` can
@@ -264,6 +267,7 @@ impl Buffer {
             marks: std::collections::HashMap::new(),
             history: History::new(config),
             last_group_at: None,
+            last_change_group: None,
             last_change_pos: None,
             disk_mtime,
             pending_changes: Vec::new(),
@@ -443,12 +447,25 @@ impl Buffer {
         }
 
         self.version += 1;
+        self.last_change_group = Some(group);
         self.last_change_pos = Some(changes[0].range.start);
 
         let after = selection.map(&edits);
         self.record(group, undo_changes, before, after.clone());
         *selection = after;
         edits
+    }
+
+    /// Did the change that moved `version` last come from a formatter rather
+    /// than from the user?
+    ///
+    /// The idle timer must not arm on a formatter's own edit: the rewrite would
+    /// re-arm the next run, and a formatter that does not agree with itself on
+    /// the first pass (or an LSP server and an external formatter with different
+    /// opinions) would keep rewriting the buffer every `on-idle` interval
+    /// forever.
+    pub fn was_formatted(&self) -> bool {
+        self.last_change_group == Some(ChangeGroup::Format)
     }
 
     /// Take the changes applied since the last call, for incremental sync.
@@ -567,6 +584,9 @@ impl Buffer {
         }
         self.invalidate_change_log();
         self.version += 1;
+        // Undo and redo are the user's own gestures, even when they walk back a
+        // formatter run, so the idle timer may arm again.
+        self.last_change_group = None;
         let restored = batch.last().expect("a non-empty batch").before.clone();
         // Redo walks forward, so the oldest item has to end up on top; every
         // item but the one that ends the step tells redo to keep going.
@@ -602,6 +622,9 @@ impl Buffer {
         }
         self.invalidate_change_log();
         self.version += 1;
+        // Undo and redo are the user's own gestures, even when they walk back a
+        // formatter run, so the idle timer may arm again.
+        self.last_change_group = None;
         let restored = batch.last().expect("a non-empty batch").after.clone();
         for item in batch {
             self.history.undo.push(item);
@@ -723,6 +746,7 @@ impl Buffer {
         self.final_newline = loaded.final_newline;
         self.had_invalid_utf8 = loaded.had_invalid_utf8;
         self.version += 1;
+        self.last_change_group = None;
         self.saved_version = self.version;
         self.history.clear();
         self.last_group_at = None;
@@ -1778,6 +1802,37 @@ mod tests {
             buffer.take_changes(),
             None,
             "a redo resyncs the whole document too"
+        );
+    }
+
+    #[test]
+    fn only_a_user_change_arms_the_idle_format() {
+        // A formatter's rewrite bumps the version like any other edit.  If the
+        // idle timer armed on it, the run would arm the next one, and a formatter
+        // that does not agree with itself on the first pass would rewrite the
+        // buffer every `on-idle` interval forever.
+        let mut buffer = buffer_with("let a=1;\n");
+        assert!(
+            !buffer.was_formatted(),
+            "a fresh buffer is not a format run"
+        );
+
+        insert(&mut buffer, 0, "let b=2;\n", ChangeGroup::Command);
+        assert!(
+            !buffer.was_formatted(),
+            "the user's own edit is what the timer is for"
+        );
+
+        auto_format(&mut buffer, "let b = 2;\nlet a = 1;\n");
+        assert!(
+            buffer.was_formatted(),
+            "this version came from the formatter, not from the user"
+        );
+
+        buffer.undo().expect("undo");
+        assert!(
+            !buffer.was_formatted(),
+            "undo is a gesture of the user's own, so the timer may arm again"
         );
     }
 
