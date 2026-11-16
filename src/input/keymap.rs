@@ -439,6 +439,8 @@ fn cmd_name(command: &Cmd) -> String {
         }
         Cmd::Hover => "hover",
         Cmd::CodeAction => "code-action",
+        Cmd::GotoDefinition => "goto-definition",
+        Cmd::FindReferences => "find-references",
         Cmd::FormatBuffer => "format-buffer",
         Cmd::Ex(command) => return command.clone(),
         Cmd::ForceQuitAll => "force-quit-all",

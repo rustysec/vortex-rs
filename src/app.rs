@@ -157,6 +157,9 @@ pub enum PromptKind {
     GotoLine,
     FindFiles,
     Grep,
+    /// Locations a language server named — every reference to a symbol, or
+    /// several candidate definitions — picked like grep hits.
+    References,
     SwitchBuffer,
     Palette,
     Spell {
@@ -266,6 +269,12 @@ pub struct App {
     format_pending: Option<(i64, BufferId, u64)>,
     /// The code-action request in flight: `(id, buffer)`.
     code_action_pending: Option<(i64, BufferId)>,
+    /// The navigation request in flight (definition or references): `(id, buffer)`.
+    ///
+    /// One slot serves both kinds: the answer arrives tagged as what it is, and
+    /// an answer whose id is no longer the pending one is dropped exactly as a
+    /// stale hover is — asking `gd` twice in a row just discards the first.
+    navigation_pending: Option<(i64, BufferId)>,
     /// The quick fixes the last code-action answer offered, indexed by the
     /// picker's payload.
     code_actions: Vec<lsp::CodeAction>,
@@ -347,6 +356,7 @@ impl App {
             hover_pending: None,
             format_pending: None,
             code_action_pending: None,
+            navigation_pending: None,
             code_actions: Vec::new(),
             diagnostic_hold: None,
             diagnostic_float_shown: false,
@@ -838,6 +848,8 @@ impl App {
                 Intent::RangeFormat(id, span) => self.spawn_range_format(id, span),
                 Intent::Hover => self.request_hover(),
                 Intent::CodeAction => self.request_code_actions(),
+                Intent::GotoDefinition => self.request_navigation(false),
+                Intent::FindReferences => self.request_navigation(true),
                 Intent::Spell(id) => self.spawn_spell(id),
                 Intent::FindFiles(query) => {
                     let kind = PromptKind::FindFiles;
@@ -998,12 +1010,14 @@ impl App {
     /// inside one file costs no I/O at all.
     fn refresh_preview(&mut self) {
         let hit = match self.prompt.as_ref() {
-            Some((PromptKind::FindFiles | PromptKind::Grep, prompt)) => prompt
-                .visible()
-                .get(prompt.selected)
-                .and_then(|index| prompt.items.get(*index))
-                .and_then(|item| item.payload_as::<HitPayload>())
-                .map(|payload| payload.path.clone()),
+            Some((PromptKind::FindFiles | PromptKind::Grep | PromptKind::References, prompt)) => {
+                prompt
+                    .visible()
+                    .get(prompt.selected)
+                    .and_then(|index| prompt.items.get(*index))
+                    .and_then(|item| item.payload_as::<HitPayload>())
+                    .map(|payload| payload.path.clone())
+            }
             _ => None,
         };
         let Some(path) = hit else {
@@ -1254,6 +1268,7 @@ impl App {
             | PromptKind::SwitchBuffer
             | PromptKind::Palette
             | PromptKind::Spell { .. }
+            | PromptKind::References
             | PromptKind::Diagnostics
             | PromptKind::CodeActions => {}
         }
@@ -1407,6 +1422,17 @@ impl App {
                     // results of a bare `start_search` would be dropped as
                     // belonging to no open picker.
                     self.open_prompt(PromptSpec::Grep(text));
+                }
+            }
+            PromptKind::References => {
+                let index = item.or_else(|| self.prompt_index(&prompt));
+                let payload = index
+                    .and_then(|index| prompt.item(index))
+                    .and_then(|item| item.payload_as::<HitPayload>())
+                    .cloned();
+                match payload {
+                    Some(payload) => self.open_hit(&payload),
+                    None => self.set_message(StatusLevel::Warn, "no location selected"),
                 }
             }
             PromptKind::SwitchBuffer => {
@@ -2272,6 +2298,20 @@ impl App {
             } => {
                 self.on_code_actions(uri, request, actions);
             }
+            LspEvent::Definition {
+                uri,
+                request,
+                locations,
+            } => {
+                self.on_definition(uri, request, locations);
+            }
+            LspEvent::References {
+                uri,
+                request,
+                locations,
+            } => {
+                self.on_references(uri, request, locations);
+            }
         }
     }
 
@@ -2469,6 +2509,183 @@ impl App {
         }
         self.hover = Some(text);
         self.needs_redraw = true;
+    }
+
+    // ------------------------------------------------------- goto / references
+
+    /// Ask the server about the symbol at the caret: its definition
+    /// (`references` false, `gd`) or every location that mentions it (`gr`).
+    ///
+    /// Both travel the same path — same position, same pending slot, same
+    /// staleness rule — so they share everything up to which request goes out.
+    fn request_navigation(&mut self, references: bool) {
+        let what = if references {
+            "references"
+        } else {
+            "definition"
+        };
+        if !self.editor.config.lsp.enable {
+            self.set_message(
+                StatusLevel::Info,
+                format!("{what} need [lsp] enable = true"),
+            );
+            return;
+        }
+        let Some(id) = self.editor.current_buffer_id() else {
+            return;
+        };
+        let Some(buffer) = self.editor.buffer(id) else {
+            return;
+        };
+        let Some(path) = buffer.path().map(|path| path.to_path_buf()) else {
+            self.set_message(
+                StatusLevel::Info,
+                format!("{what} need a file on disk (the server keys documents by path)"),
+            );
+            return;
+        };
+        let language = buffer.language.id.to_string();
+        let Some(spec) = self.server_spec_for(&language) else {
+            self.set_message(
+                StatusLevel::Info,
+                format!("no language server configured for {language}"),
+            );
+            return;
+        };
+        let cursor = self.editor.cursor();
+        let line = buffer.line_of(cursor);
+        // LSP positions are UTF-16 code units, not character indices.
+        let character = buffer.utf16_col_in_line(cursor);
+        let root = search::project_root(Some(&path));
+        let uri = lsp::uri_for(&path);
+        let request = self.next_request;
+        self.next_request += 1;
+        let sender = self.events.sender();
+        if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
+            if references {
+                client.references(uri, request, line, character);
+            } else {
+                client.definition(uri, request, line, character);
+            }
+            self.navigation_pending = Some((request, id));
+        }
+    }
+
+    /// Is this the answer we are still waiting for?  Clears the pending slot
+    /// when it is.  A slower answer for an older caret or a closed buffer is
+    /// dropped rather than yanking the view somewhere it was never asked.
+    fn accept_navigation(&mut self, request: i64, uri: &str) -> Option<()> {
+        let (pending, buffer) = self.navigation_pending?;
+        if pending != request {
+            return None;
+        }
+        self.navigation_pending = None;
+        let path = self.editor.buffer(buffer).and_then(|b| b.path())?;
+        if lsp::uri_for(path) != uri {
+            return None;
+        }
+        Some(())
+    }
+
+    /// The server answered `textDocument/definition`.
+    fn on_definition(&mut self, uri: String, request: i64, locations: Vec<lsp::Location>) {
+        if self.accept_navigation(request, &uri).is_none() {
+            return;
+        }
+        match locations.as_slice() {
+            [] => self.set_message(StatusLevel::Info, "no definition found"),
+            // The common answer: go straight there, no popup in the way.
+            [only] => self.jump_to_location(only),
+            // Several candidates — a trait method and its implementations —
+            // are a choice, so they go to the picker like grep hits.
+            _ => self.open_locations_picker("definitions", &locations),
+        }
+    }
+
+    /// The server answered `textDocument/references`.
+    fn on_references(&mut self, uri: String, request: i64, locations: Vec<lsp::Location>) {
+        if self.accept_navigation(request, &uri).is_none() {
+            return;
+        }
+        if locations.is_empty() {
+            self.set_message(StatusLevel::Info, "no references found");
+            return;
+        }
+        self.open_locations_picker("references", &locations);
+    }
+
+    /// List locations in the same popup the find/grep pickers use: one row per
+    /// hit labelled `path:line`, the file preview beside it, Enter opens the
+    /// file with the caret on the hit.  Typing narrows the list with the
+    /// picker's own fuzzy filter, so `gr` then a directory name is a quick way
+    /// to ask "where does *this file* use the symbol".
+    fn open_locations_picker(&mut self, title: &str, locations: &[lsp::Location]) {
+        let items: Vec<prompt::Item> = locations
+            .iter()
+            .map(|location| {
+                let path = lsp::path_for_uri(&location.uri).unwrap_or_default();
+                let label = path
+                    .strip_prefix(&self.search_root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                let mut item = prompt::Item::new(format!("{label}:{}", location.line + 1)).payload(
+                    HitPayload {
+                        path: path.clone(),
+                        line: location.line + 1,
+                    },
+                );
+                // The line's text as the detail column, when vortex already has
+                // the file in memory; a server happily points at files with no
+                // buffer, and reading disk per row for a decoration is not a
+                // trade worth making here — the preview pane has it anyway.
+                if let Some(buffer) = self
+                    .editor
+                    .buffer_by_path(&path)
+                    .and_then(|id| self.editor.buffer(id))
+                {
+                    let start = buffer.line_start(location.line);
+                    let end = buffer.line_end(location.line);
+                    let text = buffer.slice(crate::selection::Span::new(start, end));
+                    item = item.detail(text.trim().chars().take(70).collect::<String>());
+                }
+                item
+            })
+            .collect();
+        self.open_picker(PromptKind::References, title, "", items);
+        // The answer arrives on an async event, and unlike the find/grep
+        // pickers there is no streaming search behind it whose own events
+        // would force a frame: without this the list sits in the prompt until
+        // the next key happens to redraw the screen.
+        self.needs_redraw = true;
+    }
+
+    /// Move the caret to a location the server named, opening its file when
+    /// vortex has no buffer for it.  The old position goes on the jump list
+    /// first, so `ctrl-o` walks back from a definition the way it does from
+    /// `:60` or a mark.
+    fn jump_to_location(&mut self, location: &lsp::Location) {
+        let Some(path) = lsp::path_for_uri(&location.uri) else {
+            self.set_message(
+                StatusLevel::Warn,
+                format!("unreadable location: {}", location.uri),
+            );
+            return;
+        };
+        if let Some(id) = self.editor.current_buffer_id() {
+            let before = self.editor.cursor();
+            self.editor.jumplist.push((id, before));
+        }
+        let intents = self
+            .editor
+            .goto_location(&path, location.line, location.character);
+        self.apply_intents(intents);
+        if let Some(id) = self.editor.current_buffer_id() {
+            self.spawn_parse(id);
+            // Same reason as `open_hit`: a file reached by jumping has to be
+            // `didOpen`ed before its own server answers anything about it.
+            self.notify_lsp_open(id);
+        }
     }
 
     /// Ask the server to format `id`, falling back to the external formatter.
@@ -2712,6 +2929,9 @@ impl App {
             .collect();
         self.code_actions = actions;
         self.open_picker(PromptKind::CodeActions, "quick fixes", "", items);
+        // Same async-event rule as the references picker: nothing else will
+        // schedule the frame that shows this list.
+        self.needs_redraw = true;
     }
 
     /// Handle a key while the completion popup is open.
@@ -3223,18 +3443,20 @@ impl App {
                 // cache was pointed at it above.  `line` is 1-based, and the
                 // renderer clamps a focus past a short file back into it.
                 preview: match kind {
-                    PromptKind::FindFiles | PromptKind::Grep => preview_cache
-                        .filter(|(_, _, lines)| !lines.is_empty())
-                        .map(|(_, display, lines)| ui::FilePreview {
-                            path: display.as_str(),
-                            lines,
-                            focus: prompt
-                                .visible()
-                                .get(prompt.selected)
-                                .and_then(|index| prompt.items.get(*index))
-                                .and_then(|item| item.payload_as::<HitPayload>())
-                                .map_or(0, |payload| payload.line.saturating_sub(1)),
-                        }),
+                    PromptKind::FindFiles | PromptKind::Grep | PromptKind::References => {
+                        preview_cache.filter(|(_, _, lines)| !lines.is_empty()).map(
+                            |(_, display, lines)| ui::FilePreview {
+                                path: display.as_str(),
+                                lines,
+                                focus: prompt
+                                    .visible()
+                                    .get(prompt.selected)
+                                    .and_then(|index| prompt.items.get(*index))
+                                    .and_then(|item| item.payload_as::<HitPayload>())
+                                    .map_or(0, |payload| payload.line.saturating_sub(1)),
+                            },
+                        )
+                    }
                     _ => None,
                 },
             });

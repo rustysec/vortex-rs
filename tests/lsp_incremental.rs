@@ -467,3 +467,77 @@ async fn an_unsaved_error_is_pulled_from_the_server() {
     );
     assert_eq!(item.range.0, 1, "the error is on the second line");
 }
+
+/// Navigation: `textDocument/definition` and `textDocument/references` ask,
+/// and the answer comes back decoded into locations.
+///
+/// The retry follows `hover_until`'s reasoning: rust-analyzer may answer a
+/// freshly opened file before it has indexed it, so an early empty list is
+/// legitimate.  What is under test is the plumbing — the pending id answering
+/// its own request, and every shape of location turning into a `Location` —
+/// not the server's speed.
+#[tokio::test]
+async fn definitions_and_references_come_back_as_locations() {
+    require_rust_analyzer!();
+    let source = "fn target() -> u32 { 1 }\nfn main() { let _ = target(); }\n";
+    let scratch = Scratch::with_source("navigate", source);
+    let mut session = Session::start(&scratch.root, LspSync::Full);
+    session.wait_until_ready().await;
+
+    let path = scratch.file();
+    let uri = lsp::uri_for(&path);
+    session
+        .handle
+        .did_open(uri.clone(), "rust", source.into(), 1);
+
+    // The *call* to `target` on the second line, inside the name.
+    let (line, character) = (1, 22);
+
+    let mut definition = None;
+    for attempt in 0..10 {
+        let request = 200 + attempt;
+        session
+            .handle
+            .definition(uri.clone(), request, line, character);
+        if let Some(LspEvent::Definition { locations, .. }) = session
+            .wait_for(
+                |event| matches!(event, LspEvent::Definition { request: id, .. } if *id == request),
+            )
+            .await
+            && !locations.is_empty()
+        {
+            definition = Some(locations);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let locations = definition.expect("rust-analyzer never answered definition");
+    assert!(
+        locations.iter().any(|l| l.uri == uri && l.line == 0),
+        "the definition of the call is `fn target` on line 1: {locations:?}"
+    );
+
+    let mut references = None;
+    for attempt in 0..10 {
+        let request = 300 + attempt;
+        session
+            .handle
+            .references(uri.clone(), request, line, character);
+        if let Some(LspEvent::References { locations, .. }) = session
+            .wait_for(
+                |event| matches!(event, LspEvent::References { request: id, .. } if *id == request),
+            )
+            .await
+            && locations.len() >= 2
+        {
+            references = Some(locations);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let locations = references.expect("rust-analyzer never answered references");
+    assert!(
+        locations.iter().any(|l| l.line == 0) && locations.iter().any(|l| l.line == 1),
+        "references should cover the declaration and the call: {locations:?}"
+    );
+}

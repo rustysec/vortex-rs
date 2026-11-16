@@ -73,6 +73,8 @@ line does nothing:
 | `Space w` or `Ctrl-S` | save; `Space q` quits |
 | `Space F` | run the language formatter |
 | `Space d` | diagnostics at the cursor |
+| `gd` | jump to the definition of the symbol under the cursor |
+| `Space r` | list every reference to it, picker like the grep results |
 | `z=` or `Space e` | spelling suggestions |
 | `Space x` | clear the search highlight |
 | `Space v` / `Space h` | split right / split below |
@@ -362,8 +364,10 @@ the bug is "the file was empty" or "the leader key did nothing".
 
 ## Limitations worth knowing
 
-* LSP covers diagnostics (pushed and pulled) and insert-mode completion; hover,
-  rename and formatting are not wired up (formatting is external on purpose).
+* LSP covers diagnostics (pushed and pulled), insert-mode completion, hover,
+  quick fixes, go-to-definition and find-references.  Rename is not wired up;
+  formatting prefers the language formatter (the server is used when it has
+  one).
 * The spell dictionary is embedded and modest. It favours false negatives over
   nagging; add words to `.vortex-words` when it matters.
 * No tab page concept — buffers, not tabs.

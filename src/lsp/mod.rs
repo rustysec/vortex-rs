@@ -9,12 +9,12 @@
 //! * pull diagnostics (`textDocument/diagnostic`), requested when the server
 //!   sends `workspace/diagnostic/refresh`.  rust-analyzer pushes only the
 //!   compiler's view of the *saved* file, so without the pull an unsaved error
-//!   never shows a diagnostic.
+//!   never shows a diagnostic;
+//! * hover, completion, code actions and formatting, and navigation —
+//!   `textDocument/definition` and `textDocument/references`.
 //!
-//! What is deliberately not implemented: requests that need an answer to be
-//! useful (hover, completion, code actions, formatting).  Those need a request
-//! multiplexer and a UI affordance per feature; formatting therefore still goes
-//! through `[format.command]`, which keeps the editor usable without a server.
+//! What is deliberately not implemented: renames, `codeAction/resolve` and
+//! workspace-symbol lookup.
 //!
 //! [lsp] `enable` defaults to `false`: with no server configured nothing here
 //! runs at all.
@@ -125,6 +125,24 @@ pub enum LspEvent {
         uri: String,
         request: i64,
         actions: Vec<CodeAction>,
+    },
+    /// Where the symbol at a position is defined.
+    ///
+    /// `uri` is the document the *request* was made about; the locations can
+    /// point at any file, since definitions cross files.  A definition can be
+    /// several locations (a trait method and its implementations), so the
+    /// receiver must handle a list even though one is the common answer.
+    Definition {
+        uri: String,
+        request: i64,
+        locations: Vec<Location>,
+    },
+    /// Every location that mentions the symbol at a position, in answer to
+    /// `textDocument/references`.  `uri` is the document asked about.
+    References {
+        uri: String,
+        request: i64,
+        locations: Vec<Location>,
     },
     /// A server exited; it will be restarted the next time it is needed.
     Closed { language: String, code: Option<i32> },
@@ -679,6 +697,8 @@ pub enum PendingKind {
     Formatting,
     RangeFormatting,
     CodeAction,
+    Definition,
+    References,
     /// A `textDocument/diagnostic` pull, whose answer is a whole set for the
     /// document rather than something tied to the caret.
     PullDiagnostics,
@@ -710,6 +730,56 @@ pub struct CodeAction {
     pub title: String,
     /// The edits it applies, already resolved to byte spans.
     pub edits: Vec<TextEdit>,
+}
+
+/// One document position the server pointed at (a definition or a reference),
+/// as a file URI and a 0-based `(line, UTF-16 column)` start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub uri: String,
+    pub line: usize,
+    pub character: usize,
+}
+
+/// Decode a `textDocument/definition` or `textDocument/references` result.
+///
+/// The spec allows many shapes: `References` is an array of `Location`s,
+/// while `Definition` may be a single `Location`, an array of them, an array
+/// of `LocationLink`s, or even a bare `Range` — which belongs to the document
+/// the request was made about, and that is what `fallback_uri` supplies.  A
+/// `LocationLink` carries its target URI plus both a covering `targetRange`
+/// and the symbol-tight `targetSelectionRange`; the selection range wins when
+/// the server sends one, because it lands on the name rather than the whole
+/// item.  `null` — the server found nothing — decodes to an empty list.
+pub fn locations(result: &Value, fallback_uri: &str) -> Vec<Location> {
+    let items: Vec<&Value> = match result {
+        Value::Null => return Vec::new(),
+        Value::Array(items) => items.iter().collect(),
+        single => vec![single],
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let (uri, start) = if let Some(uri) = item.get("targetUri").and_then(Value::as_str) {
+                // LocationLink.
+                let range = item
+                    .get("targetSelectionRange")
+                    .or_else(|| item.get("targetRange"))?;
+                (uri.to_string(), position(range.get("start")?)?)
+            } else if let Some(uri) = item.get("uri").and_then(Value::as_str) {
+                // Location.
+                (uri.to_string(), position(item.pointer("/range/start")?)?)
+            } else {
+                // Bare Range, in the requesting document.
+                (fallback_uri.to_string(), position(item.pointer("/start")?)?)
+            };
+            Some(Location {
+                uri,
+                line: start.0,
+                character: start.1,
+            })
+        })
+        .collect()
 }
 
 /// Outgoing messages the app can ask a running server to send.
@@ -787,6 +857,20 @@ enum Outgoing {
         /// unused binding" only when it is told which diagnostic is being
         /// fixed, so an empty list here means an empty answer.
         diagnostics: Vec<Value>,
+    },
+    /// Ask where the symbol at a position is defined.
+    Definition {
+        uri: String,
+        request: i64,
+        line: usize,
+        character: usize,
+    },
+    /// Ask for every location that mentions the symbol at a position.
+    References {
+        uri: String,
+        request: i64,
+        line: usize,
+        character: usize,
     },
     /// Ask the server for its own analysis of a document.
     ///
@@ -972,6 +1056,26 @@ impl ClientHandle {
         });
     }
 
+    /// Ask where the symbol at a 0-based line/character position is defined.
+    pub fn definition(&self, uri: String, request: i64, line: usize, character: usize) {
+        let _ = self.outgoing.send(Outgoing::Definition {
+            uri,
+            request,
+            line,
+            character,
+        });
+    }
+
+    /// Ask for every location that mentions the symbol at a position.
+    pub fn references(&self, uri: String, request: i64, line: usize, character: usize) {
+        let _ = self.outgoing.send(Outgoing::References {
+            uri,
+            request,
+            line,
+            character,
+        });
+    }
+
     pub fn shutdown(&self) {
         let _ = self.outgoing.send(Outgoing::Shutdown);
     }
@@ -1064,6 +1168,12 @@ async fn session(
                         },
                         "contextSupport": true
                     },
+                    // Navigation: `textDocument/definition` and
+                    // `textDocument/references` need no special client
+                    // capabilities today, but declaring them is what tells a
+                    // server the client actually asks.
+                    "definition": { "dynamicRegistration": false },
+                    "references": { "dynamicRegistration": false },
                     // Pull diagnostics.  Declaring `diagnostic` here is not
                     // optional: rust-analyzer checks it before sending
                     // `workspace/diagnostic/refresh`.  Without it the only
@@ -1171,30 +1281,50 @@ async fn session(
                                     .map(str::to_string);
                                 let text = synced.get(&request.uri).cloned().unwrap_or_default();
                                 let starts = line_starts(&text);
+                                let request_uri = request.uri;
                                 let event = match request.kind {
                                     PendingKind::Completion => LspEvent::Completions {
-                                        uri: request.uri,
+                                        uri: request_uri,
                                         request: id,
                                         items: completion_items(&result, &text, &starts),
                                     },
                                     PendingKind::Hover => LspEvent::Hover {
-                                        uri: request.uri,
+                                        uri: request_uri,
                                         request: id,
                                         text: hover_text(&result),
                                     },
                                     PendingKind::Formatting | PendingKind::RangeFormatting => {
                                         LspEvent::Formatted {
-                                            uri: request.uri,
+                                            uri: request_uri,
                                             request: id,
                                             edits: text_edits(&result, &text, &starts),
                                             error,
                                         }
                                     }
                                     PendingKind::CodeAction => LspEvent::CodeActions {
-                                        uri: request.uri,
+                                        uri: request_uri,
                                         request: id,
                                         actions: code_actions(&result, &text, &starts),
                                     },
+                                    PendingKind::Definition => {
+                                        // A bare `Range` answer belongs to the
+                                        // requesting document; the decoder
+                                        // needs the URI before it is moved.
+                                        let found = locations(&result, &request_uri);
+                                        LspEvent::Definition {
+                                            uri: request_uri,
+                                            request: id,
+                                            locations: found,
+                                        }
+                                    }
+                                    PendingKind::References => {
+                                        let found = locations(&result, &request_uri);
+                                        LspEvent::References {
+                                            uri: request_uri,
+                                            request: id,
+                                            locations: found,
+                                        }
+                                    }
                                     PendingKind::PullDiagnostics => {
                                         // `unchanged` carries no items: the
                                         // previous set still stands, so the
@@ -1202,7 +1332,7 @@ async fn session(
                                         // report replaces the pulled set.
                                         let items = pull_diagnostic_items(&result);
                                         LspEvent::Diagnostics {
-                                            uri: request.uri,
+                                            uri: request_uri,
                                             version: request.version,
                                             items: items.clone().unwrap_or_default(),
                                             origin: DiagnosticOrigin::Pull,
@@ -1488,6 +1618,58 @@ async fn send_outgoing(
             );
             let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
         }
+        Outgoing::Definition {
+            uri,
+            request,
+            line,
+            character,
+        } => {
+            pending.insert(
+                request,
+                PendingRequest {
+                    kind: PendingKind::Definition,
+                    uri: uri.clone(),
+                    version: None,
+                },
+            );
+            let request_message = jsonrpc::request(
+                request,
+                "textDocument/definition",
+                Some(json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character }
+                })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
+        }
+        Outgoing::References {
+            uri,
+            request,
+            line,
+            character,
+        } => {
+            pending.insert(
+                request,
+                PendingRequest {
+                    kind: PendingKind::References,
+                    uri: uri.clone(),
+                    version: None,
+                },
+            );
+            // `includeDeclaration` asks for the definition row too: a reader
+            // who wants the full picture of a symbol expects its declaration
+            // among the hits, and servers that ignore the flag answer the same.
+            let request_message = jsonrpc::request(
+                request,
+                "textDocument/references",
+                Some(json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                    "context": { "includeDeclaration": true }
+                })),
+            );
+            let _ = jsonrpc::write_message(&mut *stdin.lock().await, &request_message).await;
+        }
         Outgoing::Format {
             uri,
             request,
@@ -1694,6 +1876,63 @@ mod tests {
         assert!(uri.starts_with("file://"), "{uri}");
         assert_eq!(path_for_uri(&uri).as_deref(), Some(path));
         assert_eq!(path_for_uri("http://example.com"), None);
+    }
+
+    #[test]
+    fn decodes_locations_in_every_legal_shape() {
+        let fallback = "file:///p/src/app.rs";
+        // A references result: an array of plain Locations.
+        let array = json!([
+            { "uri": "file:///p/src/app.rs", "range": { "start": { "line": 9, "character": 4 }, "end": { "line": 9, "character": 8 } } },
+            { "uri": "file:///p/src/lib.rs", "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 3, "character": 1 } } },
+        ]);
+        assert_eq!(
+            locations(&array, fallback),
+            vec![
+                Location {
+                    uri: "file:///p/src/app.rs".into(),
+                    line: 9,
+                    character: 4
+                },
+                Location {
+                    uri: "file:///p/src/lib.rs".into(),
+                    line: 1,
+                    character: 0
+                },
+            ]
+        );
+        // A single Location, not wrapped in an array.
+        let single = array.get(0).cloned().unwrap();
+        assert_eq!(locations(&single, fallback).len(), 1);
+        // A LocationLink: the selection range beats the covering range.
+        let link = json!({
+            "targetUri": "file:///p/src/other.rs",
+            "targetRange": { "start": { "line": 20, "character": 0 }, "end": { "line": 24, "character": 1 } },
+            "targetSelectionRange": { "start": { "line": 21, "character": 7 }, "end": { "line": 21, "character": 12 } },
+        });
+        assert_eq!(
+            locations(&json!([link]), fallback),
+            vec![Location {
+                uri: "file:///p/src/other.rs".into(),
+                line: 21,
+                character: 7
+            }]
+        );
+        // A bare Range belongs to the document that asked.
+        let bare =
+            json!({ "start": { "line": 3, "character": 2 }, "end": { "line": 3, "character": 6 } });
+        assert_eq!(
+            locations(&bare, fallback),
+            vec![Location {
+                uri: fallback.into(),
+                line: 3,
+                character: 2
+            }]
+        );
+        // Nothing found is an empty list, not a failure.
+        assert!(locations(&Value::Null, fallback).is_empty());
+        assert!(locations(&json!([]), fallback).is_empty());
+        assert!(locations(&json!([{}]), fallback).is_empty());
     }
 
     #[test]

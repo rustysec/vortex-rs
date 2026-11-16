@@ -211,6 +211,10 @@ pub enum Cmd {
     Hover,
     /// Ask the language server for quick fixes at the caret.
     CodeAction,
+    /// Jump to the definition of the symbol under the caret.
+    GotoDefinition,
+    /// List every reference to the symbol under the caret.
+    FindReferences,
     FormatBuffer,
     /// Run an ex command, used by keybindings such as `"bn" = "bnext"`.
     Ex(String),
@@ -998,6 +1002,16 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
         "code-action",
         Action::Cmd(Cmd::CodeAction),
         "quick fixes at the cursor",
+    ),
+    (
+        "goto-definition",
+        Action::Cmd(Cmd::GotoDefinition),
+        "jump to the definition of the symbol",
+    ),
+    (
+        "find-references",
+        Action::Cmd(Cmd::FindReferences),
+        "list every reference to the symbol",
     ),
     (
         "format-buffer",

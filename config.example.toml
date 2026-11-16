@@ -368,6 +368,9 @@ prompt = ""
 # vim's `K` keyword lookup, answered by the language server.
 "K" = "hover"
 "space a" = "code-action"
+# vim's goto-definition; `space r` lists every reference in a grep-style popup.
+"gd" = "goto-definition"
+"space r" = "find-references"
 "space e" = "spell-suggest"
 # vim's spelling suggestion key.
 "z=" = "spell-suggest"

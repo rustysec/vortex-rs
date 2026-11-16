@@ -46,6 +46,10 @@ pub enum Intent {
     Hover,
     /// Ask the language server for quick fixes at the caret.
     CodeAction,
+    /// Ask the language server where the symbol at the caret is defined.
+    GotoDefinition,
+    /// Ask the language server for every reference to the symbol at the caret.
+    FindReferences,
     /// Spell check `buffer`.
     Spell(BufferId),
     /// Start a file-name search.
@@ -1666,13 +1670,17 @@ impl Editor {
             Cmd::CommandMode => {
                 intents.push(Intent::OpenPrompt(PromptSpec::Command(String::new())))
             }
+            // The prompt starts empty: once a search has been submitted the
+            // previous term is what `n`/`N` repeat, not what the next `/`
+            // pre-fills — prefilling meant deleting the old word before typing
+            // the new one.  The prompt's history (Up) still offers past terms.
             Cmd::SearchForward => intents.push(Intent::OpenPrompt(PromptSpec::Search {
                 forward: true,
-                initial: self.search_pattern().unwrap_or_default().to_string(),
+                initial: String::new(),
             })),
             Cmd::SearchBackward => intents.push(Intent::OpenPrompt(PromptSpec::Search {
                 forward: false,
-                initial: self.search_pattern().unwrap_or_default().to_string(),
+                initial: String::new(),
             })),
             Cmd::FindWordForward => intents.extend(self.find_word(true)),
             Cmd::FindWordBackward => intents.extend(self.find_word(false)),
@@ -1699,6 +1707,8 @@ impl Editor {
             Cmd::DiagnosticPrev(scope) => intents.extend(self.diagnostic_jump(false, scope, area)),
             Cmd::Hover => intents.push(Intent::Hover),
             Cmd::CodeAction => intents.push(Intent::CodeAction),
+            Cmd::GotoDefinition => intents.push(Intent::GotoDefinition),
+            Cmd::FindReferences => intents.push(Intent::FindReferences),
             Cmd::SpellSuggest => intents.extend(self.spell_suggest()),
             Cmd::FormatBuffer => {
                 if let Some(id) = self.current_buffer_id() {
@@ -2650,6 +2660,25 @@ impl Editor {
             .unwrap_or(0);
         self.set_cursor(target);
         intents.push(Intent::EnsureVisible);
+        intents
+    }
+
+    /// Move to a language-server location: a file (opened if needed), a
+    /// 0-based line and a UTF-16 column.
+    ///
+    /// [`Self::goto_hit`] lands on the line's first word, which is what a grep
+    /// hit wants; a definition names the exact position, and landing anywhere
+    /// but on the symbol puts the next `gd`/`gr` on the wrong word.
+    pub fn goto_location(&mut self, path: &Path, line: usize, character: usize) -> Vec<Intent> {
+        // goto_hit is 1-based; the server is 0-based.
+        let mut intents = self.goto_hit(path, line.saturating_add(1));
+        if let Some(id) = self.current_buffer_id()
+            && let Some(buffer) = self.buffer(id)
+        {
+            let target = buffer.byte_at_utf16(line, character);
+            self.set_cursor(target);
+            intents.push(Intent::EnsureVisible);
+        }
         intents
     }
 
@@ -3808,6 +3837,52 @@ mod tests {
         fixture.feed("iZZ!(1)");
         assert_eq!(fixture.text(), "ZZ!(1)hello\n");
         assert!(Fixture::warn(&fixture.feed("i")).is_empty());
+    }
+
+    #[test]
+    fn a_fresh_slash_starts_empty_even_after_a_search() {
+        // Submitting a search leaves the term for `n`/`N`, but the next `/`
+        // must not pre-fill it: the user who searches twice in a row usually
+        // searches for two different things.
+        let mut fixture = Fixture::new("alpha beta\n");
+        fixture.editor.set_search("beta");
+        let intents = fixture.editor.run_cmd(Cmd::SearchForward, fixture.area);
+        let initial = intents
+            .iter()
+            .find_map(|intent| match intent {
+                Intent::OpenPrompt(PromptSpec::Search { forward, initial }) => {
+                    (*forward).then_some(initial.clone())
+                }
+                _ => None,
+            })
+            .expect("a forward search prompt");
+        assert!(initial.is_empty(), "prompt pre-filled with {initial:?}");
+        let intents = fixture.editor.run_cmd(Cmd::SearchBackward, fixture.area);
+        let initial = intents
+            .iter()
+            .find_map(|intent| match intent {
+                Intent::OpenPrompt(PromptSpec::Search { forward, initial }) => {
+                    (!forward).then_some(initial.clone())
+                }
+                _ => None,
+            })
+            .expect("a backward search prompt");
+        assert!(initial.is_empty(), "prompt pre-filled with {initial:?}");
+    }
+
+    #[test]
+    fn goto_location_lands_on_the_exact_column() {
+        // `goto_hit` goes to the line's first word; a language-server
+        // definition names a position and must land on the symbol itself.
+        let dir = std::env::temp_dir().join(format!("vortex-goto-{}", std::process::id()));
+        let path = dir.join("sample.txt");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(&path, "let value = compute(1);\nsecond\n").expect("temp file");
+        let mut fixture = Fixture::new("scratch\n");
+        let intents = fixture.editor.goto_location(&path, 0, 22); // the `1` inside compute(
+        assert!(intents.contains(&Intent::EnsureVisible));
+        assert_eq!(fixture.text(), "let value = compute(1);\nsecond\n");
+        assert_eq!(fixture.cursor(), 22);
     }
 
     #[test]
