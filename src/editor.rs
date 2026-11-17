@@ -481,18 +481,41 @@ impl Editor {
     /// touched — use [`Editor::show_in_pane`] for that.
     pub fn open_path(&mut self, path: &Path) -> (BufferId, bool) {
         let path = expand_home(path);
-        if let Some(id) = self.buffer_by_path(&path) {
-            return (id, false);
-        }
-        let id = self.alloc_buffer_id();
-        let buffer = match Buffer::open_or_new(id, &path, &self.config.editor) {
-            Ok(buffer) => buffer,
-            // An unreadable file is still editable: start empty and let the
-            // first write fail loudly if it must.
-            Err(_) => Buffer::new(id, Some(path.clone()), String::new(), &self.config.editor),
+        let (id, created) = if let Some(id) = self.buffer_by_path(&path) {
+            (id, false)
+        } else {
+            let id = self.alloc_buffer_id();
+            let buffer = match Buffer::open_or_new(id, &path, &self.config.editor) {
+                Ok(buffer) => buffer,
+                // An unreadable file is still editable: start empty and let the
+                // first write fail loudly if it must.
+                Err(_) => Buffer::new(id, Some(path.clone()), String::new(), &self.config.editor),
+            };
+            self.buffers.push(buffer);
+            (id, true)
         };
-        self.buffers.push(buffer);
-        (id, true)
+        self.drop_empty_scratch(id);
+        (id, created)
+    }
+
+    /// Drop any empty scratch buffer now that a real file is open.  A scratch
+    /// buffer is unnamed and empty; panes still pointing at it are repointed at
+    /// `replacement` so the editor never holds a dangling buffer reference.
+    fn drop_empty_scratch(&mut self, replacement: BufferId) {
+        let scratches: Vec<BufferId> = self
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.path().is_none() && buffer.text().is_empty())
+            .map(|buffer| buffer.id)
+            .collect();
+        for id in scratches {
+            for pane_id in self.layout.panes_showing(id) {
+                if let Some(pane) = self.layout.pane_mut(pane_id) {
+                    pane.buffer = replacement;
+                }
+            }
+            self.buffers.retain(|buffer| buffer.id != id);
+        }
     }
 
     /// An empty, unnamed buffer.
@@ -3925,6 +3948,75 @@ mod tests {
         assert!(intents.contains(&Intent::EnsureVisible));
         assert_eq!(fixture.text(), "let value = compute(1);\nsecond\n");
         assert_eq!(fixture.cursor(), 22);
+    }
+
+    #[test]
+    fn opening_a_file_drops_the_empty_scratch() {
+        let dir = std::env::temp_dir().join(format!("vortex-scratch-{}", std::process::id()));
+        let path = dir.join("real.txt");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(&path, "real\n").expect("temp file");
+
+        // The welcome screen: an empty scratch buffer with no pane yet.
+        let mut editor = Editor::new(starter());
+        let scratch = editor.new_scratch();
+        let (id, created) = editor.open_path(&path);
+        assert!(created);
+        assert!(
+            editor.buffer(scratch).is_none(),
+            "an empty scratch buffer should be dropped when a file opens"
+        );
+        assert_eq!(
+            editor.buffers().iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![id]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opening_a_file_keeps_a_scratch_with_content() {
+        let dir = std::env::temp_dir().join(format!("vortex-scratch-{}", std::process::id()));
+        let path = dir.join("real.txt");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(&path, "real\n").expect("temp file");
+
+        let mut editor = Editor::new(starter());
+        let scratch = editor.alloc_buffer_id();
+        editor.buffers.push(Buffer::new(
+            scratch,
+            None,
+            "typed\n".into(),
+            &editor.config.editor,
+        ));
+        editor.open_path(&path);
+        assert!(
+            editor.buffer(scratch).is_some(),
+            "a scratch buffer with content must be left alone"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pane_showing_the_scratch_switches_to_the_new_file() {
+        let dir = std::env::temp_dir().join(format!("vortex-scratch-{}", std::process::id()));
+        let path = dir.join("real.txt");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(&path, "real\n").expect("temp file");
+
+        let mut editor = Editor::new(starter());
+        let scratch = editor.new_scratch();
+        editor.show_in_pane(scratch, None);
+        let (id, _) = editor.open_path(&path);
+        assert!(editor.buffer(scratch).is_none());
+        assert_eq!(
+            editor.current_pane().map(|pane| pane.buffer),
+            Some(id),
+            "the pane that showed the scratch now shows the file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
