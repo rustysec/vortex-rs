@@ -299,6 +299,10 @@ pub struct EditorConfig {
     pub inline_diagnostics: bool,
     /// Show the full diagnostic message in a card when the caret rests on one.
     pub diagnostic_float: bool,
+    /// Decorate markdown buffers in place: conceal markup markers, substitute
+    /// bullets and table borders, style headings.  Changes only how a buffer is
+    /// drawn — writing still writes plain markdown.
+    pub markdown_render: bool,
     /// Per-language indentation overrides, keyed by language id:
     /// `[editor.indent.go] tab-width = 4`, `expand-tab = false`.
     #[serde(default)]
@@ -336,6 +340,7 @@ impl Default for EditorConfig {
             diagnostic_signs: true,
             inline_diagnostics: false,
             diagnostic_float: true,
+            markdown_render: true,
             indent: BTreeMap::new(),
         }
     }
@@ -913,6 +918,7 @@ impl Config {
             "editor.diagnostic-signs" => self.editor.diagnostic_signs = boolean(key, value)?,
             "editor.inline-diagnostics" => self.editor.inline_diagnostics = boolean(key, value)?,
             "editor.diagnostic-float" => self.editor.diagnostic_float = boolean(key, value)?,
+            "editor.markdown-render" => self.editor.markdown_render = boolean(key, value)?,
             "layout.split-mode" => {
                 self.layout.split_mode = SplitMode::from_str(&text(key, value)?)?
             }
@@ -1059,6 +1065,7 @@ impl Config {
             "editor.diagnostic-signs" => on_off(self.editor.diagnostic_signs),
             "editor.inline-diagnostics" => on_off(self.editor.inline_diagnostics),
             "editor.diagnostic-float" => on_off(self.editor.diagnostic_float),
+            "editor.markdown-render" => on_off(self.editor.markdown_render),
             "layout.split-mode" => split_mode_name(self.layout.split_mode).to_string(),
             "layout.border" => format!("{:?}", self.layout.border).to_lowercase(),
             "layout.golden-ratio" => format!("{:.3}", self.layout.golden_ratio),

@@ -29,6 +29,14 @@ large-file-threshold = 2000000 # bytes; bigger files skip background work
 diagnostic-signs = true       # mark flagged lines in the gutter (● error, ▲ warning)
 inline-diagnostics = false    # draw the message dimmed at the end of its line
 diagnostic-float = true       # show the full message when the caret rests on one
+markdown-render = true        # decorate markdown in place (see [editor] notes below)
+
+# `markdown-render` paints a markdown buffer as formatted text without touching the
+# bytes: markup markers are concealed (`**bold**` shows bold words), bullets and
+# quotes take typographic glyphs (`-` to `•`, `>` to `│`), rules become an unbroken
+# line, and a table draws its borders from the pipes it already has.  Every line keeps
+# its character count, so the cursor, wrapping and clicks stay where they belong.
+# Toggle it with `:markdown` or bind `toggle-markdown`.
 
 # Per-language indentation, overriding the two settings above.  Only the keys
 # given are overridden, so a language can change just the width or just the

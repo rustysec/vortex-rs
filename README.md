@@ -116,6 +116,7 @@ to scroll, and click inside a picker to choose an item.
 :f[ind] [pattern]  :gr[ep] <pattern>                    search the project
 :diag[nostic] [next|prev|list] [buffer|project]   jump between or list diagnostics
 :fo[rmat]                                          run the language formatter
+:markdown                                          toggle in-buffer markdown decoration (same as :set markdown)
 :conf[ig] path|source|write [path]                   configuration
 :cd <dir>  :pwd  :hl[search] clear                   misc
 :pal[ette]  :help                                    list every command
@@ -157,6 +158,32 @@ run without: `:grep` needs a pattern, so it asks; `:write` does not, so it saves
 An optional parameter says so in its title and is skipped by `Enter` on an empty
 row; `Esc` backs out one step instead of throwing the whole line away.
 
+## Markdown, rendered in place
+
+Opening a `.md` file draws it as formatted text — headings bold and coloured,
+emphasis italic, `**markers**` gone from sight while the words they wrapped stay in
+their own columns, `-` bullets turned into `•`, quote bars drawn as `│`, rules into
+unbroken lines, and a table given real borders out of the pipes it already has.
+
+Nothing about the buffer changes: this is only how it is painted, so writing still
+writes plain markdown, and `:markdown` (or `toggle-markdown` on a key) switches back
+to the raw source. Because each line keeps its character count one-for-one, the
+cursor lands where you expect, soft wrap still breaks where it did, and clicking a
+character selects that character — decorated or not.
+
+Two things follow from keeping that promise, and both are visible:
+
+* a concealed marker leaves its own column empty rather than closing the gap, so
+  `a **b** c` paints as if the asterisks were spaces. The words cannot be pulled
+  together without pulling the cursor along with them;
+* a rule is only as long as it was written — `---` draws three cells of `───`, not a
+  full-width line, for the same reason.
+
+Decoration needs no grammar; markdown has none wired up in `tree-sitter` and does not
+need one to be drawn this way. The one thing it cannot do is reflow: an aligned table
+draws a clean grid, while a ragged one still shows the raggedness, because moving text
+would move the cursor with it.
+
 ## Dark or light
 
 At startup vortex asks the terminal for its background colour (OSC 11) and
@@ -192,6 +219,7 @@ tab-width = 4
 expand-tab = true
 line-number = "relative"     # "absolute" | "relative" | "none"
 wrap = false
+markdown-render = true       # draw markdown as formatted text, in place
 
 [status]
 show-mode = true

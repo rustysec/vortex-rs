@@ -321,6 +321,8 @@ pub enum ToggleOption {
     Wrap,
     SpellCheck,
     CursorLine,
+    /// In-buffer markdown decoration.
+    Markdown,
 }
 
 impl ToggleOption {
@@ -332,6 +334,7 @@ impl ToggleOption {
             ToggleOption::Wrap => "editor.wrap",
             ToggleOption::SpellCheck => "spell.enable",
             ToggleOption::CursorLine => "editor.cursorline",
+            ToggleOption::Markdown => "editor.markdown-render",
         }
     }
 }
@@ -959,6 +962,11 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
         "toggle-cursorline",
         Action::Cmd(Cmd::ToggleOption(ToggleOption::CursorLine)),
         "toggle current line highlight",
+    ),
+    (
+        "toggle-markdown",
+        Action::Cmd(Cmd::ToggleOption(ToggleOption::Markdown)),
+        "toggle in-buffer markdown decoration",
     ),
     (
         "spell-suggest",

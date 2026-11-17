@@ -12,6 +12,7 @@
 //! * [`crate::search`] — ripgrep backed file/content search (async)
 //! * [`crate::git`] — git branch probe for the status row (async)
 //! * [`crate::format`] — async language formatters
+//! * [`crate::markdown`] — in-buffer decoration for markdown buffers
 //! * [`crate::lsp`] — scaffolding for a language server client
 
 pub mod action;
@@ -32,6 +33,7 @@ pub mod input;
 pub mod lang;
 pub mod layout;
 pub mod lsp;
+pub mod markdown;
 pub mod prompt;
 pub mod search;
 pub mod selection;

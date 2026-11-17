@@ -184,15 +184,22 @@ def main():
     body = app.repaint().dump()
     # The overlay reports how many actions match, which only a live picker does.
     check("space p opens the command popup", re.search(r"\d+/\d+ match", body) is not None, body)
-    # Every command listed alphabetically, so the list is a lookup: `bdelete`
-    # sorts first and its argument shape rides along dimmed after the name.
+    # Every command listed alphabetically, so the list is a lookup.  Only one page
+    # of it fits in the card, so the order is checked between neighbours that are
+    # both drawn — `bdelete` sorts first and its argument shape rides along
+    # dimmed after the name; typing what you mean brings the rest into view.
     check(
         "the popup lists commands alphabetically with their arguments",
         ":bdelete" in body
         and "<name>" in body
-        and 0 < body.index(":bdelete") < body.index(":grep"),
+        and 0 < body.index(":append") < body.index(":bdelete"),
         body,
     )
+    app.keys(b"gre", 0.5)
+    body = app.repaint().dump()
+    check("a command from deep in the list filters into view", ":grep" in body, body)
+    for _ in range(3):
+        app.keys(b"\x7f", 0.15)  # clear back to the full listing before `wri`
     app.keys(b"wri", 0.5)
     body = app.repaint().dump()
     check(
@@ -215,11 +222,16 @@ def main():
 
     # Walking to a row is the discovery path: it asks for that command's
     # parameters one at a time, and Esc backs out of a step rather than the lot.
+    # The palette lists every action as well as command, so the walk stops on the
+    # preview text instead of counting rows a list that keeps growing would date.
     app.keys(b":", 0.5)
-    for _ in range(8):
-        app.keys(b"\x1b[B", 0.12)  # Down to :edit, whose path is optional
-    body = app.repaint().dump()
-    check("the arrows walk the list and the preview follows", "reload this file" in body, body)
+    walked = False
+    for _ in range(60):
+        screen = app.keys(b"\x1b[B", 0.12)  # Down towards :edit, whose path is optional
+        if "reload this file" in screen.dump():
+            walked = True
+            break
+    check("the arrows walk the list and the preview follows", walked, screen.dump())
     app.keys(b"\r", 0.7)
     body = app.repaint().dump()
     check(

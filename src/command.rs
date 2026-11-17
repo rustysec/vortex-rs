@@ -698,6 +698,7 @@ fn toggle_for(name: &str) -> Option<ToggleOption> {
         "mouse" => ToggleOption::Mouse,
         "wrap" | "wr" => ToggleOption::Wrap,
         "spell" => ToggleOption::SpellCheck,
+        "markdown" | "md" => ToggleOption::Markdown,
         "autoformat" => ToggleOption::AutoFormat,
         _ => return None,
     })

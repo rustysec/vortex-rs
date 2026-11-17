@@ -402,6 +402,18 @@ fn draw_pane(
     } else {
         SelectionView::none()
     };
+    // Markdown is decorated in place: the glyphs painted differ from the buffer's,
+    // one for one, and every character carries its own base style.  Everything that
+    // follows still measures the *source* text, which is what keeps the caret, the
+    // wrap points and click hit-testing in buffer coordinates.
+    let decor = decorations(
+        buffer,
+        config,
+        theme,
+        scroll,
+        content.height as usize,
+        focused.then_some(cursor_line),
+    );
 
     let rows = visual_rows(
         buffer,
@@ -434,15 +446,19 @@ fn draw_pane(
         gutter.render(buf, content.x, y, Some(line), theme);
 
         let text = line_text(buffer, line);
-        let styles = line_styles(
-            buffer,
-            line,
-            &text,
-            &highlights,
-            &selection,
-            screen,
-            focused,
-        );
+        let decorated = decor.as_ref().and_then(|decor| decor.get(line));
+        // Same character count by construction; the fallback covers a buffer edited
+        // between planning this frame and drawing it.
+        let painted = match decorated {
+            Some(render) if render.glyphs.len() == text.chars().count() => render.display(),
+            _ => text.clone(),
+        };
+        let layers = Layers {
+            highlights: &highlights,
+            selection: &selection,
+            decorated,
+        };
+        let styles = line_styles(buffer, line, &text, &layers, screen, focused);
         let x = content.x + gutter.width as u16;
         let limit = content.right().saturating_sub(x) as usize;
         let paint = LinePaint {
@@ -451,7 +467,7 @@ fn draw_pane(
             limit,
             tab_width,
         };
-        render_chunk(buf, &paint, &text, slot.start, slot.end, &styles);
+        render_chunk(buf, &paint, &painted, slot.start, slot.end, &styles);
 
         // The message for the line's worst diagnostic, dimmed after the text.
         // Only on the last visual row of the line, so a wrapped line does not
@@ -480,6 +496,71 @@ fn draw_pane(
         }
     }
     cursor_position
+}
+
+/// The palette markdown decoration paints with, from the active theme.
+///
+/// Heading levels borrow the syntax groups a code editor already colours loudly
+/// (keyword / function / type) and inline code takes the string colour, so decorated
+/// markdown reads in the same palette as highlighted code rather than inventing a
+/// second one.
+fn markdown_styles(theme: &Theme) -> crate::markdown::MarkdownStyles {
+    use crate::syntax::Hl;
+    let base = theme.text;
+    crate::markdown::MarkdownStyles {
+        text: base,
+        heading1: theme.highlight(Hl::Keyword),
+        heading2: theme.highlight(Hl::Function),
+        heading3: theme.highlight(Hl::Type),
+        bold: base.add_modifier(Modifier::BOLD),
+        italic: base.add_modifier(Modifier::ITALIC),
+        strike: base.add_modifier(Modifier::CROSSED_OUT),
+        code: theme.highlight(Hl::String),
+        link: base.add_modifier(Modifier::UNDERLINED),
+        marker: theme.status_inactive,
+        quote: theme.highlight(Hl::Comment),
+        bullet: base.add_modifier(Modifier::BOLD),
+        list_number: theme.status_inactive,
+        checkbox: base.add_modifier(Modifier::BOLD),
+        rule: theme.status_inactive,
+        table_border: theme.status_inactive,
+        table_header: base.add_modifier(Modifier::BOLD),
+    }
+}
+
+/// Decorate a markdown buffer's visible rows, or `None` when this buffer is not one.
+///
+/// The whole text is read because an open fence or a table header can sit above the
+/// viewport; only the drawn window allocates glyphs.  Gutter, wrapping and cursor
+/// arithmetic deliberately still run on the *source* characters: decoration is
+/// one-for-one in column width, which is exactly what keeps the caret over the
+/// glyph it refers to.  The line under the cursor (`active_line`) reveals its own
+/// markup as written, so the characters being edited are never hidden.
+fn decorations(
+    buffer: &TextBuffer,
+    config: &Config,
+    theme: &Theme,
+    scroll: usize,
+    height: usize,
+    active_line: Option<usize>,
+) -> Option<crate::markdown::Decorated> {
+    if !config.editor.markdown_render || buffer.language.id != "markdown" {
+        return None;
+    }
+    // Classifying the document means reading all of it, every frame.  A file past
+    // the size that already skips background parsing and formatting is far from the
+    // README this was built for, so it draws as source rather than cost a copy per
+    // keystroke — the same bargain `[editor] large-file-threshold` already strikes.
+    if buffer.len_bytes() > config.editor.large_file_threshold {
+        return None;
+    }
+    let styles = markdown_styles(theme);
+    Some(crate::markdown::decorate_window(
+        &buffer.text(),
+        scroll..scroll.saturating_add(height).saturating_add(1),
+        active_line,
+        &styles,
+    ))
 }
 
 /// A visual row: a buffer line plus the character range shown on that row.
@@ -631,21 +712,42 @@ fn inline_diagnostic(buffer: &TextBuffer, line: usize) -> Option<&Diagnostic> {
         })
 }
 
+/// What paints on top of a line's base colour, in the order it is layered.
+struct Layers<'a> {
+    /// Syntax highlighting runs, empty for a language with no grammar.
+    highlights: &'a [(Span, Style)],
+    /// The visual selection, when this pane has one showing.
+    selection: &'a SelectionView,
+    /// Markdown decoration, which supplies the per-character base instead of the
+    /// flat text colour.
+    decorated: Option<&'a crate::markdown::LineRender>,
+}
+
 /// One style per character of a logical line.
 fn line_styles(
     buffer: &TextBuffer,
     line: usize,
     text: &str,
-    highlights: &[(Span, Style)],
-    selection: &SelectionView,
+    layers: &Layers<'_>,
     screen: &Screen,
     focused: bool,
 ) -> Vec<Style> {
+    let Layers {
+        highlights,
+        selection,
+        decorated,
+    } = *layers;
     let theme = screen.theme;
     let base = theme.text;
     let line_start = buffer.line_start(line);
     let characters: Vec<char> = text.chars().collect();
-    let mut styles = vec![base; characters.len()];
+    // Decorated markdown brings its own per-character base, which the layers below
+    // then patch — so a selection or a search match still wins over a heading.
+    let decorated = decorated.filter(|render| render.styles.len() == characters.len());
+    let mut styles = match decorated {
+        Some(render) => render.styles.clone(),
+        None => vec![base; characters.len()],
+    };
     if characters.is_empty() {
         return styles;
     }
@@ -804,6 +906,19 @@ fn emit(
     let width = text.chars().count().min(available);
     buf.set_stringn(x + column as u16, y, text, width, style);
     width
+}
+
+/// Blank a cell to `symbol` under exactly one style.
+///
+/// `Cell::set_style` patches (it keeps the old colours and modifiers unless the
+/// new style subtracts them), so painting an overlay straight over the buffer
+/// leaves the buffer's styling — a spellcheck or markdown underline especially —
+/// showing through.  Resetting first gives the overlay cell a clean slate; call
+/// this for every cell the overlay claims before writing text over it.
+fn paint_cell(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
+    let cell = &mut buf[(x, y)];
+    cell.reset();
+    cell.set_symbol(symbol).set_style(style);
 }
 
 // ------------------------------------------------------------------- gutter
@@ -1386,10 +1501,10 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
     let style = theme.prompt;
     // Paint the whole card first: ratatui only rewrites cells the picker writes,
     // so without this the buffer text behind the overlay stays visible between
-    // the lines of the list.
+    // the lines of the list.  `paint_cell` also clears stale styles — see there.
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
-            buf[(x, y)].set_symbol(" ").set_style(theme.overlay);
+            paint_cell(buf, x, y, " ", theme.overlay);
         }
     }
     for x in area.left()..area.right() {
@@ -1515,7 +1630,7 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
             // Clear the row first: the card was painted before the list, and a
             // shorter preview line must not leave the previous one behind.
             for column in (area.x + 2)..area.right().saturating_sub(1) {
-                buf[(column, y)].set_symbol(" ").set_style(style);
+                paint_cell(buf, column, y, " ", style);
             }
             emit(
                 buf,
@@ -1609,7 +1724,7 @@ fn draw_file_preview(
         let y = text_top + row as u16;
         // Clear the row first: a shorter line must not leave its predecessor.
         for column in (x - 1)..right {
-            buf[(column, y)].set_symbol(" ").set_style(theme.overlay);
+            paint_cell(buf, column, y, " ", theme.overlay);
         }
         let focused = index == focus;
         let number = format!("{:>w$}", index + 1, w = gutter as usize);
@@ -1663,9 +1778,11 @@ fn digit_width(n: usize) -> usize {
 /// unreadable.  Shared by the completion popup and the diagnostic float so the
 /// two cannot drift apart.
 fn draw_card(buf: &mut Buffer, area: Rect, theme: &Theme) {
+    // `paint_cell` clears stale styles: an underline on the buffer underneath
+    // (spellcheck, markdown decoration) must not bleed through the card.
     for row in area.top()..area.bottom() {
         for column in area.left()..area.right() {
-            buf[(column, row)].set_symbol(" ").set_style(theme.overlay);
+            paint_cell(buf, column, row, " ", theme.overlay);
         }
     }
     let set = border::ROUNDED;
@@ -2051,6 +2168,128 @@ mod tests {
     fn row_text(buffer: &Buffer, row: u16) -> String {
         let width = buffer.area().width;
         (0..width).map(|x| cell_symbol(buffer, x, row)).collect()
+    }
+
+    /// An editor holding `text` as a markdown buffer.
+    ///
+    /// Decoration follows the buffer's language, and a path-less scratch buffer
+    /// detects as plain text — so without this the tests below would pass while
+    /// proving nothing.  The language is set the way opening `note.md` sets it.
+    fn markdown_editor(text: &str) -> Editor {
+        let mut editor = editor_with(text);
+        let id = editor.current_buffer_id().expect("a buffer");
+        let markdown = crate::lang::detect(std::path::Path::new("note.md").into(), None);
+        editor.buffer_mut(id).expect("the buffer").language = markdown;
+        editor
+    }
+
+    /// A markdown buffer drawn through the real pane path, with the caret parked
+    /// on a spare line after the text so it does not reveal markup there — see
+    /// [`crate::markdown::LineRender::reveal`].
+    fn rendered_markdown(text: &str) -> Buffer {
+        let mut editor = markdown_editor(text);
+        editor.set_cursor(text.len());
+        let (buffer, _) = render_to(60, 10, &editor);
+        buffer
+    }
+
+    #[test]
+    fn the_carets_own_line_reveals_its_markup() {
+        // Whatever line you are editing shows its source; the rest stays clean.
+        let mut editor = markdown_editor("# Heading\n\nsome **bold** text\n");
+        editor.set_cursor(0);
+        let (buffer, _) = render_to(60, 10, &editor);
+        let frame = frame_text(&buffer);
+        assert!(frame.contains("# Heading"), "{frame:?}");
+        assert!(!frame.contains("some **bold**"), "revealed a quiet line");
+
+        editor.set_cursor(editor.current_buffer().expect("a").len_chars() - 1);
+        let (buffer, _) = render_to(60, 10, &editor);
+        let frame = frame_text(&buffer);
+        assert!(
+            !frame.contains('#'),
+            "the heading hid again under nothing:\n{frame:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_is_decorated_in_the_buffer_itself() {
+        // The markers a reader never wants to see are gone; the words they wrapped
+        // stay exactly where they were written.
+        let frame = rendered_markdown("# Heading\n\nsome **bold** text\n");
+        assert!(
+            frame_text(&frame).contains("Heading"),
+            "{:?}",
+            frame_text(&frame)
+        );
+        assert!(!frame_text(&frame).contains('#'), "hash leaked");
+        assert!(!frame_text(&frame).contains("**"), "asterisks leaked");
+    }
+
+    #[test]
+    fn a_bullet_is_drawn_in_the_editors_column() {
+        let buffer = rendered_markdown("- one\n");
+        // Gutter aside, the row reads as a bullet rather than a hyphen.
+        assert!(
+            frame_text(&buffer).contains('•'),
+            "{:?}",
+            frame_text(&buffer)
+        );
+    }
+
+    #[test]
+    fn decoration_keeps_the_cursor_over_its_character() {
+        // The invariant that matters most while editing: with concealing glyph
+        // substitution the caret must still land on the character under it, so a
+        // decorated line reports the same column as an undecorated one.
+        let text = "# Heading\n";
+        let mut editor = markdown_editor(text);
+        editor.set_cursor(2); // the `H`, two characters past the concealed `#`
+        let (buffer, cursor) = render_to(60, 10, &editor);
+        let decorated = cursor.expect("a caret in a decorated buffer");
+
+        let mut config = Config::default();
+        config.editor.markdown_render = false;
+        let mut plain_editor = markdown_editor(text);
+        plain_editor.set_cursor(2);
+        let (_, plain) = render_with(60, 10, &plain_editor, &config);
+
+        assert_eq!(Some(decorated), plain, "decoration moved the caret");
+        // And the character drawn there is the title's first letter.
+        assert_eq!(cell_symbol(&buffer, decorated.x, decorated.y), "H");
+    }
+
+    #[test]
+    fn a_theme_gives_each_heading_level_its_own_colour() {
+        // The fallback style bag can only vary weight; the palette is what separates
+        // `#`, `##` and `###` on screen.
+        let styles = markdown_styles(&Theme::default());
+        assert_ne!(styles.heading1, styles.heading2);
+        assert_ne!(styles.heading2, styles.heading3);
+    }
+
+    #[test]
+    fn a_file_too_big_for_background_work_is_drawn_as_source() {
+        // Decoration reads the whole document to classify a frame; past the threshold
+        // that already excuses a buffer from parsing and formatting, it draws plain.
+        let mut config = Config::default();
+        config.editor.large_file_threshold = 8;
+        let editor = markdown_editor("# Heading\n\nsome **bold** text\n");
+        let (buffer, _) = render_with(60, 10, &editor, &config);
+        assert!(
+            frame_text(&buffer).contains("**bold**"),
+            "decorated an oversized file"
+        );
+    }
+
+    #[test]
+    fn turning_markdown_rendering_off_shows_the_source_verbatim() {
+        let mut config = Config::default();
+        config.editor.markdown_render = false;
+        let editor = markdown_editor("# Heading\n- one\n");
+        let (buffer, _) = render_with(60, 10, &editor, &config);
+        assert!(frame_text(&buffer).contains("# Heading"));
+        assert!(!frame_text(&buffer).contains('•'));
     }
 
     #[test]
@@ -2598,6 +2837,50 @@ mod tests {
             (bottom as usize) < area.height as usize - 1,
             "the card must not sit on the status row"
         );
+    }
+
+    #[test]
+    fn buffer_underlining_does_not_bleed_through_the_picker() {
+        // A pane paints underlines (spellcheck, markdown) onto its cells before
+        // the picker opens; ratatui styles patch rather than replace, so without
+        // a full clear every card cell inheriting one keeps the underline and
+        // the popup looks like it is drawn over striped paper.
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        for row in 0..area.height {
+            for column in 0..area.width {
+                buffer[(column, row)]
+                    .set_symbol("x")
+                    .set_style(Style::default().add_modifier(Modifier::UNDERLINED));
+            }
+        }
+        let items = vec![prompt::Item::new("src/main.rs")];
+        let picker = Picker {
+            prompt: "> ",
+            title: "find",
+            input: "",
+            caret: 0,
+            suffix: "",
+            visible: &[0],
+            items: &items,
+            selected: 0,
+            preview: None,
+        };
+        draw_picker(&mut buffer, area, &picker, &Theme::default());
+
+        let (top, bottom) = card_rows(&buffer, area);
+        for row in top..=bottom {
+            for column in 0..area.width {
+                let cell = &buffer[(column, row)];
+                if cell.symbol() == "x" {
+                    continue; // outside the card: the pane underneath may keep its styles
+                }
+                assert!(
+                    !cell.style().add_modifier.contains(Modifier::UNDERLINED),
+                    "card cell ({column},{row}) inherited an underline"
+                );
+            }
+        }
     }
 
     #[test]
