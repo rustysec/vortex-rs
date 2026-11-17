@@ -1,24 +1,32 @@
 //! In-buffer markdown decoration, after the fashion of *render-markdown.nvim*.
 //!
-//! Nothing is moved or reflowed: a line keeps its character count and every
-//! substituted glyph is exactly one column wide, so cell `i` still stands for
-//! buffer character `i`.  That single invariant is what lets decoration ride along
-//! with the rest of the editor — cursor arithmetic, soft wrap, selection ranges and
-//! click hit-testing all keep working in buffer coordinates, because none of the
-//! geometry changes.  Only how a character is *painted* does:
+//! Nothing outside tables is moved or reflowed: a line keeps its character count
+//! and every substituted glyph is exactly one column wide, so cell `i` still
+//! stands for buffer character `i`.  That single invariant is what lets
+//! decoration ride along with the rest of the editor — cursor arithmetic, soft
+//! wrap, selection ranges and click hit-testing all keep working in buffer
+//! coordinates, because none of the geometry changes.  Only how a character is
+//! *painted* does:
 //!
 //! * markup is **concealed**, not deleted — `**bold**` paints spaces over the
 //!   asterisks and bold between them;
 //! * block markers are **substituted** for same-width glyphs: a bullet becomes `•`,
 //!   a quote's `>` becomes `│`, a rule's dashes become `─────`;
-//! * a table draws its borders out of the pipes and dashes already in it, so an
-//!   aligned table reads as a bordered grid.
+//! * a table is **reflowed at draw time**: each column widens to its widest cell,
+//!   the pipes land in one column of the screen on every row, and alignment
+//!   follows the delimiter row's colons.  This is the one place where a cell is
+//!   not character-for-character, which is exactly why [`LineRender::columns`]
+//!   exists — painted geometry resolves through it (or its inverse, owners) so
+//!   even table rows keep caret and clicks honest; saved text stays as written.
+//! * the line under the cursor **reveals** its markup: you edit characters you
+//!   can see (see [`LineRender::reveal`]).
 //!
-//! Two consequences worth stating plainly.  Decoration is a property of how a buffer
-//! is *shown*, never of what is stored: writing still writes plain markdown, and
-//! turning `editor.markdown-render` off leaves not a byte changed.  And it needs no
-//! tree-sitter grammar — the rules are line analysis on text that is being drawn
-//! anyway, which is why markdown has no grammar wired up in [`crate::lang`].
+//! Two consequences worth stating plainly.  Decoration is a property of how a
+//! buffer is *shown*, never of what is stored: writing still writes plain
+//! markdown, and turning `editor.markdown-render` off leaves not a byte changed.
+//! And it needs no tree-sitter grammar — the rules are line analysis on text
+//! that is being drawn anyway, which is why markdown has no grammar wired up in
+//! [`crate::lang`].
 
 use ratatui::style::{Modifier, Style};
 
@@ -126,7 +134,8 @@ pub struct LineRender {
     ///
     /// Same count and order as the source; differs only where decoration hid a
     /// marker (a space) or substituted a symbol — unless [`LineRender::reveal`]
-    /// asked for this line's markup to stay visible.
+    /// asked for this line's markup to stay visible, or [`LineRender::reflowed`]
+    /// says table columns were widened.
     pub glyphs: Vec<char>,
     /// One style per character, indexed exactly like [`LineRender::glyphs`].
     pub styles: Vec<Style>,
@@ -138,6 +147,25 @@ pub struct LineRender {
     /// only edit by guessing at is a character you should be able to see, but the
     /// reader of every other line keeps the clean rendering.
     pub reveal: bool,
+    /// The display column each source character starts at, plus a final entry
+    /// for the total width — `n + 1` entries in all, monotonic.
+    ///
+    /// Empty means the identity: character `i` occupies cell `i`, which is what
+    /// every non-table line and every revealed or un-uniform table row does.
+    /// A reflowed table row widens padded cells so a column's pipes land in the
+    /// same cells on every row of the grid; that breaks one-cell-per-character
+    /// *in the painting only*, which is why everything downstream — caret,
+    /// selection, click hit-testing — must go through this map instead of
+    /// assuming cell equals character.  Characters swallowed by padding (spaces
+    /// trimmed out of an over-padded cell) keep a zero-width entry, so offsets
+    /// stay monotonic and the caret simply lands on the next real column.
+    pub columns: Vec<u32>,
+    /// The source character owning each display cell, `glyphs.len()` entries.
+    ///
+    /// The inverse of [`LineRender::columns`] at cell granularity — padding
+    /// belongs to whichever real character stands beside it, so a style layer or
+    /// a click in blank space still resolves to a character that exists.
+    pub owners: Vec<u32>,
 }
 
 impl LineRender {
@@ -146,7 +174,35 @@ impl LineRender {
             glyphs: source.chars().collect(),
             styles: vec![base; source.chars().count()],
             reveal: false,
+            columns: Vec::new(),
+            owners: Vec::new(),
         }
+    }
+
+    /// Whether this row's display geometry differs from its character count.
+    pub fn reflowed(&self) -> bool {
+        !self.columns.is_empty()
+    }
+
+    /// The display column where source character `index` is drawn (the line's
+    /// width for an index past the end).
+    pub fn column_of(&self, index: usize) -> usize {
+        if self.columns.is_empty() {
+            return index;
+        }
+        // A zero-width character was absorbed into padding behind it, and the
+        // backward fill gives it the next real column anyway.
+        let at = index.min(self.columns.len() - 1);
+        self.columns[at] as usize
+    }
+
+    /// The source character whose drawn cell sits at display column `column`.
+    pub fn character_at(&self, column: usize) -> usize {
+        if self.columns.is_empty() {
+            return column;
+        }
+        let cells = self.owners.len();
+        self.owners[column.min(cells.saturating_sub(1))] as usize
     }
 
     /// The text to paint on this line's row.
@@ -164,6 +220,30 @@ impl LineRender {
 #[derive(Debug, Clone)]
 pub struct Plan {
     blocks: Vec<Block>,
+    /// Per line: which table run it belongs to, indexing `regions`.  A line in a
+    /// reflowable run paints from the run's normalised grid so every column has
+    /// one width; runs that cannot be made uniform (a row without outer pipes,
+    /// a tab inside a cell) are absent and draw character-for-character.
+    region_of: Vec<Option<usize>>,
+    regions: Vec<Region>,
+}
+
+/// Column widths and alignments shared by every row of one table.
+#[derive(Debug, Clone, PartialEq)]
+struct Region {
+    /// Display width of each column's content; a cell is drawn as one space,
+    /// the padded content, one space — so a column is `widths[k] + 2` wide
+    /// between its pipes.
+    widths: Vec<usize>,
+    aligns: Vec<Align>,
+}
+
+/// How a column's cells sit inside their field, read off the delimiter row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    Center,
+    Right,
 }
 
 impl Plan {
@@ -219,7 +299,17 @@ impl Plan {
             }
         }
 
-        Self { blocks }
+        let (region_of, regions) = table_regions(lines, &fences, &blocks);
+        Self {
+            blocks,
+            region_of,
+            regions,
+        }
+    }
+
+    /// The shared grid of the table containing `index`, if it reflows.
+    fn region(&self, index: usize) -> Option<&Region> {
+        self.regions.get(*self.region_of.get(index)?.as_ref()?)
     }
 
     /// How many lines were classified.
@@ -235,7 +325,9 @@ impl Plan {
     /// how a document that gained lines between frames stays drawable.
     ///
     /// `reveal` shows that line's markup as written (see [`LineRender::reveal`]);
-    /// the UI passes it for the line under the cursor.
+    /// the UI passes it for the line under the cursor.  A table row that does not
+    /// reveal comes back reflowed to its region's grid, mapping and all — see
+    /// [`LineRender::columns`].
     pub fn line(
         &self,
         lines: &[&str],
@@ -244,7 +336,18 @@ impl Plan {
         styles: &MarkdownStyles,
     ) -> Option<LineRender> {
         let block = *self.blocks.get(index)?;
-        Some(render(lines.get(index)?, block, reveal, styles))
+        let source = *lines.get(index)?;
+        if !reveal {
+            if let Block::Table(role) = block {
+                if let Some(grid) = self
+                    .region(index)
+                    .and_then(|r| grid_row(source, role, r, styles))
+                {
+                    return Some(grid);
+                }
+            }
+        }
+        Some(render(source, block, reveal, styles))
     }
 
     /// The classification of one line, for callers that only need to know whether
@@ -530,6 +633,283 @@ fn neighbour_past_spaces(row: &[char], index: usize, direction: isize) -> Option
 /// A character belonging to a border run rather than to text.
 fn is_border_run(c: char) -> bool {
     matches!(c, '-' | '─' | ':' | '=')
+}
+
+// ---------------------------------------------------------------- table grids
+//
+// A written table is only as straight as its author padded it.  Decoration
+// therefore sizes each column to the widest cell in the run — including the
+// delimiter row's dashes, so a rule never outstays its cells — and re-emits
+// every row over that shared layout: one space of padding, the content placed
+// by the column's alignment, the rest filled with spaces.  Alignment comes
+// from the delimiter row's colons (`:-` left, `-:` right, `:-:` centre), the
+// same hints the CommonMark spec reads.
+//
+// The re-emitted row is *not* one glyph per source character any more, which
+// is exactly why every drawn cell records its owning character and every
+// character its display column (`LineRender::columns`).  Everything that
+// counts positions — caret, selection, click hit-testing — resolves through
+// those two arrays instead of assuming the old identity.
+
+/// A table row split into its pipes and the cells between them.
+struct RowCells {
+    /// Character index of every unescaped `|`, outer ones included.
+    pipes: Vec<usize>,
+    /// Cell k runs from `pipes[k] + 1` to `pipes[k + 1]`.
+    cells: Vec<std::ops::Range<usize>>,
+}
+
+/// Which source characters may be dropped to padding without breaking a grid.
+fn table_regions(
+    lines: &[&str],
+    _fences: &[Fence],
+    blocks: &[Block],
+) -> (Vec<Option<usize>>, Vec<Region>) {
+    let mut region_of = vec![None; blocks.len()];
+    let mut regions: Vec<Region> = Vec::new();
+    let mut start = 0usize;
+    while start < blocks.len() {
+        if !matches!(blocks[start], Block::Table(_)) {
+            start += 1;
+            continue;
+        }
+        let end = (start..blocks.len())
+            .find(|&i| !matches!(blocks[i], Block::Table(_)))
+            .unwrap_or(blocks.len());
+        if let Some(region) = measure_region(lines, blocks, start..end) {
+            let id = regions.len();
+            regions.push(region);
+            for slot in &mut region_of[start..end] {
+                *slot = Some(id);
+            }
+        }
+        start = end;
+    }
+    (region_of, regions)
+}
+
+/// Size one run of table rows, if the run can form a single grid.
+///
+/// A row without both outer pipes, a tab inside a cell (padding arithmetic has
+/// no notion of tab stops), or a differing pipe count between rows makes the
+/// run refused: every row then draws character-for-character as before rather
+/// than aligning with half its neighbours and not the rest.
+fn measure_region(lines: &[&str], blocks: &[Block], run: std::ops::Range<usize>) -> Option<Region> {
+    let mut widths: Option<Vec<usize>> = None;
+    let mut aligns: Option<Vec<Align>> = None;
+    for index in run {
+        let chars: Vec<char> = lines[index].chars().collect();
+        let row = split_row(&chars)?;
+        let columns = row.cells.len();
+        if columns == 0 {
+            return None;
+        }
+        let w = widths.get_or_insert_with(|| vec![0; columns]);
+        if w.len() != columns {
+            return None; // ragged pipe counts refuse the run
+        }
+        for (k, cell) in row.cells.iter().enumerate() {
+            let trimmed = trim_range(&chars, cell.clone());
+            w[k] = w[k].max(trimmed.len());
+        }
+        // The delimiter row is the column's alignment declaration.  Keep the
+        // first one: a second border would be another table wedged against
+        // this one, and its row is still content width-wise.
+        if aligns.is_none() && blocks[index] == Block::Table(Role::Border) {
+            let mut found = Vec::with_capacity(columns);
+            for cell in &row.cells {
+                let trimmed: String = chars[cell.clone()].iter().collect();
+                let t = trimmed.trim_matches(' ');
+                let left = t.starts_with(':');
+                let right = t.ends_with(':') && t.len() > 1;
+                found.push(match (left, right) {
+                    (true, true) => Align::Center,
+                    (false, true) => Align::Right,
+                    _ => Align::Left,
+                });
+            }
+            aligns = Some(found);
+        }
+    }
+    let widths = widths?;
+    Some(Region {
+        aligns: aligns.unwrap_or_else(|| vec![Align::Left; widths.len()]),
+        widths,
+    })
+}
+
+/// Split a line at its unescaped pipes.  `None` refuses the row — see
+/// [`measure_region`] for what is refused and why.
+fn split_row(chars: &[char]) -> Option<RowCells> {
+    if chars.contains(&'\t') {
+        return None;
+    }
+    let pipes: Vec<usize> = (0..chars.len())
+        .filter(|&i| chars[i] == '|' && unescaped(chars, i))
+        .collect();
+    if pipes.len() < 2 {
+        return None;
+    }
+    // Only indentation may precede the opening pipe, and only spaces follow
+    // the closing one — otherwise the row's edges are not where the grid puts
+    // them and the row is refused rather than painted over someone's prose.
+    if !chars[..pipes[0]].iter().all(|&c| c == ' ') {
+        return None;
+    }
+    if !chars[pipes[pipes.len() - 1] + 1..]
+        .iter()
+        .all(|&c| c == ' ')
+    {
+        return None;
+    }
+    let cells = pipes[..pipes.len() - 1]
+        .iter()
+        .zip(&pipes[1..])
+        .map(|(&open, &close)| open + 1..close)
+        .collect();
+    Some(RowCells { pipes, cells })
+}
+
+/// Whether `chars[i]` stands free — not escaped by a run of backslashes.
+fn unescaped(chars: &[char], i: usize) -> bool {
+    let mut backs = 0usize;
+    let mut before = i;
+    while before > 0 && chars[before - 1] == '\\' {
+        backs += 1;
+        before -= 1;
+    }
+    backs % 2 == 0
+}
+
+/// `range` with its leading and trailing spaces removed.
+fn trim_range(chars: &[char], range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let mut start = range.start;
+    let mut end = range.end;
+    while start < end && chars[start] == ' ' {
+        start += 1;
+    }
+    while end > start && chars[end - 1] == ' ' {
+        end -= 1;
+    }
+    start..end
+}
+
+/// Re-emit `source` over its region's grid, mapping every character.
+///
+/// `None` when this particular row cannot take the grid (a pipe count that
+/// disagrees with the run); the caller falls back to painting it verbatim, so
+/// a table edited mid-frame never fails to draw — at worst one row is briefly
+/// crooked until the next keystroke resizes nothing, because measurement and
+/// painting read the same lines.
+fn grid_row(
+    source: &str,
+    role: Role,
+    region: &Region,
+    styles: &MarkdownStyles,
+) -> Option<LineRender> {
+    let chars: Vec<char> = source.chars().collect();
+    let row = split_row(&chars)?;
+    if row.cells.len() != region.widths.len() {
+        return None;
+    }
+    let base = match role {
+        Role::Header => styles.table_header,
+        _ => styles.text,
+    };
+
+    // Cell-by-cell construction: each painted cell records the source character
+    // that owns it.  Padding a cell needs but its source never wrote is absorbed
+    // by the neighbouring mark (the pipe before a left pad, the one after a
+    // right pad), so no display cell is ever ownerless.
+    let mut glyphs: Vec<char> = Vec::with_capacity(chars.len() + 8);
+    let mut owners: Vec<u32> = Vec::with_capacity(chars.len() + 8);
+    for index in 0..row.pipes[0] {
+        glyphs.push(' '); // the row's own indentation, untouched
+        owners.push(index as u32);
+    }
+    let columns = region.widths.len();
+    for k in 0..columns {
+        glyphs.push('|');
+        owners.push(row.pipes[k] as u32);
+        let cell = &row.cells[k];
+        let trimmed = trim_range(&chars, cell.clone());
+        let width = region.widths[k].max(trimmed.len());
+        let content = trimmed.len();
+        let extra_left = match region.aligns.get(k).copied().unwrap_or(Align::Left) {
+            Align::Left => 0,
+            Align::Center => (width - content) / 2,
+            Align::Right => width - content,
+        };
+        for j in 0..=extra_left {
+            // One guaranteed space of breathing room plus the alignment pad;
+            // the row's own leading spaces fill these cells first.
+            let lead = trimmed.start - cell.start;
+            let owner = if j < lead {
+                cell.start + j
+            } else {
+                row.pipes[k] // written padding this column does not need
+            };
+            glyphs.push(' ');
+            owners.push(owner as u32);
+        }
+        for index in trimmed.clone() {
+            glyphs.push(chars[index]);
+            owners.push(index as u32);
+        }
+        let right = width - content - extra_left;
+        for j in 0..=right {
+            // Same trick on the closing side: real trailing spaces take cells
+            // first, surplus padding waits at the next pipe.
+            let tail_owner = if cell.end - trimmed.end > j {
+                trimmed.end + j
+            } else {
+                row.pipes[k + 1]
+            };
+            glyphs.push(' ');
+            owners.push(tail_owner as u32);
+        }
+    }
+    // The closing pipe.  A cell-less tail still has this last mark to own any
+    // surplus padding the row gained.
+    glyphs.push('|');
+    owners.push(row.pipes[columns] as u32);
+    for index in row.pipes[columns] + 1..chars.len() {
+        glyphs.push(' '); // trailing spaces after the closing pipe
+        owners.push(index as u32);
+    }
+
+    let mut out = LineRender {
+        glyphs,
+        styles: vec![base; owners.len()],
+        reveal: false,
+        columns: Vec::new(),
+        owners,
+    };
+    // The shared border pass does the rest exactly as it did character-for-
+    // character: pipes become rules and crossings, dashes fill their fields.
+    table(&mut out, role, styles);
+
+    // Fill the character → column map from first-owned cells; owners advance
+    // monotonically along the row, so the first cell an owner appears in marks
+    // its start.  A space this grid trimmed away owns no cell and collapses onto
+    // whatever follows it: zero-width, monotonic, and a click near one still
+    // resolves to a real neighbour.
+    let width = out.glyphs.len() as u32;
+    let mut columns_map = vec![u32::MAX; chars.len() + 1];
+    for (cell, owner) in out.owners.iter().enumerate() {
+        let owner = *owner as usize;
+        if columns_map[owner] == u32::MAX {
+            columns_map[owner] = cell as u32;
+        }
+    }
+    for index in (0..chars.len()).rev() {
+        if columns_map[index] == u32::MAX {
+            columns_map[index] = columns_map[index + 1];
+        }
+    }
+    columns_map[chars.len()] = width;
+    out.columns = columns_map;
+    Some(out)
 }
 
 // --------------------------------------------------------------------- inline
@@ -1215,9 +1595,67 @@ mod tests {
     #[test]
     fn table_intersections_get_corner_glyphs() {
         // Where a pipe crosses the dash run both ways it is `┼`; at either end an
-        // elbow.  That is what makes the grid read as a box.
+        // elbow.  That is what makes the grid read as a box.  The reflow also
+        // grows the packed row to the normal one-space cells, so both rows of
+        // this table end up the same width with their pipes in the same columns.
         let lines = ["|a|b|", "|-|-|"];
-        assert_eq!(display(&lines, 1), "├─┼─┤");
+        assert_eq!(display(&lines, 1), "├───┼───┤");
+        assert_eq!(display(&lines, 0), "│ a │ b │");
+    }
+
+    #[test]
+    fn ragged_rows_grow_to_one_grid() {
+        // The whole point of the reflow: a table whose author padded nothing still
+        // draws its borders straight.  Every row shares one layout — same column
+        // widths, pipes in the same display cells — and each character's map entry
+        // names where it ended up.
+        let lines = [
+            "| name | value |",
+            "| --- | ----- |",
+            "| a longer cell | 1 |",
+        ];
+        let decorated = decorate(&lines, &styles());
+        assert!(decorated[0].reflowed() && decorated[2].reflowed());
+        for render in &decorated {
+            assert_eq!(
+                render.glyphs.len(),
+                decorated[0].glyphs.len(),
+                "rows of one grid are the same width"
+            );
+        }
+        // The long cell pushed column one to its own width; the header's `value`
+        // travelled there without moving a byte in the buffer.
+        let display = |i: usize| decorated[i].display();
+        assert!(
+            display(2).starts_with("│ a longer cell │"),
+            "{}",
+            display(0)
+        );
+        assert_eq!(
+            display(0).find('v'),
+            Some(display(2).find('1').expect("a value cell")),
+            "column two starts at the same cell on every row"
+        );
+        // And the caret map follows: buffer character 2 is the header's `n…`'s
+        // neighbour — it must still sit two columns in, and every column of the
+        // map be monotonic with a terminator equal to the drawn width.
+        let render = &decorated[0];
+        assert_eq!(render.column_of(0), 0);
+        for i in 1..=2 {
+            assert!(render.columns[i] >= render.columns[i - 1]);
+        }
+        assert_eq!(
+            *render.columns.last().unwrap() as usize,
+            render.glyphs.len()
+        );
+
+        // The header's `v` — character nine of its line — has grown along with
+        // its column: it now draws where the long row's `1` draws, and clicking
+        // that cell must find the `v` back.
+        let v = render.column_of(9);
+        assert!(v > 9, "`value` did not travel with its column: {v}");
+        assert_eq!(render.glyphs[v], 'v');
+        assert_eq!(render.character_at(v), 9);
     }
 
     #[test]

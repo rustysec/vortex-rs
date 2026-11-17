@@ -862,9 +862,9 @@ impl App {
         if let Some(offset) = ui::byte_at(
             buffer,
             pane_rect,
-            &pane.view,
-            &pane.selection,
+            pane,
             &self.editor.config,
+            &self.theme,
             column,
             row,
         ) {

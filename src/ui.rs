@@ -422,6 +422,7 @@ fn draw_pane(
         text_width,
         tab_width,
         config.editor.wrap,
+        decor.as_ref(),
     );
 
     let mut cursor_position = None;
@@ -447,10 +448,16 @@ fn draw_pane(
 
         let text = line_text(buffer, line);
         let decorated = decor.as_ref().and_then(|decor| decor.get(line));
-        // Same character count by construction; the fallback covers a buffer edited
-        // between planning this frame and drawing it.
+        // A reflowed table row arrives as its grid: one row of cells wider or
+        // narrower than the characters it was written with, addressed through
+        // `LineRender::columns` instead of cell-equals-character.  Every other
+        // decorated line is the same character count by construction; the
+        // fallback covers a buffer edited between planning and drawing.
+        let grid = decorated.filter(|render| render.reflowed());
         let painted = match decorated {
-            Some(render) if render.glyphs.len() == text.chars().count() => render.display(),
+            Some(render) if grid.is_some() || render.glyphs.len() == text.chars().count() => {
+                render.display()
+            }
             _ => text.clone(),
         };
         let layers = Layers {
@@ -467,21 +474,34 @@ fn draw_pane(
             limit,
             tab_width,
         };
-        render_chunk(buf, &paint, &painted, slot.start, slot.end, &styles);
+        // A grid row is drawn whole, its columns already placed by the plan; a
+        // normal row slices `painted` by character index exactly as before, since
+        // for it cell equals character.
+        let (chunk_start, chunk_end) = match grid {
+            Some(_) => (0usize, painted.chars().count()),
+            None => (slot.start, slot.end),
+        };
+        render_chunk(buf, &paint, &painted, chunk_start, chunk_end, &styles);
 
         // The message for the line's worst diagnostic, dimmed after the text.
         // Only on the last visual row of the line, so a wrapped line does not
         // repeat it on every chunk.
         if config.editor.inline_diagnostics && slot.end >= text.chars().count() {
             if let Some(diagnostic) = inline_diagnostic(buffer, line) {
-                let column = display_column(&text, slot.start, slot.end, slot.end, tab_width);
+                let column = match grid {
+                    Some(render) => render.column_of(text.chars().count()),
+                    None => display_column(&text, slot.start, slot.end, slot.end, tab_width),
+                };
                 let message = format!("  {}", diagnostic.message);
                 emit(buf, x, y, &message, theme.status_inactive, column, limit);
             }
         }
 
         if focused && line == cursor_line && cursor_in_row(buffer, &text, cursor_char, slot) {
-            let column = display_column(&text, slot.start, slot.end, cursor_char, tab_width);
+            let column = match grid {
+                Some(render) => render.column_of(cursor_char),
+                None => display_column(&text, slot.start, slot.end, cursor_char, tab_width),
+            };
             if column < limit {
                 cursor_position = Some(Position {
                     x: x + column as u16,
@@ -572,6 +592,11 @@ struct RowSlot {
 }
 
 /// Map buffer lines to visual rows, wrapping when `[editor] wrap` is on.
+///
+/// A reflowed table row always takes exactly one row: its columns were laid out
+/// as a grid, and wrapping the second half under text it no longer borders would
+/// undo the alignment that made the row worth reflowing.  Off-pane surplus
+/// clips at the edge, which is what a too-wide table does unwrapped anyway.
 fn visual_rows(
     buffer: &TextBuffer,
     scroll: usize,
@@ -579,6 +604,7 @@ fn visual_rows(
     width: usize,
     tab_width: usize,
     wrap: bool,
+    decor: Option<&crate::markdown::Decorated>,
 ) -> Vec<RowSlot> {
     let mut rows = Vec::with_capacity(height);
     let mut line = scroll;
@@ -594,7 +620,7 @@ fn visual_rows(
             continue;
         }
         let text = line_text(buffer, line);
-        if !wrap {
+        if !wrap || decor.is_some_and(|d| d.get(line).is_some_and(|r| r.reflowed())) {
             rows.push(RowSlot {
                 line: Some(line),
                 start: 0,
@@ -723,7 +749,16 @@ struct Layers<'a> {
     decorated: Option<&'a crate::markdown::LineRender>,
 }
 
-/// One style per character of a logical line.
+/// One style per drawn cell of a logical line.
+///
+/// Normal cells *are* characters, so the decoration's per-character styles pass
+/// straight through.  A reflowed table row is wider than its character count:
+/// there each drawn column resolves to whichever source character owns it (see
+/// [`crate::markdown::LineRender::owners`]), and every layer below — cursor
+/// line, highlights, selection, search matches, diagnostics — then reads that
+/// character's byte offset as it always has.  Padding inherits its neighbour's
+/// layers, which is what makes a selection or a spell squiggle stretch across
+/// the blank a column grew by rather than stopping short of it.
 fn line_styles(
     buffer: &TextBuffer,
     line: usize,
@@ -741,25 +776,45 @@ fn line_styles(
     let base = theme.text;
     let line_start = buffer.line_start(line);
     let characters: Vec<char> = text.chars().collect();
-    // Decorated markdown brings its own per-character base, which the layers below
-    // then patch — so a selection or a search match still wins over a heading.
-    let decorated = decorated.filter(|render| render.styles.len() == characters.len());
-    let mut styles = match decorated {
-        Some(render) => render.styles.clone(),
-        None => vec![base; characters.len()],
-    };
-    if characters.is_empty() {
-        return styles;
-    }
 
     // Byte offset of every character, computed in one pass.
-    let mut offsets = Vec::with_capacity(characters.len());
+    let mut char_offsets = Vec::with_capacity(characters.len());
     let mut byte = 0usize;
     for character in &characters {
-        offsets.push(line_start + byte);
+        char_offsets.push(line_start + byte);
         byte += character.len_utf8();
     }
 
+    // Decorated markdown brings its own per-character base, which the layers below
+    // then patch — so a selection or a search match still wins over a heading.
+    let grid = decorated.filter(|render| render.reflowed());
+    let (mut styles, offsets): (Vec<Style>, Vec<usize>) = match grid {
+        Some(render) => (
+            render.styles.clone(),
+            (0..render.glyphs.len())
+                .map(|column| {
+                    let owner = render.character_at(column).min(characters.len());
+                    char_offsets
+                        .get(owner)
+                        .copied()
+                        .unwrap_or(line_start + byte)
+                })
+                .collect(),
+        ),
+        None => {
+            let decorated = decorated.filter(|render| render.styles.len() == characters.len());
+            (
+                match decorated {
+                    Some(render) => render.styles.clone(),
+                    None => vec![base; characters.len()],
+                },
+                char_offsets,
+            )
+        }
+    };
+    if offsets.is_empty() {
+        return styles;
+    }
     if screen.config.editor.cursorline && focused && selection.cursor_line == Some(line) {
         for style in styles.iter_mut() {
             *style = style.patch(theme.cursor_line);
@@ -813,7 +868,6 @@ fn line_styles(
     styles
 }
 
-/// Emit one visual row, expanding tabs and coalescing equal styles.
 /// Where a line of text is drawn, and how far it may run.
 struct LinePaint {
     x: u16,
@@ -824,6 +878,7 @@ struct LinePaint {
     tab_width: usize,
 }
 
+/// Emit one visual row, expanding tabs and coalescing equal styles.
 fn render_chunk(
     buf: &mut Buffer,
     paint: &LinePaint,
@@ -1271,9 +1326,9 @@ fn pane_flags(buffer: &TextBuffer, editor: &Editor, focused: bool) -> String {
 pub fn byte_at(
     buffer: &TextBuffer,
     pane_area: Rect,
-    view: &crate::layout::View,
-    selection: &Selection,
+    pane: &crate::layout::Pane,
     config: &Config,
+    theme: &Theme,
     column: u16,
     row: u16,
 ) -> Option<usize> {
@@ -1286,12 +1341,17 @@ pub fn byte_at(
     }
     let tab_width = config.editor.tab_width_for(buffer.language.id);
     let line_count = buffer.display_line_count();
-    let scroll = view.scroll_line.min(line_count.saturating_sub(1));
-    let cursor_line = buffer.line_of(selection.cursor());
+    let scroll = pane.view.scroll_line.min(line_count.saturating_sub(1));
+    let cursor_line = buffer.line_of(pane.selection.cursor());
     let gutter = Gutter::new(config, buffer, cursor_line, true);
     let text_width = content.width.saturating_sub(gutter.width as u16).max(1) as usize;
     let line_row = usize::from(row.checked_sub(content.y)?);
 
+    // The same decoration map the pane was painted with: on a reflowed table
+    // row the columns are not characters, and only the grid knows where each
+    // one actually sits.  `None` for the caret line because a click never
+    // reveals markup — it resolves against the geometry that is drawn.
+    let decor = decorations(buffer, config, theme, scroll, content.height as usize, None);
     let rows = visual_rows(
         buffer,
         scroll,
@@ -1299,6 +1359,7 @@ pub fn byte_at(
         text_width,
         tab_width,
         config.editor.wrap,
+        decor.as_ref(),
     );
     let slot = *rows.get(line_row)?;
     let line = slot.line?;
@@ -1311,23 +1372,35 @@ pub fn byte_at(
     let text = line_text(buffer, line);
     let characters: Vec<char> = text.chars().collect();
     let target = usize::from(column - (content.x + gutter.width as u16));
-    let mut displayed = 0usize;
-    let mut index = slot.start.min(characters.len());
-    while index < slot.end.min(characters.len()) {
-        let character = characters[index];
-        let advance = if character == '\t' {
-            tab_width - (displayed % tab_width)
-        } else {
-            1
-        };
-        if displayed + advance > target {
-            break;
+    // A reflowed row answers for itself which character owns the clicked cell;
+    // anything past its drawn width clamps to the end of the line.
+    let index = match decor
+        .as_ref()
+        .and_then(|decor| decor.get(line))
+        .filter(|render| render.reflowed())
+    {
+        Some(render) => render.character_at(target.min(render.glyphs.len().saturating_sub(1))),
+        None => {
+            let mut displayed = 0usize;
+            let mut index = slot.start.min(characters.len());
+            while index < slot.end.min(characters.len()) {
+                let character = characters[index];
+                let advance = if character == '\t' {
+                    tab_width - (displayed % tab_width)
+                } else {
+                    1
+                };
+                if displayed + advance > target {
+                    break;
+                }
+                displayed += advance;
+                index += 1;
+            }
+            index
         }
-        displayed += advance;
-        index += 1;
-    }
+    };
     let byte = buffer.line_start(line)
-        + characters[slot.start.min(characters.len())..index]
+        + characters[slot.start.min(characters.len())..index.max(slot.start)]
             .iter()
             .map(|character| character.len_utf8())
             .sum::<usize>();
@@ -2194,6 +2267,77 @@ mod tests {
     }
 
     #[test]
+    fn a_ragged_table_grows_into_one_aligned_grid() {
+        // The complaint this answers: rows, cells and columns of a table written
+        // without padding must still line up on screen.  Every row of the run
+        // draws at the same width with its rules in the same cells, and the
+        // caret — parked off the table so no row reveals itself — resolves
+        // through the column map like everything else.
+        let text = "| name | value |\n| --- | ----- |\n| a longer cell | 1 |\n\nDone.\n";
+        let mut editor = markdown_editor(text);
+        editor.set_cursor(text.find("Done.").expect("a closing line") + 1);
+        let (buffer, _) = render_to(70, 12, &editor);
+
+        // Screen rows 1..=3 below the pane border; the card's own edge pipes are
+        // present too, which is harmless — they sit at the same column on every
+        // row of any frame.
+        let rules_on = |row: u16| -> Vec<usize> {
+            row_text(&buffer, row)
+                .chars()
+                .enumerate()
+                .filter(|(_, c)| matches!(c, '│' | '┼' | '├' | '┤'))
+                .map(|(index, _)| index)
+                .collect()
+        };
+        let header = rules_on(1);
+        for row in 2..=3 {
+            assert_eq!(rules_on(row), header, "row {row} broke the grid");
+        }
+        // Content starts where its column starts on every row, alignment included.
+        let first_row = row_text(&buffer, 1);
+        let last_row = row_text(&buffer, 3);
+        assert_eq!(first_row.find("value"), last_row.find('1'));
+    }
+
+    #[test]
+    fn a_click_on_a_grown_column_lands_on_the_character_drawn_there() {
+        // The click path resolves through the same map the paint path does:
+        // the header's `v` has travelled from buffer column 9 to its grown
+        // grid cell, and clicking that cell must still name character 9.
+        let text = "| name | value |\n| --- | ----- |\n| a longer cell | 1 |\n\nDone.\n";
+        let mut editor = markdown_editor(text);
+        let click_line = 0usize;
+        editor.set_cursor(text.find("Done.").expect("a closing line") + 1);
+        let config = Config::default();
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 70, 12);
+        let (_, pane_area) = areas(area, &config);
+        let buffer = editor.current_buffer().expect("a buffer");
+        let mut pane = crate::layout::Pane::new(
+            crate::layout::PaneId(1),
+            editor.current_buffer_id().expect("a buffer"),
+        );
+        pane.selection = Selection::point(text.find("Done.").expect("a closing line") + 1);
+
+        // Where does the map say that `v` ended up?  Ask, then click there.
+        let decor = decorations(buffer, &config, &theme, 0, 12, None).expect("markdown");
+        let render = decor.get(click_line).expect("a row");
+        assert!(render.reflowed(), "the header did not reflow");
+        let column = pane_content(pane_area, &config).x
+            + Gutter::new(&config, buffer, 4, true).width as u16
+            + render.column_of(9) as u16;
+        let row = pane_content(pane_area, &config).y + click_line as u16;
+
+        let byte = byte_at(buffer, pane_area, &pane, &config, &theme, column, row)
+            .expect("the click is inside the pane");
+        assert_eq!(
+            byte,
+            buffer.line_start(click_line) + 9,
+            "the click missed the `v`"
+        );
+    }
+
+    #[test]
     fn the_carets_own_line_reveals_its_markup() {
         // Whatever line you are editing shows its source; the rest stays clean.
         let mut editor = markdown_editor("# Heading\n\nsome **bold** text\n");
@@ -2529,6 +2673,7 @@ mod tests {
             content_width,
             4,
             true,
+            None,
         );
         assert!(rows.len() >= 4, "120 characters should wrap");
         assert_eq!(rows[0].end, content_width);
@@ -3368,7 +3513,7 @@ mod tests {
             "one\ntwo\nthree\n".into(),
             &Config::default().editor,
         );
-        let rows = visual_rows(&buffer, 0, 5, 40, 4, false);
+        let rows = visual_rows(&buffer, 0, 5, 40, 4, false, None);
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[0].line, Some(0));
         assert_eq!(rows[2].line, Some(2));

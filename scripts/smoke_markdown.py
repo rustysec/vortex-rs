@@ -68,6 +68,12 @@ def main():
         "| name | value |\n"
         "| ---- | ----- |\n"
         "| a    | 1     |\n"
+        "\n"
+        # A second table, written with no padding at all: decoration must grow
+        # its columns so the grid still lines up on screen.
+        "| item | qty |\n"
+        "| - | - |\n"
+        "| pineapple | 1234567890 |\n"
     )
     with open(target, "w") as handle:
         handle.write(source)
@@ -90,6 +96,28 @@ def main():
     check("table borders are box drawing", "│ name │ value │" in screen, screen)
     border = [row for row in screen.splitlines() if "name" not in row and ("┼" in row or "─" in row)]
     check("the table delimiter row became a rule", bool(border), screen)
+
+    # The ragged second table must still draw as one grid: every rule of the
+    # run lands in the same screen column on all three rows, and each column's
+    # content starts at the same cell wherever it was written.
+    lines = screen.splitlines()
+    header_at = next(i for i, row in enumerate(lines) if "item" in row and "qty" in row)
+    grid = lines[header_at : header_at + 3]
+
+    def rule_columns(row):
+        return [i for i, ch in enumerate(row) if ch in "│┼├┤"]
+
+    check(
+        "a ragged table grows into one aligned grid",
+        len(grid) == 3
+        and rule_columns(grid[0]) == rule_columns(grid[1]) == rule_columns(grid[2]),
+        "\n".join(repr(row) for row in grid),
+    )
+    check(
+        "grown columns start their content in the same cell",
+        len(grid) == 3 and grid[0].index("qty") == grid[2].index("1234567890"),
+        "\n".join(repr(row) for row in grid),
+    )
 
     # The caret must sit over the character it names. `0` then `2l` lands on the
     # heading's `H`, which is written at buffer column 3 but painted two cells in,

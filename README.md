@@ -167,9 +167,10 @@ unbroken lines, and a table given real borders out of the pipes it already has.
 
 Nothing about the buffer changes: this is only how it is painted, so writing still
 writes plain markdown, and `:markdown` (or `toggle-markdown` on a key) switches back
-to the raw source. Because each line keeps its character count one-for-one, the
-cursor lands where you expect, soft wrap still breaks where it did, and clicking a
-character selects that character — decorated or not.
+to the raw source. Because every decorated line keeps its character count
+one-for-one — table rows aside, where drawn geometry resolves through an explicit
+character map either way — the cursor lands where you expect, soft wrap still breaks
+where it did, and clicking a character selects that character, decorated or not.
 
 Two things follow from keeping that promise, and both are visible:
 
@@ -180,9 +181,15 @@ Two things follow from keeping that promise, and both are visible:
   full-width line, for the same reason.
 
 Decoration needs no grammar; markdown has none wired up in `tree-sitter` and does not
-need one to be drawn this way. The one thing it cannot do is reflow: an aligned table
-draws a clean grid, while a ragged one still shows the raggedness, because moving text
-would move the cursor with it.
+need one to be drawn this way.  Tables are the one place where painting does move
+text: a table's columns grow to fit their widest cell, so even a raggedly written
+grid draws straight rules and aligned content (delimiter-row colons pick the
+alignment).  The cursor comes along for the ride through a per-cell character map —
+clicks, selection and caret all land on the character you can see, never a padded
+column over it.  The file itself is still exactly what was typed: alignment lives in
+the drawing, not the text.  And whichever line the cursor sits on reveals its markup
+as written, so the characters being edited are always visible — move off the row and
+the clean grid comes back.
 
 ## Dark or light
 
