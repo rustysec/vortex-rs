@@ -380,7 +380,11 @@ impl Theme {
             constant: Style::default().fg(magenta),
             function: bold(blue),
             type_name: Style::default().fg(yellow),
-            property: Style::default(),
+            // A key is neither a string nor plain text: config files are mostly
+            // keys, so leaving this unstyled paints them in a single colour.
+            // Cyan is the one loud hue not already spoken for by keywords,
+            // strings, numbers or types (comments borrow it, but italic).
+            property: Style::default().fg(hue(Color::Cyan, Color::Indexed(4))),
             operator: Style::default().add_modifier(Modifier::DIM),
             punctuation: Style::default(),
             tag: bold(green),
@@ -599,6 +603,32 @@ mod tests {
         assert_eq!(mix((255, 255, 255), (0, 0, 0), 0.25), (191, 191, 191));
         assert_eq!(mix((10, 20, 30), (200, 200, 200), 0.0), (10, 20, 30));
         assert_eq!(mix((10, 20, 30), (200, 200, 200), 2.0), (200, 200, 200));
+    }
+
+    #[test]
+    fn keys_are_coloured_rather_than_left_as_plain_text() {
+        // `Hl::Property` being the terminal's default text style made a
+        // highlighted key indistinguishable from an unhighlighted one — the
+        // JSON and TOML config files that are mostly keys read as one colour.
+        let dark = Theme::default_for(Scheme::Dark);
+        assert!(dark.property.fg.is_some(), "a key needs a colour");
+        assert_ne!(
+            dark.property.fg, dark.text.fg,
+            "keys must not be plain text"
+        );
+        // ...and a different one from the string a key is written with, so a
+        // pair reads as `"key": "value"` rather than as two strings.
+        assert_ne!(dark.property.fg, dark.string.fg);
+        let light = Theme::default_for(Scheme::Light);
+        assert!(light.property.fg.is_some(), "a key needs a colour");
+        // The config can still restyle it like every other element.
+        let config = ThemeConfig {
+            property: "bold underline green".into(),
+            ..ThemeConfig::default()
+        };
+        let theme = Theme::from_config(&config);
+        assert_eq!(theme.property.fg, Some(Color::Green));
+        assert!(theme.property.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

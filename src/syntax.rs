@@ -382,7 +382,13 @@ fn role_highlight(node: Node<'_>, field: Option<&str>) -> Option<Hl> {
             }
         }
         "type" | "return_type" | "argument_type" => Some(Hl::Type),
-        "parameter" | "parameters" | "field" | "property" | "attribute" => Some(Hl::Property),
+        // `key` is what the data grammars call the left-hand side of a pair:
+        // `"name": 1`, `name = 1` and `name: 1` all come back with this field.
+        // Without it a JSON key is just another string, which paints a config
+        // file in one colour.
+        "parameter" | "parameters" | "field" | "property" | "attribute" | "key" => {
+            Some(Hl::Property)
+        }
         _ => None,
     }
 }
@@ -546,7 +552,9 @@ fn keyword_group(lang_id: &str, token: &str) -> Option<Hl> {
         "go" => GO,
         "c" => C,
         "bash" => BASH,
-        "toml" | "yaml" => DATA,
+        // JSON's `true` and `false` are their own token kinds, so they need the
+        // same table the other data formats use; `null` is caught by kind.
+        "json" | "toml" | "yaml" => DATA,
         _ => &[],
     };
     set.iter()
@@ -1233,6 +1241,48 @@ mod tests {
             second.iter().all(|highlight| highlight.span.start >= 11),
             "{second:?}"
         );
+    }
+
+    #[test]
+    fn json_keys_and_literals_are_highlighted() {
+        // JSON used to paint almost nothing: a key is a `string` token, so it
+        // came out the same green as every value, and `true`/`false` are their
+        // own token kinds that no keyword table covered.  A config file then
+        // read as one colour.
+        let mut buffer = Buffer::new(
+            BufferId(1),
+            Some(std::path::PathBuf::from("sample.json")),
+            "{\"name\": \"vortex\", \"count\": 12, \"on\": true, \"off\": false, \"none\": null}\n"
+                .to_string(),
+            &EditorConfig::default(),
+        );
+        assert!(buffer.reparse_now(), "the JSON grammar should parse");
+        let groups = groups(&buffer);
+
+        for key in ["\"name\"", "\"count\"", "\"on\"", "\"off\"", "\"none\""] {
+            assert!(
+                groups
+                    .iter()
+                    .any(|(hl, text)| *hl == Hl::Property && text == key),
+                "key {key:?} should be a property in {groups:?}"
+            );
+        }
+        // A value is still a string, so a key and its text differ on screen.
+        assert!(
+            groups
+                .iter()
+                .any(|(hl, text)| *hl == Hl::String && text == "\"vortex\""),
+            "{groups:?}"
+        );
+        assert!(groups.iter().any(|(hl, _)| *hl == Hl::Number), "{groups:?}");
+        for literal in ["true", "false", "null"] {
+            assert!(
+                groups
+                    .iter()
+                    .any(|(hl, text)| *hl == Hl::Constant && text == literal),
+                "{literal} should be a constant in {groups:?}"
+            );
+        }
     }
 
     #[test]
