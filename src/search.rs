@@ -722,18 +722,9 @@ async fn walk_files(
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<Hit>>();
     let flag = Arc::clone(&cancelled);
     let walk_config = config.clone();
-    let matcher = prune_matcher(&root, &config);
     tokio::task::spawn_blocking(move || {
         let mut batch: Vec<Hit> = Vec::with_capacity(BATCH);
-        let walker = ignore::WalkBuilder::new(&root)
-            .hidden(!walk_config.hidden)
-            .follow_links(walk_config.follow)
-            .ignore(walk_config.ignore)
-            .git_ignore(walk_config.ignore)
-            .git_global(walk_config.ignore)
-            // Pruning as a filter also stops the walk descending into `target`.
-            .filter_entry(move |entry| keep_entry(matcher.as_ref(), &root, entry))
-            .build();
+        let walker = workspace_walker(&root, &walk_config);
         for entry in walker.flatten() {
             if flag.load(Ordering::Relaxed) {
                 return;
@@ -799,7 +790,6 @@ async fn grep_fallback(
     let flag = Arc::clone(&cancelled);
     let needle = query.to_string();
     let search_config = config.clone();
-    let matcher = prune_matcher(&root, &config);
     tokio::task::spawn_blocking(move || {
         let case_sensitive = !search_config.smart_case || needle.chars().any(|c| c.is_uppercase());
         let needle_compare = if case_sensitive {
@@ -808,13 +798,7 @@ async fn grep_fallback(
             needle.to_lowercase()
         };
         let mut batch: Vec<Hit> = Vec::with_capacity(BATCH);
-        let walker = ignore::WalkBuilder::new(&root)
-            .hidden(!search_config.hidden)
-            .follow_links(search_config.follow)
-            .ignore(search_config.ignore)
-            .git_ignore(search_config.ignore)
-            .filter_entry(move |entry| keep_entry(matcher.as_ref(), &root, entry))
-            .build();
+        let walker = workspace_walker(&root, &search_config);
         for entry in walker.flatten() {
             if flag.load(Ordering::Relaxed) {
                 return;
@@ -897,6 +881,27 @@ fn prune_matcher(root: &Path, config: &SearchConfig) -> Option<ignore::gitignore
 
 fn pruned(matcher: Option<&ignore::gitignore::Gitignore>, path: &Path, is_dir: bool) -> bool {
     matcher.is_some_and(|matcher| matcher.matched(path, is_dir).is_ignore())
+}
+
+/// A walker over `root` that honours the same `[search]` settings a search does.
+///
+/// Background work that reads the tree (the search pickers, and registering
+/// workspace files with a language server) must agree about what is in the
+/// tree.  Walking `node_modules` or `target` is not just slow: the LSP scan
+/// starts one server per root it finds a file for, so a vendored tree full of
+/// thousands of directories turns into thousands of processes.
+pub fn workspace_walker(root: &Path, config: &SearchConfig) -> ignore::Walk {
+    let matcher = prune_matcher(root, config);
+    let owned = root.to_path_buf();
+    ignore::WalkBuilder::new(root)
+        .hidden(!config.hidden)
+        .follow_links(config.follow)
+        .ignore(config.ignore)
+        .git_ignore(config.ignore)
+        .git_global(config.ignore)
+        // Pruning as a filter also stops the walk descending into `target`.
+        .filter_entry(move |entry| keep_entry(matcher.as_ref(), &owned, entry))
+        .build()
 }
 
 /// Skip `[search] prune` directories without leaving the search root behind.

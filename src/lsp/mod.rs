@@ -1046,6 +1046,14 @@ impl Handshake {
     }
 }
 
+/// How long a server that failed to start is left alone before another attempt.
+///
+/// A server that dies immediately — a configured command that is not installed,
+/// or one that rejects the handshake — failed for a reason the next spawn in
+/// the same millisecond will reproduce.  Retrying on every `ensure` turned one
+/// bad line of config into a process spawn per workspace file.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A handle to a running server.
 pub struct ClientHandle {
     pub language: String,
@@ -1054,6 +1062,12 @@ pub struct ClientHandle {
     pub root: PathBuf,
     outgoing: mpsc::UnboundedSender<Outgoing>,
     failed: Arc<std::sync::atomic::AtomicBool>,
+    /// When the handle last went dead, from the moment it was spawned.
+    ///
+    /// Kept on the handle rather than in `Clients` so a restarted session gets
+    /// a fresh clock with its fresh handle, and so a dead one keeps a reason
+    /// to wait instead of being replaced on sight.
+    started: std::time::Instant,
 }
 
 impl ClientHandle {
@@ -1070,11 +1084,17 @@ impl ClientHandle {
             root,
             outgoing,
             failed,
+            started: std::time::Instant::now(),
         }
     }
 
     pub fn is_alive(&self) -> bool {
         !self.failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether a dead handle has waited long enough for another attempt.
+    pub fn retry_due(&self) -> bool {
+        self.started.elapsed() >= RETRY_AFTER
     }
 
     pub fn did_open(&self, uri: String, language: &str, text: String, version: i64) {
@@ -1987,6 +2007,28 @@ impl Clients {
         self.by_root.is_empty()
     }
 
+    /// The root a server for `root` should actually run in.
+    ///
+    /// `search::project_root` falls back to the directory of the file when
+    /// there is no repository above it, so every directory holding a source
+    /// file would get its own server — a vendored `node_modules` of a thousand
+    /// directories meant a thousand processes.  A server speaks for the tree it
+    /// was started in, so an existing client for a *parent* of `root` is used
+    /// instead: one server per tree, not one per directory.
+    fn serving_root(&self, root: &Path) -> PathBuf {
+        if self.by_root.contains_key(root) {
+            return root.to_path_buf();
+        }
+        self.by_root
+            .keys()
+            .filter(|served| root.starts_with(served))
+            // The nearest enclosing client is the one whose analysis already
+            // covers this file.
+            .max_by_key(|served| served.as_os_str().len())
+            .cloned()
+            .unwrap_or_else(|| root.to_path_buf())
+    }
+
     /// The client for `root`, starting one when needed.
     pub fn ensure(
         &mut self,
@@ -1994,11 +2036,26 @@ impl Clients {
         spec: &ServerSpec,
         root: &Path,
     ) -> Option<&mut ClientHandle> {
+        let root = self.serving_root(root);
+        let root = root.as_path();
         let live = self
             .by_root
             .get(root)
             .is_some_and(|client| client.is_alive() && client.language == spec.language);
         if !live {
+            // A dead client is remembered rather than forgotten.  Replacing it
+            // here meant every later `ensure` spawned the server again, so a
+            // project whose server is configured but not installed paid a
+            // process spawn per file it tried to register.  Keeping the dead
+            // handle makes the next attempt wait out the retry window instead,
+            // and it still counts as "unavailable" for `attached`.
+            let cooling_down = self
+                .by_root
+                .get(root)
+                .is_some_and(|client| !client.is_alive() && !client.retry_due());
+            if cooling_down {
+                return None;
+            }
             let client = spawn_client(tx.clone(), spec.clone(), root.to_path_buf(), JobId::new(0));
             self.by_root.insert(root.to_path_buf(), client);
         }
@@ -2006,7 +2063,8 @@ impl Clients {
     }
 
     pub fn get(&mut self, root: &Path) -> Option<&mut ClientHandle> {
-        self.by_root.get_mut(root)
+        let root = self.serving_root(root);
+        self.by_root.get_mut(&root)
     }
 
     /// The server program attached for `language`, if a live client serves it.
@@ -2491,6 +2549,84 @@ mod tests {
             },
         );
         assert!(server_for("python", &config).is_none());
+    }
+
+    #[test]
+    fn a_server_serves_the_whole_tree_not_one_directory_per_file() {
+        // Outside a git repository `project_root` is just the file's own
+        // directory, so every directory holding a source file looked like its
+        // own project.  In a vendored tree — a `node_modules` with thousands of
+        // directories — that started thousands of servers, which is what made
+        // opening one small file next to it sluggish.
+        let mut clients = Clients::new();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tree = Path::new("/tmp/vortex-lsp-serving-root");
+        let parent = ClientHandle::new(
+            "typescript".into(),
+            "tsc".into(),
+            tree.to_path_buf(),
+            mpsc::unbounded_channel().0,
+            Arc::clone(&failed),
+        );
+        clients.by_root.insert(tree.to_path_buf(), parent);
+
+        // A file deeper in the same tree resolves to the server already there...
+        let nested = tree.join("node_modules/@scope/pkg/src");
+        assert_eq!(clients.serving_root(&nested), tree.to_path_buf());
+        // ...and so does one in a sibling directory.
+        assert_eq!(
+            clients.serving_root(&tree.join("other")),
+            tree.to_path_buf()
+        );
+        // A path that is not under it is its own root, not a prefix match: this
+        // is a string check on components, so `/tmp/vortex-lsp-serving-root2`
+        // must not be served by `/tmp/vortex-lsp-serving-root`.
+        let sibling = Path::new("/tmp/vortex-lsp-serving-root2");
+        assert_eq!(clients.serving_root(sibling), sibling.to_path_buf());
+        // The nearest enclosing client wins when a tree contains another.
+        assert_eq!(clients.serving_root(tree), tree.to_path_buf());
+    }
+
+    #[test]
+    fn a_server_that_failed_is_not_respawned_on_every_request() {
+        // `tsc --lsp` (or a mistyped command) exits at once.  Replacing the dead
+        // handle on sight meant every later `ensure` — one per workspace file —
+        // spawned the process again, so a single bad config line cost a process
+        // spawn per file before the first frame was even drawn.
+        let clients = Clients::new();
+        let root = Path::new("/tmp/vortex-lsp-retry-test").to_path_buf();
+        // A handle that has just died, exactly as a failed session leaves one.
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let dead = ClientHandle::new(
+            "json".into(),
+            "tsc".into(),
+            root.clone(),
+            mpsc::unbounded_channel().0,
+            Arc::clone(&failed),
+        );
+        let live = !dead.is_alive();
+        assert!(live, "a failed flag marks the handle dead");
+        assert!(
+            !dead.retry_due(),
+            "a fresh death is inside the retry window, so no respawn is due"
+        );
+        assert!(
+            clients.attached("json").is_none(),
+            "and nothing looks attached"
+        );
+
+        // An old death is due: the window has passed and the server is worth
+        // another attempt, rather than being written off for the session.
+        let mut aged = ClientHandle::new(
+            "json".into(),
+            "tsc".into(),
+            root,
+            mpsc::unbounded_channel().0,
+            failed,
+        );
+        aged.started = std::time::Instant::now() - RETRY_AFTER - std::time::Duration::from_secs(1);
+        assert!(aged.retry_due());
+        assert!(clients.is_empty());
     }
 
     #[test]

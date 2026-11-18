@@ -56,6 +56,21 @@ const DIAGNOSTIC_HOLD: Duration = Duration::from_millis(500);
 /// How often the git branch behind the status row is re-probed; a branch
 /// switch happens outside vortex, so only time can notice it.
 const GIT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// How many directory entries one tick spends walking the workspace.
+///
+/// Registering the whole tree at startup meant walking it, reading every file
+/// and queueing a `didOpen` before the first frame was drawn, which is what
+/// made opening a file in a large project feel slow even when no server was
+/// installed for its language.  Walking and registering now both run a batch at
+/// a time on the idle tick: the first frame goes out immediately and the
+/// project scope fills in behind it.
+const LSP_WALK_BATCH: usize = 512;
+/// How many workspace files one tick hands to a language server.
+const LSP_REGISTER_BATCH: usize = 64;
+/// Most files ever registered for one server root in a session.  A tree with
+/// more source files than this is past what a project-wide diagnostic sweep
+/// buys, and queueing them all would cost memory for answers nobody reads.
+const LSP_REGISTER_LIMIT: usize = 20_000;
 
 /// Convert LSP diagnostics for an unopened workspace file into project entries.
 ///
@@ -304,6 +319,79 @@ pub struct App {
     /// can trigger exactly one redraw.
     diagnostic_float_shown: bool,
     last_frame: Rect,
+    /// The workspace registration still running: a directory walk and the
+    /// files it has found so far, advanced a batch per idle tick.
+    ///
+    /// `None` means nothing is queued — LSP is off, or the walk has finished.
+    lsp_scan: Option<WorkspaceScan>,
+}
+
+/// The workspace registration walk, spread across idle ticks.
+///
+/// Walking a large tree and sending `didOpen` for every source file is real
+/// work (stat, read, JSON) even when most files share a language; done at
+/// startup it delayed the first frame, which is what made opening a file feel
+/// slow in a big project.  Keeping the walk half-done between ticks means it
+/// interleaves with drawing and key handling instead.
+struct WorkspaceScan {
+    walker: ignore::Walk,
+    /// Files found but not yet registered, in walk order.
+    ready: std::collections::VecDeque<(PathBuf, String)>,
+    /// False once the walk is exhausted, so the last queued files still go out.
+    walking: bool,
+    /// Most files this scan will ever queue.
+    limit: usize,
+}
+
+impl WorkspaceScan {
+    fn new(walker: ignore::Walk) -> Self {
+        Self {
+            walker,
+            ready: std::collections::VecDeque::new(),
+            walking: true,
+            limit: LSP_REGISTER_LIMIT,
+        }
+    }
+
+    /// True while there is work left, found or still to find.
+    fn pending(&self) -> bool {
+        self.walking || !self.ready.is_empty()
+    }
+
+    /// Find files and hand back the next batch worth registering.
+    ///
+    /// One batch of directory entries and one batch of ready files per call, so
+    /// a caller on the event loop can interleave this with drawing instead of
+    /// stalling startup on a whole-tree walk.  `wanted` filters by language id;
+    /// only files it accepts are queued.
+    fn advance(&mut self, wanted: impl Fn(&str) -> bool) -> Vec<(PathBuf, String)> {
+        if self.walking {
+            for _ in 0..LSP_WALK_BATCH {
+                let Some(entry) = self.walker.next() else {
+                    self.walking = false;
+                    break;
+                };
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    continue;
+                }
+                let path = entry.into_path();
+                let language = lang::detect(Some(&path), None).id.to_string();
+                if !wanted(&language) {
+                    continue;
+                }
+                if self.ready.len() >= self.limit {
+                    self.walking = false;
+                    break;
+                }
+                self.ready.push_back((path, language));
+            }
+        }
+        let take = self.ready.len().min(LSP_REGISTER_BATCH);
+        self.ready.drain(..take).collect()
+    }
 }
 
 impl App {
@@ -382,6 +470,7 @@ impl App {
             diagnostic_hold: None,
             diagnostic_float_shown: false,
             last_frame: Rect::new(0, 0, 80, 24),
+            lsp_scan: None,
         };
         // Initial background work: parse, and check spelling if enabled.
         let ids: Vec<BufferId> = app
@@ -397,10 +486,12 @@ impl App {
             }
             app.notify_lsp_open(id);
         }
-        // Register every workspace source file with its language server so the
-        // project scope sees diagnostics across the whole tree from the start,
-        // not just for files that happen to be open.
-        app.register_workspace();
+        // Queue every workspace source file for its language server so the
+        // project scope fills in across the tree, not just for files that happen
+        // to be open.  The walk is deferred: doing it here put a read of every
+        // matching file on the startup path, which is what made opening a file
+        // in a large tree slow even when no server was installed for it.
+        app.queue_workspace_registration();
         for warning in keymap_warnings.iter().take(3) {
             app.set_message(StatusLevel::Warn, warning.clone());
         }
@@ -491,6 +582,10 @@ impl App {
         }
 
         self.sync_versions();
+
+        // The workspace registration walk, a batch per tick.  It is behind the
+        // first frame by construction: `start` only queues it.
+        self.advance_lsp_scan();
 
         // Background work, one buffer per tick so the loop stays responsive.
         if let Some(id) = self.needs_parse() {
@@ -3486,41 +3581,50 @@ impl App {
         }
     }
 
-    /// Register every workspace source file with its language server, without
-    /// opening a buffer for it.
+    /// Queue a walk of the workspace, so every source file can be registered
+    /// with its language server without opening a buffer for it.
     ///
     /// A server only analyses documents it has been told about via `didOpen`, so
     /// the project scope used to be limited to files vortex had opened.  Walking
     /// the tree and sending `didOpen` for each matching file makes rust-analyzer
-    /// (and friends) report diagnostics across the whole workspace from the very
-    /// first frame, instead of only once a file happened to be reached.
+    /// (and friends) report diagnostics across the whole workspace, instead of
+    /// only once a file happened to be reached.
     ///
-    /// Files are read straight off disk — no buffer is created — so a large tree
-    /// costs transient reads rather than permanent buffers.
-    fn register_workspace(&mut self) {
+    /// The walk itself runs from [`App::advance_lsp_scan`] on the idle tick, not
+    /// here: a startup that stats every file in the tree before the first frame
+    /// is exactly the slowness this avoids.  Files are read off disk when their
+    /// batch comes up — no buffer is created — so a large tree costs transient
+    /// reads rather than permanent buffers.
+    fn queue_workspace_registration(&mut self) {
         if !self.editor.config.lsp.enable || self.search_root.as_os_str().is_empty() {
             return;
         }
-        let root = self.search_root.clone();
-        // Collect the files first so we are not holding a borrow of `self` while
-        // sending to clients.
-        let mut candidates: Vec<(PathBuf, String)> = Vec::new();
-        for entry in ignore::WalkBuilder::new(&root).build().flatten() {
-            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-                continue;
-            }
-            let path = entry.into_path();
-            // Only files whose language has a configured server are worth
-            // registering; everything else would just be sent to nothing.
-            let language = lang::detect(Some(&path), None).id.to_string();
-            if self.server_spec_for(&language).is_none() {
-                continue;
-            }
-            candidates.push((path, language));
+        // The same walker and pruning the search pickers use, so `target/`,
+        // `node_modules/` and everything `.gitignore` names cost nothing here
+        // either.  Without the pruning a vendored tree is walked in full, and
+        // since this walk starts a server per root it finds a file for, a
+        // `node_modules` of thousands of directories became thousands of
+        // processes — which is exactly how opening one small JSON file next to
+        // it made the editor sluggish.
+        let walker = search::workspace_walker(&self.search_root, &self.editor.config.search);
+        self.lsp_scan = Some(WorkspaceScan::new(walker));
+    }
+
+    /// Advance the workspace registration by one tick's worth of work.
+    ///
+    /// Files are found a batch at a time and registered a batch at a time, so a
+    /// huge tree interleaves with drawing rather than stalling startup.  A file
+    /// already open as a buffer is skipped: the normal `notify_lsp_open` path
+    /// registered it.
+    fn advance_lsp_scan(&mut self) {
+        if !self.editor.config.lsp.enable {
+            return;
         }
-        for (path, language) in candidates {
-            // A file already open as a buffer is registered through the normal
-            // `notify_lsp_open` path; registering it again would be redundant.
+        let Some(mut scan) = self.lsp_scan.take() else {
+            return;
+        };
+        let batch = scan.advance(|language| self.server_spec_for(language).is_some());
+        for (path, language) in batch {
             if self.editor.buffer_by_path(&path).is_some() {
                 continue;
             }
@@ -3536,6 +3640,9 @@ impl App {
             if let Some(client) = self.clients.ensure(&sender, &spec, &root) {
                 client.did_open(uri, &language, text, 1);
             }
+        }
+        if scan.pending() {
+            self.lsp_scan = Some(scan);
         }
     }
 
@@ -4028,5 +4135,111 @@ fn key(code: KeyCode) -> KeyEvent {
         modifiers: KeyModifiers::NONE,
         kind: KeyEventKind::Press,
         state: crossterm::event::KeyEventState::NONE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each test needs its own directory: the suite runs in parallel.
+    fn temp_tree(files: &[&str]) -> PathBuf {
+        let unique = format!(
+            "vortex-scan-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique.replace(['/', ' '], "-"));
+        for name in files {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(&path, "x\n").expect("write");
+        }
+        root
+    }
+
+    fn scan_of(root: &Path) -> WorkspaceScan {
+        WorkspaceScan::new(ignore::WalkBuilder::new(root).build())
+    }
+
+    #[test]
+    fn the_workspace_scan_hands_out_files_a_batch_at_a_time() {
+        // The point of the scan is that it never does the whole tree in one go:
+        // the first call must return promptly, not after every file is found.
+        let files: Vec<String> = (0..(LSP_REGISTER_BATCH * 2 + 5))
+            .map(|index| format!("src/f{index}.rs"))
+            .collect();
+        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+        let root = temp_tree(&names);
+        let mut scan = scan_of(&root);
+
+        let first = scan.advance(|language| language == "rust");
+        assert!(!first.is_empty(), "the first tick still makes progress");
+        assert!(
+            first.len() <= LSP_REGISTER_BATCH,
+            "one tick hands over at most a batch, got {}",
+            first.len()
+        );
+        assert!(scan.pending(), "most of the tree is still to register");
+
+        // Draining the rest reaches every file exactly once.
+        let mut seen = first;
+        while scan.pending() {
+            seen.extend(scan.advance(|language| language == "rust"));
+        }
+        let mut names: Vec<String> = seen
+            .into_iter()
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), files.len(), "{names:?}");
+        assert!(!scan.pending());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_workspace_scan_skips_directories_pruned_from_searching() {
+        // A vendored tree is not part of the project: walking it is slow, and
+        // since the scan starts a server per file's root it also spawned one
+        // process per vendored directory.  `[search] prune` is what says which
+        // directories those are, so the scan must honour it.
+        let root = temp_tree(&["src/app.ts", "node_modules/pkg/deep/lib.ts"]);
+        let config = crate::config::SearchConfig {
+            prune: vec!["node_modules".into()],
+            ..crate::config::SearchConfig::default()
+        };
+        let mut scan = WorkspaceScan::new(crate::search::workspace_walker(&root, &config));
+        let mut found = Vec::new();
+        while scan.pending() {
+            found.extend(scan.advance(|language| language == "typescript"));
+        }
+        let names: Vec<String> = found
+            .into_iter()
+            .map(|(path, _)| path.strip_prefix(&root).unwrap().display().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["src/app.ts"],
+            "pruned directories must not be scanned"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_workspace_scan_only_queues_languages_with_a_server() {
+        let root = temp_tree(&["a.rs", "b.json", "c.md"]);
+        let mut scan = scan_of(&root);
+        let mut found = Vec::new();
+        while scan.pending() {
+            found.extend(scan.advance(|language| language == "rust"));
+        }
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].1, "rust");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
