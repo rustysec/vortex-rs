@@ -18,6 +18,10 @@
 //!   not character-for-character, which is exactly why [`LineRender::columns`]
 //!   exists — painted geometry resolves through it (or its inverse, owners) so
 //!   even table rows keep caret and clicks honest; saved text stays as written.
+//! * a grid too wide for the pane **fits rather than clips**: columns shrink and
+//!   their cells word-wrap across extra screen rows (`decorate_window`'s `fit`),
+//!   so nothing hides past the right edge — and the row being edited reveals
+//!   itself as plain text anyway, caret arithmetic and all.
 //! * the line under the cursor **reveals** its markup: you edit characters you
 //!   can see (see [`LineRender::reveal`]).
 //!
@@ -247,8 +251,14 @@ enum Align {
 }
 
 impl Plan {
-    /// Classify every line of `lines`.
+    /// Classify every line of `lines`, sizing tables to no particular width.
     pub fn new(lines: &[&str]) -> Self {
+        Self::fitted(lines, None)
+    }
+
+    /// Classify every line of `lines`, shrinking each table's columns so its
+    /// grid fits `fit` screen columns where one is given (see [`decorate_window`]).
+    pub fn fitted(lines: &[&str], fit: Option<usize>) -> Self {
         let fences = fence_map(lines);
         let mut blocks: Vec<Block> = lines
             .iter()
@@ -299,7 +309,7 @@ impl Plan {
             }
         }
 
-        let (region_of, regions) = table_regions(lines, &fences, &blocks);
+        let (region_of, regions) = table_regions(lines, &fences, &blocks, fit);
         Self {
             blocks,
             region_of,
@@ -321,20 +331,24 @@ impl Plan {
         self.blocks.is_empty()
     }
 
-    /// Paint `lines[index]`.  `None` when the index is outside the plan, which is
-    /// how a document that gained lines between frames stays drawable.
+    /// Paint `lines[index]`, returning every screen row it needs.
+    ///
+    /// A table row whose grid was shrunk to fit the pane may wrap: one segment
+    /// per screen row, each a complete trip across the columns so the vertical
+    /// rules line up down the page.  Everything else is a single segment.
+    /// `None` when the index is outside the plan, which is how a document that
+    /// gained lines between frames stays drawable.
     ///
     /// `reveal` shows that line's markup as written (see [`LineRender::reveal`]);
-    /// the UI passes it for the line under the cursor.  A table row that does not
-    /// reveal comes back reflowed to its region's grid, mapping and all — see
-    /// [`LineRender::columns`].
-    pub fn line(
+    /// the UI passes it for the line under the cursor — which is also why no
+    /// grid has to agree with a caret: the row being edited draws as plain text.
+    pub fn row(
         &self,
         lines: &[&str],
         index: usize,
         reveal: bool,
         styles: &MarkdownStyles,
-    ) -> Option<LineRender> {
+    ) -> Option<Row> {
         let block = *self.blocks.get(index)?;
         let source = *lines.get(index)?;
         if !reveal {
@@ -343,11 +357,26 @@ impl Plan {
                     .region(index)
                     .and_then(|r| grid_row(source, role, r, styles))
                 {
-                    return Some(grid);
+                    return Some(Row { segments: grid });
                 }
             }
         }
-        Some(render(source, block, reveal, styles))
+        Some(Row {
+            segments: vec![render(source, block, reveal, styles)],
+        })
+    }
+
+    /// Paint `lines[index]` as a single row — the answer for every line that
+    /// does not wrap, which is all of them when the plan carries no fit width.
+    pub fn line(
+        &self,
+        lines: &[&str],
+        index: usize,
+        reveal: bool,
+        styles: &MarkdownStyles,
+    ) -> Option<LineRender> {
+        self.row(lines, index, reveal, styles)
+            .map(|row| row.segments.into_iter().next())?
     }
 
     /// The classification of one line, for callers that only need to know whether
@@ -357,8 +386,31 @@ impl Plan {
     }
 }
 
+/// How one buffer line paints: normally a single screen row, more when a
+/// reflowed table row had to wrap inside its columns to fit the pane.
+#[derive(Debug, Clone)]
+pub struct Row {
+    /// One entry per screen row, in vertical order; never empty.
+    pub segments: Vec<LineRender>,
+}
+
+impl Row {
+    /// Whether any segment's geometry differs from the line's character count.
+    pub fn reflowed(&self) -> bool {
+        self.segments.first().is_some_and(LineRender::reflowed)
+    }
+
+    /// The screen row drawn at vertical offset `sub`, clamped to what exists —
+    /// a document edited between planning and painting may have lost segments,
+    /// and drawing the last one is better than drawing nothing.
+    pub fn segment(&self, sub: usize) -> Option<&LineRender> {
+        self.segments.get(sub).or_else(|| self.segments.last())
+    }
+}
+
 /// Plan and paint a whole document at once — the convenience path tests and any
-/// caller without a viewport uses.
+/// caller without a viewport uses.  With no pane to fit, no table wraps and
+/// every row is one segment.
 pub fn decorate(lines: &[&str], styles: &MarkdownStyles) -> Vec<LineRender> {
     let plan = Plan::new(lines);
     (0..lines.len())
@@ -372,12 +424,12 @@ pub struct Decorated {
     first_line: usize,
     /// One entry per line of the requested window, in order.  `None` where the text
     /// had no such line keeps the indices aligned without offset arithmetic.
-    renders: Vec<Option<LineRender>>,
+    renders: Vec<Option<Row>>,
 }
 
 impl Decorated {
     /// The decoration of buffer line `line`, when this window covers it.
-    pub fn get(&self, line: usize) -> Option<&LineRender> {
+    pub fn get(&self, line: usize) -> Option<&Row> {
         self.renders
             .get(line.checked_sub(self.first_line)?)?
             .as_ref()
@@ -392,17 +444,23 @@ impl Decorated {
 /// file.  Lines past the end of the text come back as `None`, so a document edited
 /// between planning and painting simply loses its decoration on that row until the
 /// next frame.
+///
+/// `fit` is the pane's text width: a table wider than it gets its columns shrunk
+/// and their contents word-wrapped across several screen rows per source line,
+/// so the whole grid stays visible without scrolling sideways (the row under the
+/// cursor still draws once, revealed as written — there the user edits, not reads).
 pub fn decorate_window(
     text: &str,
     window: std::ops::Range<usize>,
     active_line: Option<usize>,
     styles: &MarkdownStyles,
+    fit: Option<usize>,
 ) -> Decorated {
     let lines: Vec<&str> = text.lines().collect();
-    let plan = Plan::new(&lines);
+    let plan = Plan::fitted(&lines, fit);
     let renders = window
         .clone()
-        .map(|index| plan.line(&lines, index, Some(index) == active_line, styles))
+        .map(|index| plan.row(&lines, index, Some(index) == active_line, styles))
         .collect();
     Decorated {
         first_line: window.start,
@@ -664,6 +722,7 @@ fn table_regions(
     lines: &[&str],
     _fences: &[Fence],
     blocks: &[Block],
+    fit: Option<usize>,
 ) -> (Vec<Option<usize>>, Vec<Region>) {
     let mut region_of = vec![None; blocks.len()];
     let mut regions: Vec<Region> = Vec::new();
@@ -676,7 +735,7 @@ fn table_regions(
         let end = (start..blocks.len())
             .find(|&i| !matches!(blocks[i], Block::Table(_)))
             .unwrap_or(blocks.len());
-        if let Some(region) = measure_region(lines, blocks, start..end) {
+        if let Some(region) = measure_region(lines, blocks, start..end, fit) {
             let id = regions.len();
             regions.push(region);
             for slot in &mut region_of[start..end] {
@@ -694,12 +753,23 @@ fn table_regions(
 /// no notion of tab stops), or a differing pipe count between rows makes the
 /// run refused: every row then draws character-for-character as before rather
 /// than aligning with half its neighbours and not the rest.
-fn measure_region(lines: &[&str], blocks: &[Block], run: std::ops::Range<usize>) -> Option<Region> {
+///
+/// `fit` is the pane's text width; a grid wider than it has its columns shrunk
+/// (widest first, down to [`MIN_COLUMN`] each) so the wrapped rows that follow
+/// can present the whole table inside the visible space.
+fn measure_region(
+    lines: &[&str],
+    blocks: &[Block],
+    run: std::ops::Range<usize>,
+    fit: Option<usize>,
+) -> Option<Region> {
     let mut widths: Option<Vec<usize>> = None;
     let mut aligns: Option<Vec<Align>> = None;
+    let mut indent = 0usize;
     for index in run {
         let chars: Vec<char> = lines[index].chars().collect();
         let row = split_row(&chars)?;
+        indent = indent.max(row.pipes[0]);
         let columns = row.cells.len();
         if columns == 0 {
             return None;
@@ -731,11 +801,100 @@ fn measure_region(lines: &[&str], blocks: &[Block], run: std::ops::Range<usize>)
             aligns = Some(found);
         }
     }
-    let widths = widths?;
+    let mut widths = widths?;
+    if let Some(avail) = fit {
+        shrink_to_fit(&mut widths, indent, avail);
+    }
     Some(Region {
         aligns: aligns.unwrap_or_else(|| vec![Align::Left; widths.len()]),
         widths,
     })
+}
+
+/// The narrowest a shrunken column may get before the grid gives up on fitting.
+const MIN_COLUMN: usize = 3;
+
+/// Screen columns a grid of these widths occupies, indentation included:
+/// every column is its content plus `| ` on one side and ` ` on the other,
+/// and the row closes with one more pipe.
+fn grid_width(widths: &[usize], indent: usize) -> usize {
+    indent + widths.iter().map(|w| w + 3).sum::<usize>() + 1
+}
+
+/// Shave the widest columns until the grid fits `avail`, so no column ends up
+/// narrower than [`MIN_COLUMN`] — content that no longer fits a field is
+/// word-wrapped across extra screen rows by [`grid_row`], never lost.
+fn shrink_to_fit(widths: &mut [usize], indent: usize, avail: usize) {
+    while grid_width(widths, indent) > avail {
+        let widest = (0..widths.len())
+            .filter(|&k| widths[k] > MIN_COLUMN)
+            .max_by_key(|&k| widths[k]);
+        match widest {
+            Some(k) => widths[k] -= 1,
+            // Everything is already at the floor: a table with more columns
+            // than even the narrowest grid needs clips as it always has.
+            None => break,
+        }
+    }
+}
+
+/// Split one cell's trimmed range into lines at most `width` characters wide.
+///
+/// Word-wrapping on the runs of spaces a cell already contains: each returned
+/// range is contiguous source text, so the dropped inter-word spaces simply
+/// own no display cell — zero-width entries in [`LineRender::columns`], which
+/// is how they were already handled for padding this grid trimmed away.  A
+/// word longer than the column is hard-broken rather than allowed to shove
+/// the rule out of sight; the ranges stay disjoint, ordered and inside the
+/// cell either way.
+fn wrap_cell(
+    chars: &[char],
+    trimmed: std::ops::Range<usize>,
+    width: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let width = width.max(1);
+    if trimmed.is_empty() {
+        return vec![trimmed];
+    }
+    // The cell's words, with anything longer than a field cut into pieces.
+    let mut words: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut index = trimmed.start;
+    while index < trimmed.end {
+        if chars[index] == ' ' {
+            index += 1;
+            continue;
+        }
+        let mut end = index;
+        while end < trimmed.end && chars[end] != ' ' {
+            end += 1;
+        }
+        let mut start = index;
+        while end - start > width {
+            words.push(start..start + width);
+            start += width;
+        }
+        if start < end || words.is_empty() {
+            words.push(start..end.max(start));
+        }
+        index = end;
+    }
+    // Greedy fill: a word joins the current line when the whole span from the
+    // line's first character to that word's end still fits — interior spaces
+    // included, the boundary space between lines excluded by construction.
+    let mut lines = Vec::new();
+    let mut iter = words.into_iter().peekable();
+    while let Some(first) = iter.next() {
+        let (start, mut end) = (first.start, first.end);
+        while let Some(next) = iter.peek() {
+            if next.end - start > width {
+                break;
+            }
+            end = next.end;
+            iter.next();
+        }
+        lines.push(start..end);
+    }
+    lines
 }
 
 /// Split a line at its unescaped pipes.  `None` refuses the row — see
@@ -794,7 +953,15 @@ fn trim_range(chars: &[char], range: std::ops::Range<usize>) -> std::ops::Range<
     start..end
 }
 
-/// Re-emit `source` over its region's grid, mapping every character.
+/// Re-emit `source` over its region's grid, mapping every character — one
+/// [`LineRender`] per screen row.
+///
+/// With columns at their natural width a cell needs at most one line and the
+/// row comes back whole, exactly as it was drawn before fitting existed.  A
+/// shrunk column holds less than the cell does, so the row returns as several
+/// segments: each walks all the columns drawing that segment's line of every
+/// cell (blank where a cell ran out of lines), which keeps the vertical rules
+/// in one place down the whole wrapped row.
 ///
 /// `None` when this particular row cannot take the grid (a pipe count that
 /// disagrees with the run); the caller falls back to painting it verbatim, so
@@ -806,7 +973,7 @@ fn grid_row(
     role: Role,
     region: &Region,
     styles: &MarkdownStyles,
-) -> Option<LineRender> {
+) -> Option<Vec<LineRender>> {
     let chars: Vec<char> = source.chars().collect();
     let row = split_row(&chars)?;
     if row.cells.len() != region.widths.len() {
@@ -817,98 +984,132 @@ fn grid_row(
         _ => styles.text,
     };
 
-    // Cell-by-cell construction: each painted cell records the source character
-    // that owns it.  Padding a cell needs but its source never wrote is absorbed
-    // by the neighbouring mark (the pipe before a left pad, the one after a
-    // right pad), so no display cell is ever ownerless.
-    let mut glyphs: Vec<char> = Vec::with_capacity(chars.len() + 8);
-    let mut owners: Vec<u32> = Vec::with_capacity(chars.len() + 8);
-    for index in 0..row.pipes[0] {
-        glyphs.push(' '); // the row's own indentation, untouched
-        owners.push(index as u32);
-    }
+    // What each column shows on which segment: one wrapped line per entry.
+    let lines: Vec<Vec<std::ops::Range<usize>>> = (0..region.widths.len())
+        .map(|k| {
+            let trimmed = trim_range(&chars, row.cells[k].clone());
+            wrap_cell(&chars, trimmed, region.widths[k])
+        })
+        .collect();
+    let segments = lines.iter().map(Vec::len).max().unwrap_or(1);
+
     let columns = region.widths.len();
-    for k in 0..columns {
-        glyphs.push('|');
-        owners.push(row.pipes[k] as u32);
-        let cell = &row.cells[k];
-        let trimmed = trim_range(&chars, cell.clone());
-        let width = region.widths[k].max(trimmed.len());
-        let content = trimmed.len();
-        let extra_left = match region.aligns.get(k).copied().unwrap_or(Align::Left) {
-            Align::Left => 0,
-            Align::Center => (width - content) / 2,
-            Align::Right => width - content,
-        };
-        for j in 0..=extra_left {
-            // One guaranteed space of breathing room plus the alignment pad;
-            // the row's own leading spaces fill these cells first.
-            let lead = trimmed.start - cell.start;
-            let owner = if j < lead {
-                cell.start + j
-            } else {
-                row.pipes[k] // written padding this column does not need
-            };
-            glyphs.push(' ');
-            owners.push(owner as u32);
-        }
-        for index in trimmed.clone() {
-            glyphs.push(chars[index]);
+    let mut out = Vec::with_capacity(segments);
+    for segment in 0..segments {
+        // Cell-by-cell construction: each painted cell records the source character
+        // that owns it.  Padding a cell needs but its source never wrote is absorbed
+        // by the neighbouring mark (the pipe before a left pad, the one after a
+        // right pad), so no display cell is ever ownerless.
+        let mut glyphs: Vec<char> = Vec::with_capacity(chars.len() + 8);
+        let mut owners: Vec<u32> = Vec::with_capacity(chars.len() + 8);
+        for index in 0..row.pipes[0] {
+            glyphs.push(' '); // the row's own indentation, untouched
             owners.push(index as u32);
         }
-        let right = width - content - extra_left;
-        for j in 0..=right {
-            // Same trick on the closing side: real trailing spaces take cells
-            // first, surplus padding waits at the next pipe.
-            let tail_owner = if cell.end - trimmed.end > j {
-                trimmed.end + j
-            } else {
-                row.pipes[k + 1]
+        for (k, cell_lines) in lines.iter().enumerate() {
+            glyphs.push('|');
+            owners.push(row.pipes[k] as u32);
+            let cell = &row.cells[k];
+            // The first segment keeps the cell's own leading and trailing spaces,
+            // exactly as the unwrapped grid drew them; later ones pad from the pipes.
+            let trimmed = match cell_lines.get(segment) {
+                Some(part) => part.clone(),
+                None => cell.start..cell.start,
             };
-            glyphs.push(' ');
-            owners.push(tail_owner as u32);
+            let width = region.widths[k];
+            let content = trimmed.len();
+            let extra_left = match region.aligns.get(k).copied().unwrap_or(Align::Left) {
+                Align::Left => 0,
+                Align::Center => (width - content) / 2,
+                Align::Right => width - content,
+            };
+            for j in 0..=extra_left {
+                // One guaranteed space of breathing room plus the alignment pad;
+                // on this line's first segment its own leading spaces fill cells first.
+                let lead = if segment == 0 && trimmed.start >= cell.start {
+                    trimmed.start - cell.start
+                } else {
+                    0
+                };
+                let owner = if j < lead {
+                    cell.start + j
+                } else {
+                    row.pipes[k] // written padding this column does not need
+                };
+                glyphs.push(' ');
+                owners.push(owner as u32);
+            }
+            for index in trimmed.clone() {
+                glyphs.push(chars[index]);
+                owners.push(index as u32);
+            }
+            let right = width - content - extra_left;
+            for j in 0..=right {
+                // Same trick on the closing side: this line's own trailing spaces —
+                // those that follow its last drawn character inside the cell — take
+                // cells first, surplus padding waits at the next pipe.
+                let written_tail = if segment + 1 == cell_lines.len() || cell_lines.len() == 1 {
+                    cell.end.saturating_sub(trimmed.end)
+                } else {
+                    0
+                };
+                let tail_owner = if written_tail > j {
+                    trimmed.end + j
+                } else {
+                    row.pipes[k + 1]
+                };
+                glyphs.push(' ');
+                owners.push(tail_owner as u32);
+            }
         }
-    }
-    // The closing pipe.  A cell-less tail still has this last mark to own any
-    // surplus padding the row gained.
-    glyphs.push('|');
-    owners.push(row.pipes[columns] as u32);
-    for index in row.pipes[columns] + 1..chars.len() {
-        glyphs.push(' '); // trailing spaces after the closing pipe
-        owners.push(index as u32);
-    }
+        // The closing pipe.  A cell-less tail still has this last mark to own any
+        // surplus padding the row gained; text after it is the line's end, drawn
+        // once, under the last segment like a period under an abbreviation.
+        glyphs.push('|');
+        owners.push(row.pipes[columns] as u32);
+        if segment + 1 == segments {
+            for index in row.pipes[columns] + 1..chars.len() {
+                glyphs.push(' '); // trailing spaces after the closing pipe
+                owners.push(index as u32);
+            }
+        }
 
-    let mut out = LineRender {
-        glyphs,
-        styles: vec![base; owners.len()],
-        reveal: false,
-        columns: Vec::new(),
-        owners,
-    };
-    // The shared border pass does the rest exactly as it did character-for-
-    // character: pipes become rules and crossings, dashes fill their fields.
-    table(&mut out, role, styles);
+        let mut out_row = LineRender {
+            glyphs,
+            styles: vec![base; owners.len()],
+            reveal: false,
+            columns: Vec::new(),
+            owners,
+        };
+        // The shared border pass does the rest exactly as it did character-for-
+        // character: pipes become rules and crossings, dashes fill their fields.
+        table(&mut out_row, role, styles);
 
-    // Fill the character → column map from first-owned cells; owners advance
-    // monotonically along the row, so the first cell an owner appears in marks
-    // its start.  A space this grid trimmed away owns no cell and collapses onto
-    // whatever follows it: zero-width, monotonic, and a click near one still
-    // resolves to a real neighbour.
-    let width = out.glyphs.len() as u32;
-    let mut columns_map = vec![u32::MAX; chars.len() + 1];
-    for (cell, owner) in out.owners.iter().enumerate() {
-        let owner = *owner as usize;
-        if columns_map[owner] == u32::MAX {
-            columns_map[owner] = cell as u32;
+        // Fill the character → column map from first-owned cells; owners advance
+        // monotonically along the row, so the first cell an owner appears in marks
+        // its start.  A space this grid trimmed away owns no cell and collapses onto
+        // whatever follows it: zero-width, monotonic, and a click near one still
+        // resolves to a real neighbour.  (A character another segment draws is not
+        // on *this* row at all; the backward fill lands it on the next local column,
+        // which no caller reads — only the caret's line reveals, and reveal does not
+        // reflow.)
+        let width = out_row.glyphs.len() as u32;
+        let mut columns_map = vec![u32::MAX; chars.len() + 1];
+        for (cell, owner) in out_row.owners.iter().enumerate() {
+            let owner = *owner as usize;
+            if columns_map[owner] == u32::MAX {
+                columns_map[owner] = cell as u32;
+            }
         }
-    }
-    for index in (0..chars.len()).rev() {
-        if columns_map[index] == u32::MAX {
-            columns_map[index] = columns_map[index + 1];
+        for index in (0..chars.len()).rev() {
+            if columns_map[index] == u32::MAX {
+                columns_map[index] = columns_map[index + 1];
+            }
         }
+        columns_map[chars.len()] = width;
+        out_row.columns = columns_map;
+        out.push(out_row);
     }
-    columns_map[chars.len()] = width;
-    out.columns = columns_map;
     Some(out)
 }
 
@@ -1881,5 +2082,129 @@ mod tests {
             let rendered = plan.line(&lines, 0, reveal, &styles).expect("planned");
             assert_eq!(rendered.glyphs.len(), lines[0].chars().count());
         }
+    }
+
+    // ------------------------------------------------------------- fitting rows
+
+    /// Every screen row a planned line paints as.
+    fn segments(lines: &[&str], index: usize, fit: Option<usize>) -> Vec<LineRender> {
+        let plan = Plan::fitted(lines, fit);
+        plan.row(lines, index, false, &styles())
+            .expect("planned")
+            .segments
+    }
+
+    #[test]
+    fn a_cell_wider_than_its_column_wraps_on_words() {
+        let text = "alpha beta gamma";
+        let chars: Vec<char> = text.chars().collect();
+        let whole = 0..text.len();
+        let lines = wrap_cell(&chars, whole.clone(), 10);
+        // Greedy fill: "alpha" (5) plus a space and "beta" would be ten — it fits;
+        // "gamma" cannot join, so it opens the next line.
+        assert_eq!(
+            lines
+                .iter()
+                .map(|r| chars[r.clone()].iter().collect::<String>())
+                .collect::<Vec<_>>(),
+            ["alpha beta", "gamma"]
+        );
+        // Interior spaces survive; boundary spaces are what the wrap spends.
+        let spaced: Vec<char> = "a  b".chars().collect();
+        assert_eq!(wrap_cell(&spaced, 0..4, 1).len(), 2); // no room to keep the gap
+        // A word longer than the field is hard-broken rather than left to shove
+        // the rule off screen.
+        let solid = "abcdefgh".chars().collect::<Vec<_>>();
+        let broken = wrap_cell(&solid, 0..8, 3);
+        assert_eq!(broken.len(), 3);
+        for range in &broken {
+            assert!(range.end - range.start <= 3);
+        }
+    }
+
+    #[test]
+    fn a_wide_table_shrinks_and_wraps_rather_than_clipping() {
+        let lines = [
+            "| flag | meaning |",
+            "| ---- | ------- |",
+            "| A | a description so long that the pane cannot show it in one row |",
+        ];
+        let fit = 24;
+        // Every screen segment fits, and the wrapped row keeps its vertical rules
+        // lined up with its neighbours: segments continue the grid, they do not
+        // abandon it.
+        for index in 0..lines.len() {
+            for seg in segments(&lines, index, Some(fit)) {
+                assert!(
+                    seg.glyphs.len() <= fit,
+                    "segment {:?} is {} wide",
+                    seg.display(),
+                    seg.glyphs.len()
+                );
+            }
+        }
+        let body = segments(&lines, 2, Some(fit));
+        assert!(body.len() > 1, "the long cell did not wrap");
+        // Nothing is lost between the segments: every word of the row survives.
+        let painted: String = body.iter().map(|seg| seg.display()).collect();
+        for word in lines[2].split_whitespace().filter(|w| w.len() > 1) {
+            assert!(painted.contains(word), "{word:?} vanished from the grid");
+        }
+    }
+
+    #[test]
+    fn a_table_that_already_fits_is_drawn_exactly_as_before() {
+        let lines = [
+            "| name | value |",
+            "| --- | ----- |",
+            "| a longer cell | 1 |",
+        ];
+        for index in 0..lines.len() {
+            let roomy = segments(&lines, index, Some(200));
+            assert_eq!(roomy.len(), 1, "a fitting table should not wrap");
+            // Identical to the viewport-free decoration every other path uses.
+            assert_eq!(roomy[0], decorate(&lines, &styles())[index]);
+        }
+    }
+
+    #[test]
+    fn a_wrapped_row_still_maps_its_cells_to_their_characters() {
+        // Clicks and styling resolve through each segment's owner map: wherever a
+        // character ends up after the shrink, exactly one screen row draws it,
+        // and that row says so.
+        let lines = [
+            "| name | value |",
+            "| --- | ----- |",
+            "| a long cell here | 1 |",
+        ];
+        let narrow = segments(&lines, 0, Some(12));
+        assert!(narrow.len() > 1 || narrow[0].reflowed());
+        // The header's `v` is character 9 of its row.
+        let drawers = narrow
+            .iter()
+            .filter(|seg| {
+                let column = seg.column_of(9);
+                seg.glyphs.get(column) == Some(&'v')
+            })
+            .count();
+        assert_eq!(drawers, 1, "the `v` was drawn twice or never");
+    }
+
+    #[test]
+    fn a_revealed_table_row_never_wraps() {
+        // The row under the caret is edited as written: one screen row, markup
+        // and all — wrapping it would hide characters behind a scroll.
+        let lines = [
+            "| flag |",
+            "| --- |",
+            "| a description so long it must wrap somewhere |",
+        ];
+        let plan = Plan::fitted(&lines, Some(16));
+        let revealed = plan
+            .row(&lines, 2, true, &styles())
+            .expect("planned")
+            .segments;
+        assert_eq!(revealed.len(), 1);
+        assert_eq!(revealed[0].display(), lines[2]);
     }
 }

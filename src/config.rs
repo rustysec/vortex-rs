@@ -295,6 +295,8 @@ pub struct EditorConfig {
     pub large_file_threshold: usize,
     /// Draw a sign column in the gutter marking lines with diagnostics.
     pub diagnostic_signs: bool,
+    /// Mark lines edited since the last write with a `+` in the gutter.
+    pub changed_signs: bool,
     /// Draw the diagnostic message dimmed at the end of the line it covers.
     pub inline_diagnostics: bool,
     /// Show the full diagnostic message in a card when the caret rests on one.
@@ -338,6 +340,7 @@ impl Default for EditorConfig {
             undo_group_timeout: DurationMs(500),
             large_file_threshold: 2_000_000,
             diagnostic_signs: true,
+            changed_signs: true,
             inline_diagnostics: false,
             diagnostic_float: true,
             markdown_render: true,
@@ -916,6 +919,7 @@ impl Config {
             "editor.undo-group-timeout" => self.editor.undo_group_timeout = duration(key, value)?,
             "editor.large-file-threshold" => self.editor.large_file_threshold = number(key, value)?,
             "editor.diagnostic-signs" => self.editor.diagnostic_signs = boolean(key, value)?,
+            "editor.changed-signs" => self.editor.changed_signs = boolean(key, value)?,
             "editor.inline-diagnostics" => self.editor.inline_diagnostics = boolean(key, value)?,
             "editor.diagnostic-float" => self.editor.diagnostic_float = boolean(key, value)?,
             "editor.markdown-render" => self.editor.markdown_render = boolean(key, value)?,
@@ -1063,6 +1067,7 @@ impl Config {
             "editor.sidescroll-margin" => self.editor.sidescroll_margin.to_string(),
             "editor.undo-limit" => self.editor.undo_limit.to_string(),
             "editor.diagnostic-signs" => on_off(self.editor.diagnostic_signs),
+            "editor.changed-signs" => on_off(self.editor.changed_signs),
             "editor.inline-diagnostics" => on_off(self.editor.inline_diagnostics),
             "editor.diagnostic-float" => on_off(self.editor.diagnostic_float),
             "editor.markdown-render" => on_off(self.editor.markdown_render),

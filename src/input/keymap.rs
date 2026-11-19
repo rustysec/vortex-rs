@@ -415,6 +415,9 @@ fn cmd_name(command: &Cmd) -> String {
         Cmd::ScrollToTop => "scroll-to-top",
         Cmd::ScrollToBottom => "scroll-to-bottom",
         Cmd::ScrollLine(direction) => return format!("scroll-line-{}", direction.label()),
+        Cmd::ScrollColumn(direction) => {
+            return format!("scroll-column-{}", direction.label());
+        }
         Cmd::JumpBack => "jump-back",
         Cmd::JumpForward => "jump-forward",
         Cmd::InsertNewline => "insert-newline",

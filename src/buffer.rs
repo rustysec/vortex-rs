@@ -236,6 +236,16 @@ pub struct Buffer {
     /// Set when `pending_changes` overflowed, so the next drain reports "send
     /// the whole document" instead of a partial list of edits.
     changes_overflowed: bool,
+    /// Lines touched by an edit since the buffer was last written.
+    ///
+    /// The gutter's change sign reads this; [`Buffer::apply`], `undo` and
+    /// `redo` keep the indices pointing at their lines as the text moves
+    /// around them, and every path that marks the buffer saved (write, save-
+    /// as, reload) empties it.  Undoing an edit marks the line too: "changed
+    /// since write" describes what would land on disk next, not what the
+    /// undo stack remembers, and a line walked back is still line-for-line
+    /// unlike the file only if nothing else moved it after.
+    changed_lines: std::collections::BTreeSet<usize>,
 }
 
 impl Buffer {
@@ -272,6 +282,7 @@ impl Buffer {
             disk_mtime,
             pending_changes: Vec::new(),
             changes_overflowed: false,
+            changed_lines: std::collections::BTreeSet::new(),
         }
     }
 
@@ -413,7 +424,19 @@ impl Buffer {
             let start = utf16_position(&self.rope, change.range.start);
             let end = utf16_position(&self.rope, change.range.end);
             let removed = slice_bytes(&self.rope, change.range);
+            // The line window for the change sign, on the same pre-edit rope:
+            // `end - 1` so a range that stops at the next line's first byte has
+            // not actually touched it.
+            let first_line = self.line_of(change.range.start);
+            let last_line = if change.range.end > change.range.start {
+                self.line_of(change.range.end - 1)
+            } else {
+                first_line
+            };
+            let line_delta =
+                change.text.matches('\n').count() as isize - removed.matches('\n').count() as isize;
             replace(&mut self.rope, change.range, &change.text);
+            self.mark_lines(first_line, last_line, line_delta);
             // Diagnostics are byte spans too.  Mapping them here, one edit at a
             // time, keeps them on the text they describe: without this, deleting
             // the line a diagnostic points at leaves the mark on whatever line
@@ -577,7 +600,16 @@ impl Buffer {
         for item in batch.iter() {
             for change in item.changes.iter().rev() {
                 let range = Span::new(change.at, change.at + change.inserted.len());
+                let first_line = self.line_of(change.at);
+                let last_line = if !change.inserted.is_empty() {
+                    self.line_of(range.end - 1)
+                } else {
+                    first_line
+                };
+                let line_delta = change.removed.matches('\n').count() as isize
+                    - change.inserted.matches('\n').count() as isize;
                 replace(&mut self.rope, range, &change.removed);
+                self.mark_lines(first_line, last_line, line_delta);
                 // Diagnostics are byte spans too; shift them back with the text.
                 self.map_diagnostics(range, change.removed.len());
             }
@@ -615,7 +647,16 @@ impl Buffer {
         for item in batch.iter() {
             for change in item.changes.iter() {
                 let range = Span::new(change.at, change.at + change.removed.len());
+                let first_line = self.line_of(change.at);
+                let last_line = if !change.removed.is_empty() {
+                    self.line_of(range.end - 1)
+                } else {
+                    first_line
+                };
+                let line_delta = change.inserted.matches('\n').count() as isize
+                    - change.removed.matches('\n').count() as isize;
                 replace(&mut self.rope, range, &change.inserted);
+                self.mark_lines(first_line, last_line, line_delta);
                 // Diagnostics are byte spans too; shift them forward with the text.
                 self.map_diagnostics(range, change.inserted.len());
             }
@@ -669,6 +710,7 @@ impl Buffer {
     /// Mark the buffer as saved at `path` without writing (used by tests/undo).
     pub fn mark_saved(&mut self) {
         self.saved_version = self.version;
+        self.changed_lines.clear(); // written text: no change signs any more
         self.disk_mtime = file_mtime(self.path.as_deref());
     }
 
@@ -683,6 +725,7 @@ impl Buffer {
         }
         write_file(&path, &self.content_for_disk())?;
         self.saved_version = self.version;
+        self.changed_lines.clear(); // written text: no change signs any more
         self.disk_mtime = file_mtime(Some(&path));
         Ok(Some(SaveOutcome {
             path,
@@ -702,6 +745,7 @@ impl Buffer {
         };
         self.path = Some(path);
         self.saved_version = self.version;
+        self.changed_lines.clear(); // written text: no change signs any more
         self.disk_mtime = file_mtime(self.path.as_deref());
         self.read_only = false;
         Ok(outcome)
@@ -748,6 +792,7 @@ impl Buffer {
         self.version += 1;
         self.last_change_group = None;
         self.saved_version = self.version;
+        self.changed_lines.clear(); // written text: no change signs any more
         self.history.clear();
         self.last_group_at = None;
         self.syntax.invalidate();
@@ -1121,6 +1166,34 @@ impl Buffer {
             diagnostic.range = Span::new(start, end);
             true
         });
+    }
+
+    /// Walk the change-sign ledger through one edit: every line between
+    /// `first` and `last` inclusive is now modified text — collapsed to a mark
+    /// on `first`, since the lines after it may no longer exist — and anything
+    /// below slides by `delta`, the newlines this edit added or removed.
+    ///
+    /// Called once per [`Change`] in application order, which is byte-offset-
+    /// descending, so each step already sees line numbers in the coordinate
+    /// space of the partially-edited document — the same space its marks live
+    /// in.  A `delta` that shoves a mark upward cannot bury it above the edit:
+    /// clamping at `first` keeps every surviving line below or at its own edit.
+    fn mark_lines(&mut self, first: usize, last: usize, delta: isize) {
+        let below = self.changed_lines.split_off(&(last + 1));
+        self.changed_lines.retain(|&line| line < first);
+        self.changed_lines.insert(first);
+        for line in below {
+            let moved = (line as isize + delta).max(first as isize) as usize;
+            self.changed_lines.insert(moved);
+        }
+    }
+
+    /// Lines edited since this buffer was last written — what the gutter's
+    /// change sign paints, and what [`Buffer::mark_saved`] (and every save)
+    /// clears.  A brand-new scratch buffer has none yet: its content has never
+    /// been *changed*, only typed into being, which `apply` records anyway.
+    pub fn changed_lines(&self) -> &std::collections::BTreeSet<usize> {
+        &self.changed_lines
     }
 
     /// Parse the buffer on this thread.  Used by tests and one-shot queries;
@@ -1902,5 +1975,152 @@ mod tests {
         assert_eq!(buffer.line_end(0), 3);
         assert_eq!(buffer.line_start(1), 4);
         assert_eq!(buffer.line_end(1), 7);
+    }
+
+    // ------------------------------------------------------------ change signs
+
+    #[test]
+    fn an_edit_marks_its_line_and_survives_saves_clearing_it() {
+        let mut buffer = buffer_with("one\ntwo\nthree\n");
+        assert!(
+            buffer.changed_lines().is_empty(),
+            "fresh off disk, nothing changed"
+        );
+
+        let mut selection = Selection::point(0);
+        let two = buffer.text().find("two").unwrap();
+        buffer.apply(
+            vec![Change::insert(two, "!")],
+            ChangeGroup::Insert,
+            &mut selection,
+        );
+        assert_eq!(
+            buffer.changed_lines().iter().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        buffer.mark_saved();
+        assert!(
+            buffer.changed_lines().is_empty(),
+            "a write settles the ledger"
+        );
+    }
+
+    #[test]
+    fn marks_walk_down_the_file_as_text_is_inserted_above_them() {
+        let mut buffer = buffer_with("one\ntwo\nthree\n");
+        let mut selection = Selection::point(0);
+        // Mark line two (index 1).
+        let two = buffer.text().find("two").unwrap();
+        buffer.apply(
+            vec![Change::insert(two, "…")],
+            ChangeGroup::Insert,
+            &mut selection,
+        );
+        // Then push two new lines in above it: the sign travels with its line,
+        // and the insertion's own landing line joins the ledger — brand-new
+        // text is changed text too.
+        buffer.apply(
+            vec![Change::insert(0, "alpha\nbeta\n")],
+            ChangeGroup::Command,
+            &mut selection,
+        );
+        assert_eq!(
+            buffer.changed_lines().iter().copied().collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+
+        // Deleting those lines brings the mark home; line nil is still a
+        // landing site of an edit since the write, which the ledger keeps.
+        buffer.apply(
+            vec![Change {
+                range: Span::new(0, "alpha\nbeta\n".len()),
+                text: String::new(),
+            }],
+            ChangeGroup::Command,
+            &mut selection,
+        );
+        assert_eq!(
+            buffer.changed_lines().iter().copied().collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn deleting_a_line_takes_its_mark_and_the_gap_closes_over_lower_marks() {
+        let mut buffer = buffer_with("one\ntwo\nthree\n");
+        let mut selection = Selection::point(0);
+        let two = buffer.text().find("two").unwrap();
+        let three = buffer.text().find("three").unwrap();
+        buffer.apply(
+            vec![Change::insert(two, "x"), Change::insert(three, "y")],
+            ChangeGroup::Command,
+            &mut selection,
+        );
+        assert_eq!(
+            buffer.changed_lines().iter().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // Delete line index 1 entirely (`two…\n`): its mark dies with it and
+        // the marked `three` slides up to take its place.
+        let line_two = buffer.line_start(1);
+        let line_three = buffer.line_start(2);
+        buffer.apply(
+            vec![Change {
+                range: Span::new(line_two, line_three),
+                text: String::new(),
+            }],
+            ChangeGroup::Operator,
+            &mut selection,
+        );
+        assert_eq!(
+            buffer.changed_lines().iter().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn one_edit_touching_several_lines_leaves_one_mark() {
+        let mut buffer = buffer_with("one\ntwo\nthree\n");
+        let mut selection = Selection::point(0);
+        // Join all three lines into one.
+        buffer.apply(
+            vec![Change {
+                range: Span::new(3, buffer.text().find("three").unwrap()),
+                text: " ".to_string(),
+            }],
+            ChangeGroup::Operator,
+            &mut selection,
+        );
+        assert_eq!(
+            buffer.changed_lines().iter().copied().collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn undo_marks_the_lines_it_walked_back() {
+        // "Changed since write" answers *what would land on disk*, so the sign
+        // survives walking text back — an undone line is still unsaved text.
+        let mut buffer = buffer_with("one\ntwo\n");
+        let mut selection = Selection::point(0);
+        let two = buffer.text().find("two").unwrap();
+        buffer.apply(
+            vec![Change::insert(two, "\nextra")],
+            ChangeGroup::Command,
+            &mut selection,
+        );
+        assert_eq!(buffer.changed_lines().len(), 1);
+        buffer.undo().expect("undo the insert");
+        assert_eq!(buffer.text(), "one\ntwo\n");
+        assert!(
+            buffer.changed_lines().contains(&1),
+            "the undone line is still unlike what was written"
+        );
+
+        // A save settles everything, undo history and all.
+        buffer.mark_saved();
+        assert!(buffer.changed_lines().is_empty());
     }
 }

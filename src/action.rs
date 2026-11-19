@@ -184,6 +184,8 @@ pub enum Cmd {
     ScrollToTop,
     ScrollToBottom,
     ScrollLine(Direction),
+    /// Slide the column window sideways with `[editor] wrap` off (`zh`/`zl`).
+    ScrollColumn(Direction),
     JumpBack,
     JumpForward,
 
@@ -1054,6 +1056,16 @@ pub const ACTIONS: &[(&str, Action, &str)] = &[
         "scroll-line-down",
         Action::Cmd(Cmd::ScrollLine(Direction::Down)),
         "scroll down without moving the cursor",
+    ),
+    (
+        "scroll-column-left",
+        Action::Cmd(Cmd::ScrollColumn(Direction::Left)),
+        "scroll left without moving the cursor",
+    ),
+    (
+        "scroll-column-right",
+        Action::Cmd(Cmd::ScrollColumn(Direction::Right)),
+        "scroll right without moving the cursor",
     ),
     ("jump-back", Action::Cmd(Cmd::JumpBack), "older jump"),
     ("jump-forward", Action::Cmd(Cmd::JumpForward), "newer jump"),

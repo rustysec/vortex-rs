@@ -388,6 +388,14 @@ fn draw_pane(
 
     let gutter = Gutter::new(config, buffer, cursor_line, focused);
     let text_width = content.width.saturating_sub(gutter.width as u16).max(1) as usize;
+    // Sideways scrolling only hides columns that soft wrap would otherwise
+    // have drawn on a row of their own, so with `wrap` on the column window
+    // is always the left edge.
+    let hscroll = if config.editor.wrap {
+        0
+    } else {
+        pane.view.scroll_col
+    };
 
     let highlights = highlight_runs(
         buffer,
@@ -413,6 +421,7 @@ fn draw_pane(
         scroll,
         content.height as usize,
         focused.then_some(cursor_line),
+        Some(text_width),
     );
 
     let rows = visual_rows(
@@ -422,6 +431,7 @@ fn draw_pane(
         text_width,
         tab_width,
         config.editor.wrap,
+        hscroll,
         decor.as_ref(),
     );
 
@@ -447,7 +457,13 @@ fn draw_pane(
         gutter.render(buf, content.x, y, Some(line), theme);
 
         let text = line_text(buffer, line);
-        let decorated = decor.as_ref().and_then(|decor| decor.get(line));
+        // A wrapped table row is several screen rows: this slot's `sub` picks
+        // which one paints here.  Every other line has a single segment and
+        // every `sub` lands on it.
+        let decorated = decor
+            .as_ref()
+            .and_then(|decor| decor.get(line))
+            .and_then(|row| row.segment(slot.sub));
         // A reflowed table row arrives as its grid: one row of cells wider or
         // narrower than the characters it was written with, addressed through
         // `LineRender::columns` instead of cell-equals-character.  Every other
@@ -553,9 +569,12 @@ fn markdown_styles(theme: &Theme) -> crate::markdown::MarkdownStyles {
 /// The whole text is read because an open fence or a table header can sit above the
 /// viewport; only the drawn window allocates glyphs.  Gutter, wrapping and cursor
 /// arithmetic deliberately still run on the *source* characters: decoration is
-/// one-for-one in column width, which is exactly what keeps the caret over the
-/// glyph it refers to.  The line under the cursor (`active_line`) reveals its own
-/// markup as written, so the characters being edited are never hidden.
+/// one-for-one in column width except inside a reflowed table grid, which maps
+/// through [`crate::markdown::LineRender::columns`].  The line under the cursor
+/// (`active_line`) reveals its own markup as written, so the characters being
+/// edited are never hidden — and never re-flowed out from under the caret.
+/// `fit` is the pane's text width; tables wider than it wrap to fit (see
+/// [`crate::markdown::decorate_window`]).
 fn decorations(
     buffer: &TextBuffer,
     config: &Config,
@@ -563,6 +582,7 @@ fn decorations(
     scroll: usize,
     height: usize,
     active_line: Option<usize>,
+    fit: Option<usize>,
 ) -> Option<crate::markdown::Decorated> {
     if !config.editor.markdown_render || buffer.language.id != "markdown" {
         return None;
@@ -580,23 +600,32 @@ fn decorations(
         scroll..scroll.saturating_add(height).saturating_add(1),
         active_line,
         &styles,
+        fit,
     ))
 }
 
-/// A visual row: a buffer line plus the character range shown on that row.
+/// A visual row: a buffer line plus the slice shown on that row.
 #[derive(Debug, Clone, Copy)]
 struct RowSlot {
     line: Option<usize>,
+    /// Character range for wrapped prose and side-scrolled rows; a grid
+    /// segment paints its whole [`crate::markdown::LineRender`] instead.
     start: usize,
     end: usize,
+    /// Which screen row of a multi-segment (wrapped table) line this is.
+    sub: usize,
 }
 
 /// Map buffer lines to visual rows, wrapping when `[editor] wrap` is on.
 ///
-/// A reflowed table row always takes exactly one row: its columns were laid out
-/// as a grid, and wrapping the second half under text it no longer borders would
-/// undo the alignment that made the row worth reflowing.  Off-pane surplus
-/// clips at the edge, which is what a too-wide table does unwrapped anyway.
+/// A reflowed table row takes exactly the segments its grid produced: its
+/// columns were laid out and word-wrapped to fit the pane (see
+/// [`crate::markdown::decorate_window`]), so it needs no sideways scrolling —
+/// wrapping prose under a rule it no longer borders would undo the alignment.
+/// With `wrap` off, every other row is one screen line starting at display
+/// column `hscroll`: text that runs past the right edge scrolls into view
+/// instead of vanishing (the caret's pane keeps `hscroll` following it).
+#[allow(clippy::too_many_arguments)] // the full geometry of a drawn row: window, metrics, wrap model, decoration
 fn visual_rows(
     buffer: &TextBuffer,
     scroll: usize,
@@ -604,6 +633,7 @@ fn visual_rows(
     width: usize,
     tab_width: usize,
     wrap: bool,
+    hscroll: usize,
     decor: Option<&crate::markdown::Decorated>,
 ) -> Vec<RowSlot> {
     let mut rows = Vec::with_capacity(height);
@@ -616,15 +646,38 @@ fn visual_rows(
                 line: None,
                 start: 0,
                 end: 0,
+                sub: 0,
             });
             continue;
         }
         let text = line_text(buffer, line);
-        if !wrap || decor.is_some_and(|d| d.get(line).is_some_and(|r| r.reflowed())) {
+        let row = decor.and_then(|decor| decor.get(line));
+        if row.is_some_and(|row| row.reflowed()) {
+            // One slot per grid segment; the character range matters only to
+            // the last one, which is where an inline diagnostic may sit.
+            let count = text.chars().count();
+            let segments = row.map_or(1, |row| row.segments.len());
+            for sub in 0..segments {
+                if rows.len() >= height {
+                    break;
+                }
+                rows.push(RowSlot {
+                    line: Some(line),
+                    start: 0,
+                    end: if sub + 1 == segments { count } else { 0 },
+                    sub,
+                });
+            }
+            line += 1;
+            continue;
+        }
+        if !wrap {
+            let count = text.chars().count();
             rows.push(RowSlot {
                 line: Some(line),
-                start: 0,
-                end: text.chars().count(),
+                start: column_start(&text, tab_width, hscroll),
+                end: count,
+                sub: 0,
             });
             line += 1;
             continue;
@@ -638,11 +691,36 @@ fn visual_rows(
                 line: Some(line),
                 start,
                 end,
+                sub: 0,
             });
         }
         line += 1;
     }
     rows
+}
+
+/// The first character of `text` that begins at or past display column
+/// `target`, tabs expanded — the character where a row side-scrolled by
+/// `target` starts painting.  A target inside a tab lands after it, so a
+/// scrolled row never re-draws half a gap; every line shorter than the
+/// scroll offset starts at its own end and paints blank, as in vim.
+fn column_start(text: &str, tab_width: usize, target: usize) -> usize {
+    if target == 0 {
+        return 0;
+    }
+    let mut column = 0usize;
+    for (index, character) in text.chars().enumerate() {
+        if column >= target {
+            return index;
+        }
+        let advance = if character == '\t' {
+            tab_width - (column % tab_width.max(1))
+        } else {
+            1
+        };
+        column += advance;
+    }
+    text.chars().count()
 }
 
 /// Split a line into character ranges that fit `width` columns.
@@ -984,6 +1062,9 @@ struct Gutter {
     cursor_line: usize,
     /// One entry per line: the worst diagnostic on it, if any.
     signs: Vec<Option<Severity>>,
+    /// One entry per line: edited since the buffer was last written (the
+    /// change sign — a quiet `+` under any severity marker).
+    changed: Vec<bool>,
     /// Columns reserved to the left of the numbers for the sign column.
     sign_width: usize,
 }
@@ -1004,9 +1085,17 @@ impl Gutter {
         } else {
             Vec::new()
         };
+        let changed = if config.editor.changed_signs {
+            (0..total_lines)
+                .map(|line| buffer.changed_lines().contains(&line))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Only reserve the column when something is actually marked, so a clean
         // buffer keeps the full text width.
-        let sign_width = usize::from(signs.iter().any(Option::is_some));
+        let sign_width =
+            usize::from(signs.iter().any(Option::is_some) || changed.iter().any(|&c| c));
         let width = if kind == LineNumber::None {
             sign_width
         } else {
@@ -1017,6 +1106,7 @@ impl Gutter {
             kind,
             cursor_line,
             signs,
+            changed,
             sign_width,
         }
     }
@@ -1051,6 +1141,11 @@ impl Gutter {
                     severity_sign(severity),
                     severity_style(severity, theme).remove_modifier(Modifier::UNDERLINED),
                 ),
+                // A line edited since the last write, with no diagnostic to
+                // shout over: the quiet `+` of a diff gutter.
+                None if self.changed.get(line).copied().unwrap_or(false) => {
+                    ('+', theme.status_inactive)
+                }
                 None => (' ', theme.gutter),
             };
             buf.set_stringn(x, y, symbol.to_string(), 1, style);
@@ -1351,7 +1446,20 @@ pub fn byte_at(
     // row the columns are not characters, and only the grid knows where each
     // one actually sits.  `None` for the caret line because a click never
     // reveals markup — it resolves against the geometry that is drawn.
-    let decor = decorations(buffer, config, theme, scroll, content.height as usize, None);
+    let hscroll = if config.editor.wrap {
+        0
+    } else {
+        pane.view.scroll_col
+    };
+    let decor = decorations(
+        buffer,
+        config,
+        theme,
+        scroll,
+        content.height as usize,
+        None,
+        Some(text_width),
+    );
     let rows = visual_rows(
         buffer,
         scroll,
@@ -1359,6 +1467,7 @@ pub fn byte_at(
         text_width,
         tab_width,
         config.editor.wrap,
+        hscroll,
         decor.as_ref(),
     );
     let slot = *rows.get(line_row)?;
@@ -1372,13 +1481,15 @@ pub fn byte_at(
     let text = line_text(buffer, line);
     let characters: Vec<char> = text.chars().collect();
     let target = usize::from(column - (content.x + gutter.width as u16));
-    // A reflowed row answers for itself which character owns the clicked cell;
+    // A reflowed row answers for itself which character owns the clicked cell,
+    // resolving through the very segment that was drawn on this screen row;
     // anything past its drawn width clamps to the end of the line.
-    let index = match decor
+    let segment = decor
         .as_ref()
         .and_then(|decor| decor.get(line))
-        .filter(|render| render.reflowed())
-    {
+        .and_then(|row| row.segment(slot.sub))
+        .filter(|render| render.reflowed());
+    let index = match segment {
         Some(render) => render.character_at(target.min(render.glyphs.len().saturating_sub(1))),
         None => {
             let mut displayed = 0usize;
@@ -1399,8 +1510,11 @@ pub fn byte_at(
             index
         }
     };
+    // Byte arithmetic runs from the start of the line, not the start of the
+    // visible window — a click on the first character of a wrapped or
+    // side-scrolled row still names that character, wherever it stands.
     let byte = buffer.line_start(line)
-        + characters[slot.start.min(characters.len())..index.max(slot.start)]
+        + characters[..index.min(characters.len())]
             .iter()
             .map(|character| character.len_utf8())
             .sum::<usize>();
@@ -1422,6 +1536,36 @@ pub fn pane_content(area: Rect, config: &Config) -> Rect {
 }
 
 // ------------------------------------------------------------------ overlays
+
+/// Columns available to text inside a pane — the same arithmetic [`draw_pane`]
+/// uses (border and gutter subtracted), so viewport decisions and painting can
+/// never disagree about where the right edge is.
+pub fn text_columns(area: Rect, buffer: &TextBuffer, cursor_line: usize, config: &Config) -> usize {
+    let content = pane_content(area, config);
+    if content.width == 0 {
+        return 0;
+    }
+    let gutter = Gutter::new(config, buffer, cursor_line, true);
+    (content.width as usize).saturating_sub(gutter.width).max(1)
+}
+
+/// The display column character `char_index` of `text` begins at when the line
+/// is drawn from column 0 — with tabs expanded to `tab_width` stops, which is
+/// what both a side-scrolled row and its caret measure against.
+pub fn caret_column(text: &str, char_index: usize, tab_width: usize) -> usize {
+    let mut column = 0usize;
+    for (index, character) in text.chars().enumerate() {
+        if index >= char_index {
+            break;
+        }
+        column += if character == '\t' {
+            tab_width - (column % tab_width.max(1))
+        } else {
+            1
+        };
+    }
+    column
+}
 
 /// Draw one transient line — a prompt, an echo or a message — on a card
 /// floating over the panes at `[status] notice-position`.
@@ -2300,6 +2444,73 @@ mod tests {
     }
 
     #[test]
+    fn a_table_too_wide_for_the_pane_wraps_into_it() {
+        // The other half of the complaint: a wide table used to run past the
+        // right edge with no way to see the rest.  Its columns shrink and the
+        // long cells word-wrap down their own column, so every word is on
+        // screen without any sideways scrolling — and the rules stay in line.
+        let text = "| flag | meaning |\n| ---- | ------- |\n\
+                    | A | a description far too long for this pane to display \
+                    unwrapped beside its rule at all |\n\nDone.\n";
+        let mut editor = markdown_editor(text);
+        editor.set_cursor(text.find("Done.").expect("a closing line") + 1);
+        // Narrow enough that the natural grid cannot fit.
+        let (buffer, _) = render_to(48, 16, &editor);
+
+        let all: Vec<String> = (1..7).map(|row| row_text(&buffer, row)).collect();
+        let joined = all.join("\n");
+        assert!(
+            joined.contains("at all"),
+            "the cell's end never appeared:\n{joined}"
+        );
+
+        // The grid survives the wrap: vertical rules mark the same columns on
+        // every screen row of the table, continuation rows included.
+        let rules_on = |row: u16| -> Vec<usize> {
+            row_text(&buffer, row)
+                .chars()
+                .enumerate()
+                .filter(|(_, c)| matches!(c, '│' | '┼' | '├' | '┤'))
+                .map(|(index, _)| index)
+                .collect()
+        };
+        let header = rules_on(1);
+        assert!(!header.is_empty(), "no grid was drawn");
+        for row in 2..5 {
+            // Only rows that belong to the table: a blank line and `Done.` end it.
+            let rules = rules_on(row);
+            if !rules.is_empty() && !row_text(&buffer, row).contains("Done") {
+                assert_eq!(rules, header, "row {row} broke the wrapped grid");
+            }
+        }
+    }
+
+    #[test]
+    fn the_carets_own_table_row_stays_plain_editable_text() {
+        // Requirement: when the caret stands on a table row, that row shows the
+        // source as written — raw pipes and spaces on one screen line — so it
+        // can be edited correctly even while its neighbours wear the grid.
+        let text = "| flag | meaning |\n| ---- | ------- |\n\
+                    | A | a description far too long for this pane at all |\n";
+        let mut editor = markdown_editor(text);
+        editor.set_cursor(text.find("| A |").expect("the body row") + 4);
+        let (buffer, cursor) = render_to(48, 10, &editor);
+
+        // The caret's row paints the raw source, pipes and all…  (`│` also
+        // frames the pane, so compare inside the borders.)
+        let row = row_text(&buffer, 3);
+        assert!(row.contains("| A |"), "the row hid its markup: {row:?}");
+        let inside: String = row.chars().skip(1).take_while(|&c| c != '│').collect();
+        assert!(
+            !inside.contains('│'),
+            "the row wore the grid under the caret"
+        );
+        // …and it is still one screen line, with a visible caret on it.
+        let caret = cursor.expect("a caret in a focused pane");
+        assert_eq!(caret.y, 3);
+    }
+
+    #[test]
     fn a_click_on_a_grown_column_lands_on_the_character_drawn_there() {
         // The click path resolves through the same map the paint path does:
         // the header's `v` has travelled from buffer column 9 to its grown
@@ -2320,12 +2531,14 @@ mod tests {
         pane.selection = Selection::point(text.find("Done.").expect("a closing line") + 1);
 
         // Where does the map say that `v` ended up?  Ask, then click there.
-        let decor = decorations(buffer, &config, &theme, 0, 12, None).expect("markdown");
-        let render = decor.get(click_line).expect("a row");
-        assert!(render.reflowed(), "the header did not reflow");
+        let fit = pane_content(pane_area, &config).width as usize
+            - Gutter::new(&config, buffer, 4, true).width;
+        let decor = decorations(buffer, &config, &theme, 0, 12, None, Some(fit)).expect("markdown");
+        let row = decor.get(click_line).expect("a row");
+        assert!(row.reflowed(), "the header did not reflow");
         let column = pane_content(pane_area, &config).x
             + Gutter::new(&config, buffer, 4, true).width as u16
-            + render.column_of(9) as u16;
+            + row.segment(0).expect("a segment").column_of(9) as u16;
         let row = pane_content(pane_area, &config).y + click_line as u16;
 
         let byte = byte_at(buffer, pane_area, &pane, &config, &theme, column, row)
@@ -2458,7 +2671,11 @@ mod tests {
 
     #[test]
     fn renders_text_with_gutter_and_cursor_line() {
-        let editor = editor_with("alpha\nbeta\ngamma\n");
+        let mut editor = editor_with("alpha\nbeta\ngamma\n");
+        // A buffer straight off disk has no change signs, so the gutter is just
+        // its line numbers (`+` columns are tested under the change-sign tests).
+        let id = editor.current_buffer_id().expect("a buffer");
+        editor.buffer_mut(id).expect("the buffer").mark_saved();
         let (buffer, cursor) = render_to(40, 8, &editor);
         let first = row_text(&buffer, 1);
         assert!(first.contains("alpha"), "{first:?}");
@@ -2673,11 +2890,134 @@ mod tests {
             content_width,
             4,
             true,
+            0,
             None,
         );
         assert!(rows.len() >= 4, "120 characters should wrap");
         assert_eq!(rows[0].end, content_width);
         assert_eq!(rows[0].line, Some(0));
+    }
+
+    #[test]
+    fn an_unwrapped_line_shows_the_column_window_it_was_scrolled_to() {
+        // The complaint this answers: with wrap off a long line simply ran out
+        // of screen.  `scroll_col` is now the first drawn display column, so a
+        // scrolled pane shows what the caret walked to instead of thin air.
+        let text = "x".repeat(150) + "TAIL";
+        let mut editor = editor_with(&text);
+        let focused = editor.layout.focused().expect("a pane");
+        editor
+            .layout
+            .pane_mut(focused)
+            .expect("the pane")
+            .view
+            .scroll_col = 148;
+        let (buffer, _) = render_to(60, 6, &editor);
+        let row = row_text(&buffer, 1);
+        assert!(
+            row.contains("xxTAIL"),
+            "the tail never scrolled in: {row:?}"
+        );
+
+        // Soft wrap needs no column window — everything already fits by wrapping
+        // — so `wrap` on pins the view back to the line's first column.
+        let mut config = Config::default();
+        config.editor.wrap = true;
+        let (buffer, _) = render_with(60, 6, &editor, &config);
+        let row = row_text(&buffer, 1);
+        assert!(
+            !row.contains("TAIL"),
+            "wrap should ignore scroll_col: {row:?}"
+        );
+    }
+
+    #[test]
+    fn an_edited_line_wears_a_change_sign_until_the_write() {
+        // The cue: a line touched since the last write gets a quiet `+` in the
+        // sign column, and nothing reserves that column while every line
+        // matches what is on disk.
+        let mut editor = editor_with("one\ntwo\nthree\n");
+        let id = editor.current_buffer_id().expect("a buffer");
+        editor.buffer_mut(id).expect("the buffer").mark_saved();
+        let config = Config::default();
+
+        let clean_width = {
+            let buffer = editor.buffer(id).unwrap();
+            let (buffer_view, _) = render_to(40, 8, &editor);
+            let frame = row_text(&buffer_view, 1);
+            assert!(
+                !frame.contains('+'),
+                "a saved buffer showed signs: {frame:?}"
+            );
+            Gutter::new(&config, buffer, 0, true).width
+        };
+
+        // Edit the middle line the way an operator would.
+        let mut selection = Selection::point(0);
+        let two_byte = editor.buffer(id).unwrap().text().find("two").unwrap();
+        editor.buffer_mut(id).expect("the buffer").apply(
+            vec![crate::buffer::Change::insert(two_byte, "!")],
+            crate::buffer::ChangeGroup::Operator,
+            &mut selection,
+        );
+
+        let (buffer_view, _) = render_to(40, 8, &editor);
+        let content = pane_content(
+            {
+                let area = Rect::new(0, 0, 40, 8);
+                areas(area, &config).1
+            },
+            &config,
+        );
+        let marked: Vec<u16> = (0..buffer_view.area().height)
+            .filter(|&y| cell_symbol(&buffer_view, content.x, y) == "+")
+            .collect();
+        assert_eq!(marked, vec![content.y + 1], "the `+` missed line two");
+
+        let dirty_width = {
+            let buffer = editor.buffer(id).unwrap();
+            Gutter::new(&config, buffer, 0, true).width
+        };
+        assert_eq!(dirty_width, clean_width + 1, "the column opened by one");
+
+        // The write settles it: signs gone, width with them.
+        editor.buffer_mut(id).expect("the buffer").mark_saved();
+        let (buffer_view, _) = render_to(40, 8, &editor);
+        let any_plus = (0..buffer_view.area().height)
+            .any(|y| (content.x..content.right()).any(|x| cell_symbol(&buffer_view, x, y) == "+"));
+        assert!(!any_plus, "a write left its marks behind");
+    }
+
+    #[test]
+    fn a_click_lands_on_the_character_scrolled_into_view() {
+        // Hit-testing mirrors the paint path's arithmetic, window included: the
+        // first text column belongs to character `scroll_col`, not character 0.
+        let text = "x".repeat(200);
+        let editor = editor_with(&text);
+        let config = Config::default();
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 60, 8);
+        let (_, pane_area) = areas(area, &config);
+        let buffer_data = editor.current_buffer().expect("a buffer");
+        let mut pane = crate::layout::Pane::new(
+            crate::layout::PaneId(1),
+            editor.current_buffer_id().expect("a buffer"),
+        );
+        pane.view.scroll_col = 148;
+
+        let content = pane_content(pane_area, &config);
+        let gutter = Gutter::new(&config, buffer_data, 0, true);
+        let byte = byte_at(
+            buffer_data,
+            pane_area,
+            &pane,
+            &config,
+            &theme,
+            content.x + gutter.width as u16,
+            content.y,
+        )
+        .expect("the click is inside the pane");
+        assert_eq!(byte, 148, "the click ignored the column window");
     }
 
     #[test]
@@ -3513,7 +3853,7 @@ mod tests {
             "one\ntwo\nthree\n".into(),
             &Config::default().editor,
         );
-        let rows = visual_rows(&buffer, 0, 5, 40, 4, false, None);
+        let rows = visual_rows(&buffer, 0, 5, 40, 4, false, 0, None);
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[0].line, Some(0));
         assert_eq!(rows[2].line, Some(2));

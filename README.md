@@ -100,6 +100,14 @@ partner with the caret between the two. The
 mouse works too: click to place the cursor, drag to select, wheel
 to scroll, and click inside a picker to choose an item.
 
+Every line you have edited since the last write wears a small `+` in the gutter —
+the cue that there is unsaved text over there, wherever your eye happens to be.
+It rides along with the line as text moves above it, yields to a diagnostic sign
+on the same line (a problem outranks a diff), and clears when you write; an undo
+leaves the `+` in place, because walked-back text is still unsaved text.
+`:set editor.changed-signs=false` turns the marks off (the column reserves no
+width at all while nothing is marked).
+
 ## Commands
 
 `:help` lists everything; abbreviations work as long as they are unambiguous.
@@ -190,6 +198,12 @@ column over it.  The file itself is still exactly what was typed: alignment live
 the drawing, not the text.  And whichever line the cursor sits on reveals its markup
 as written, so the characters being edited are always visible — move off the row and
 the clean grid comes back.
+
+A table too wide for the pane fits rather than clips: its columns shrink toward a
+shared width and long cells word-wrap down their own column across extra screen
+rows, keeping every rule in line and no word past the right edge.  The row under
+the cursor stays what it always is — one plain line of source, revealed for editing
+— so a caret never has to chase text through a wrap.
 
 ## Dark or light
 
@@ -284,6 +298,13 @@ buffer behind them cannot show through the text.
 Panes scroll independently, and each one scrolls to its *own* height: split the
 window in two and the cursor turns the pane at the pane's edge, not at the edge
 of the screen.
+
+With `[editor] wrap` off (the default), a line longer than the pane scrolls
+sideways instead of losing the caret: moving right along a long line pulls the
+column window along with it — keeping `editor.sidescroll-margin` columns of
+context ahead — and `z h` / `z l` nudge that window left or right without moving
+the cursor. Turning wrap on draws everything by wrapping, so the column window
+stays parked at the first column until you turn it back off.
 
 `:set` changes apply to the running session and are never written to disk;
 `:config write` is how you save them. `:config source` re-reads the file. The

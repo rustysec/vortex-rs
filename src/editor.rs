@@ -1662,7 +1662,12 @@ impl Editor {
             Cmd::Recenter => intents.extend(self.recenter(area)),
             Cmd::ScrollToTop => intents.extend(self.scroll_to_edge(true, area)),
             Cmd::ScrollToBottom => intents.extend(self.scroll_to_edge(false, area)),
-            Cmd::ScrollLine(direction) => intents.extend(self.scroll_lines(direction)),
+            Cmd::ScrollLine(direction) => {
+                intents.extend(self.scroll_lines(direction, count));
+            }
+            Cmd::ScrollColumn(direction) => {
+                intents.extend(self.scroll_columns(direction, count));
+            }
             Cmd::JumpBack => intents.extend(self.jump(true)),
             Cmd::JumpForward => intents.extend(self.jump(false)),
             // ---- files ----
@@ -2751,7 +2756,9 @@ impl Editor {
 
     // ------------------------------------------------------------- viewport
 
-    /// Keep the cursor inside the focused pane, scrolling when needed.
+    /// Keep the cursor inside the focused pane, scrolling when needed —
+    /// vertically always, and horizontally too while `[editor] wrap` is off
+    /// (with wrapping on there are no hidden columns to chase).
     pub fn ensure_visible(&mut self, area: Rect) {
         let height = self.text_height(area);
         let margin = (self.config.editor.scroll_margin as usize).min(height / 2);
@@ -2783,6 +2790,42 @@ impl Editor {
         next = next.min(lines.saturating_sub(height));
         if let Some(pane) = self.layout.pane_mut(focused) {
             pane.view.scroll_line = next;
+        }
+
+        // The same bargain sideways: an unwrapped line longer than the pane is
+        // read by scrolling, so a caret that walks off the right edge pulls the
+        // column window along instead of vanishing.  `sidescroll-margin` keeps
+        // a band of context ahead of it; reflowed table rows fit their pane and
+        // never ask for this (the row under the cursor draws as plain text).
+        if !self.config.editor.wrap {
+            let caret = self.current_buffer().map(|buffer| {
+                let character = buffer.char_in_line(self.cursor());
+                let text = buffer
+                    .line_str(line)
+                    .trim_end_matches(['\n', '\r'])
+                    .to_string();
+                let tab_width = self.config.editor.tab_width_for(buffer.language.id);
+                let width =
+                    crate::ui::text_columns(self.focused_area(area), buffer, line, &self.config);
+                (crate::ui::caret_column(&text, character, tab_width), width)
+            });
+            if let Some((column, width)) = caret.filter(|(_, width)| *width > 0) {
+                let side = (self.config.editor.sidescroll_margin as usize).min(width / 2);
+                let scroll = self
+                    .layout
+                    .pane(focused)
+                    .map(|pane| pane.view.scroll_col)
+                    .unwrap_or(0);
+                let mut next = scroll;
+                if column + 1 < scroll + side {
+                    next = column.saturating_add(1).saturating_sub(side);
+                } else if column + side + 1 > scroll + width {
+                    next = column + side + 1 - width;
+                }
+                if let Some(pane) = self.layout.pane_mut(focused) {
+                    pane.view.scroll_col = next;
+                }
+            }
         }
     }
 
@@ -3002,8 +3045,8 @@ impl Editor {
         Some(Intent::EnsureVisible)
     }
 
-    fn scroll_lines(&mut self, direction: Direction) -> Option<Intent> {
-        let count = self.pending.take_count().max(1);
+    fn scroll_lines(&mut self, direction: Direction, count: usize) -> Option<Intent> {
+        let count = count.max(1);
         let focused = self.layout.focused()?;
         let max = self.current_buffer()?.last_line() as i32;
         let scroll = self.layout.pane(focused)?.view.scroll_line as i32;
@@ -3011,6 +3054,21 @@ impl Editor {
         if let Some(pane) = self.layout.pane_mut(focused) {
             pane.view.scroll_line = next;
         }
+        Some(Intent::EnsureVisible)
+    }
+
+    /// `zh` / `zl`: slide the focused pane's column window sideways without
+    /// moving the cursor — the unwrapped counterpart of `scroll-line-*`.
+    fn scroll_columns(&mut self, direction: Direction, count: usize) -> Option<Intent> {
+        let count = count.max(1);
+        let focused = self.layout.focused()?;
+        let scroll = self.layout.pane(focused)?.view.scroll_col as i32;
+        let next = (scroll + direction.sign() * count as i32).max(0) as usize;
+        if let Some(pane) = self.layout.pane_mut(focused) {
+            pane.view.scroll_col = next;
+        }
+        // With wrapping on there is no column window to move, and the pane's
+        // `scroll_col` is ignored by the painter until it is turned back off.
         Some(Intent::EnsureVisible)
     }
 
@@ -5273,6 +5331,56 @@ mod tests {
             buffer.syntax.parse_due(buffer.version),
             "invalidating is a request for a parse, not a job in flight: {:?}",
             buffer.syntax.status
+        );
+    }
+
+    #[test]
+    fn the_column_window_follows_an_unwrapped_caret_off_the_right_edge() {
+        // The complaint this answers: on a long line with wrap off the caret
+        // kept moving while the screen stood still, until the user was editing
+        // blind.  `ensure_visible` now slides `scroll_col` along with it.
+        let mut fixture = Fixture::new(&"y".repeat(200));
+        assert!(fixture.feed("$").contains(&Intent::EnsureVisible));
+        fixture.editor.ensure_visible(fixture.area);
+
+        let pane_id = fixture.editor.layout.focused().expect("a pane");
+        let at_end = fixture
+            .editor
+            .layout
+            .pane(pane_id)
+            .expect("the pane")
+            .view
+            .scroll_col;
+        assert!(at_end > 0, "the caret ran off with nobody following");
+
+        // `z l` nudges the window sideways without moving the cursor, as far as
+        // keeping the caret in reach allows: from a followed line end there is
+        // slack on the right, so the count lands whole.
+        fixture.feed("2 z l");
+        fixture.editor.ensure_visible(fixture.area);
+        let scrolled = fixture
+            .editor
+            .layout
+            .pane(pane_id)
+            .expect("the pane")
+            .view
+            .scroll_col;
+        assert_eq!(scrolled, at_end + 2, "z l should scroll two columns over");
+
+        // It stops as soon as the caret is back in reach: `0` returns it to the
+        // line's start and the window closes up again, margin and all.
+        fixture.feed("0");
+        fixture.editor.ensure_visible(fixture.area);
+        let scroll_col = fixture
+            .editor
+            .layout
+            .pane(pane_id)
+            .expect("the pane")
+            .view
+            .scroll_col;
+        assert_eq!(
+            scroll_col, 0,
+            "a caret at home should not keep the window open"
         );
     }
 }
