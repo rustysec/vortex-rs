@@ -116,8 +116,9 @@ pub fn apply(
                 if next == p {
                     break;
                 }
-                // Stepping onto a line break is allowed, like vim: the cursor
-                // renders at the end of the line.
+                // The raw step may land on the line break; the editor clamps
+                // normal-mode cursors back to the last character so operators
+                // never eat the break.
                 p = next;
             }
             Some(Dest::char(p))
@@ -130,10 +131,12 @@ pub fn apply(
         Motion::FirstNonBlank => Some(Dest::inclusive_char(
             buffer.first_non_blank(buffer.line_of(cursor)),
         )),
-        Motion::LineEnd => Some(Dest::inclusive_char(last_byte_on_line(
-            buffer,
-            buffer.line_of(cursor),
-        ))),
+        Motion::LineEnd | Motion::TillLineEnd => {
+            // `$` (and its `D` / `C` aliases) can move down `count - 1` lines,
+            // but always stops on a character — never on the line break.
+            let line = (buffer.line_of(cursor) + count.saturating_sub(1)).min(buffer.last_line());
+            Some(Dest::inclusive_char(buffer.last_char_of_line(line)))
+        }
         Motion::LineEndFirstNonBlank => Some(Dest::inclusive_char(
             buffer.first_non_blank(last_non_blank_line(buffer, cursor, env)?),
         )),
@@ -173,9 +176,6 @@ pub fn apply(
             }
             Some(Dest::inclusive_char(last))
         }
-        Motion::TillLineEnd => Some(Dest::inclusive_char(
-            buffer.line_end(buffer.line_of(cursor)),
-        )),
         Motion::FindChar(_dir) => None, // resolved with a character by the editor
         Motion::RepeatFind | Motion::RepeatFindReverse => None, // needs the last find
         Motion::DocumentStart => {
@@ -266,15 +266,7 @@ fn vertical(
 /// The last character of a line (the line start if the line is empty).  Vim's
 /// cursor sits *on* a character, so `$` and vertical motion stop here.
 fn last_byte_on_line(buffer: &Buffer, line: usize) -> usize {
-    let start = buffer.line_start(line);
-    let end = buffer.line_end(line);
-    if end <= start {
-        return start;
-    }
-    match buffer.char_before(end) {
-        Some((offset, _)) if offset >= start => offset,
-        _ => start,
-    }
+    buffer.last_char_of_line(line)
 }
 
 fn view_line(buffer: &Buffer, _env: &Env<'_>, line: usize) -> Option<Dest> {
@@ -915,6 +907,18 @@ mod tests {
         let buffer = buffer("ab\ncd");
         assert_eq!(cursor(Motion::Right, 1, 1, &buffer), 2);
         assert_eq!(cursor(Motion::Right, 1, 2, &buffer), 3);
+    }
+
+    #[test]
+    fn end_of_line_stops_on_a_character_and_counts_down() {
+        let empty = buffer("one\n\ntwo\n");
+        let buffer = buffer("hello\nworld\nthird");
+        assert_eq!(cursor(Motion::LineEnd, 2, 0, &buffer), 10);
+        // `D` and `C` use the same motion as `$`, not one that lands on the
+        // break and deletes it.
+        assert_eq!(cursor(Motion::TillLineEnd, 1, 0, &buffer), 4);
+        assert_eq!(cursor(Motion::TillLineEnd, 2, 0, &buffer), 10);
+        assert_eq!(cursor(Motion::LineEnd, 1, 4, &empty), 4);
     }
 
     #[test]

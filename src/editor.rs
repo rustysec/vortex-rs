@@ -1416,6 +1416,10 @@ impl Editor {
             }
             Target::CharAhead => {
                 let buffer = self.current_buffer()?;
+                if on_empty_line(buffer, cursor) {
+                    // The caret sits on the break, which is not a character.
+                    return Some(Region::char(Span::point(cursor)));
+                }
                 let mut stop = next_boundary(buffer, cursor);
                 if stop == cursor {
                     return None;
@@ -1443,6 +1447,7 @@ impl Editor {
                     return None;
                 }
                 let buffer = self.current_buffer()?;
+                let cursor = clamp_cursor(buffer, cursor);
                 let env = self.motion_env(area);
                 let Dest {
                     cursor: to,
@@ -1454,6 +1459,23 @@ impl Editor {
                     let first = buffer.line_of(cursor.min(to));
                     let last = buffer.line_of(cursor.max(to));
                     return Some(Region::line(operators::lines_span(buffer, first, last)));
+                }
+                if on_empty_line(buffer, cursor)
+                    && (matches!(
+                        motion,
+                        Motion::Left
+                            | Motion::Right
+                            | Motion::LineStart
+                            | Motion::FirstNonBlank
+                            | Motion::Column
+                            | Motion::CharAhead
+                    ) || (matches!(motion, Motion::LineEnd | Motion::TillLineEnd)
+                        && buffer.line_of(to) == buffer.line_of(cursor)))
+                {
+                    // The caret on an empty line sits on its break, which is
+                    // not a character these motions can cover: `x`, `l`, `h`
+                    // and `d$` must leave the line break alone.
+                    return Some(Region::char(Span::point(cursor)));
                 }
                 let region = operators::region_for_motion(buffer, cursor, to, false, inclusive);
                 if region.is_empty() {
@@ -3580,11 +3602,18 @@ fn should_push_jump(motion: Motion, from_line: usize, to_line: usize) -> bool {
     }
 }
 
-/// Normal mode cannot sit past the last character of a line.
+/// Normal mode cannot sit past the last character of a line: `line_end` is the
+/// byte of the line break, and deleting from there pulls the next line up.
 fn clamp_cursor(buffer: &Buffer, position: usize) -> usize {
     let position = buffer.clamp_byte(position);
-    let line_end = buffer.line_end(buffer.line_of(position));
-    position.min(line_end)
+    position.min(buffer.last_char_of_line(buffer.line_of(position)))
+}
+
+/// Whether the caret is sitting on the break of an empty line. That byte is a
+/// line ending, not a character for characterwise operators to consume.
+fn on_empty_line(buffer: &Buffer, position: usize) -> bool {
+    let line = buffer.line_of(position);
+    buffer.line_start(line) == buffer.line_end(line)
 }
 
 fn clamped_to_buffer(buffer: Option<&Buffer>, selection: Selection) -> Selection {
@@ -3869,6 +3898,80 @@ mod tests {
             "alpha\nbeta\n",
             "nothing deleted yet"
         );
+    }
+
+    #[test]
+    fn delete_to_line_end_never_takes_the_line_break() {
+        // `D` is `d$`: both stop on the last character, so the following line
+        // stays on its own line.
+        for keys in ["0wd$", "0wD"] {
+            let mut fixture = Fixture::new("alpha beta\ngamma delta\n");
+            fixture.feed(keys);
+            assert_eq!(fixture.text(), "alpha \ngamma delta\n", "{keys}");
+        }
+
+        // On the last character there is still that one character to delete.
+        let mut fixture = Fixture::new("alpha beta\ngamma delta\n");
+        fixture.feed("$d$");
+        assert_eq!(fixture.text(), "alpha bet\ngamma delta\n");
+
+        // A count reaches the end of a later line, breaks in between included.
+        let mut fixture = Fixture::new("alpha beta\ngamma delta\nepsilon zeta\n");
+        fixture.feed("0w2d$");
+        assert_eq!(fixture.text(), "alpha \nepsilon zeta\n");
+    }
+
+    #[test]
+    fn change_to_line_end_leaves_the_line_break_for_insert() {
+        let mut fixture = Fixture::new("alpha beta\ngamma delta\n");
+        fixture.feed("0wCxyzesc");
+        assert_eq!(fixture.text(), "alpha xyz\ngamma delta\n");
+
+        let mut fixture = Fixture::new("alpha beta\ngamma delta\n");
+        fixture.feed("0wc$xyzesc");
+        assert_eq!(fixture.text(), "alpha xyz\ngamma delta\n");
+    }
+
+    #[test]
+    fn end_of_line_cannot_rest_on_the_line_break() {
+        // `l` past the last character stays there: a cursor on the break made
+        // both `x` and `d$` swallow it and pull the next line up.
+        let mut fixture = Fixture::new("alpha beta\ngamma delta\n");
+        fixture.feed("0llllllllll");
+        assert_eq!(fixture.cursor(), 9, "the last character, not the break");
+        fixture.feed("x");
+        assert_eq!(fixture.text(), "alpha bet\ngamma delta\n");
+
+        let mut fixture = Fixture::new("alpha beta\ngamma delta\n");
+        fixture.feed("0llllllllll");
+        fixture.feed("d$");
+        assert_eq!(fixture.text(), "alpha bet\ngamma delta\n");
+    }
+
+    #[test]
+    fn delete_to_line_end_on_an_empty_line_does_nothing() {
+        let mut fixture = Fixture::new("alpha\n\ngamma\n");
+        fixture.feed("jd$");
+        assert_eq!(fixture.text(), "alpha\n\ngamma\n");
+
+        let mut fixture = Fixture::new("alpha\n\ngamma\n");
+        fixture.feed("jD");
+        assert_eq!(fixture.text(), "alpha\n\ngamma\n");
+
+        // The caret on an empty line sits on its break; no characterwise
+        // operator may eat that break instead.
+        let mut fixture = Fixture::new("alpha\n\ngamma\n");
+        fixture.feed("jx");
+        assert_eq!(fixture.text(), "alpha\n\ngamma\n");
+
+        let mut fixture = Fixture::new("alpha\n\ngamma\n");
+        fixture.feed("jdl");
+        assert_eq!(fixture.text(), "alpha\n\ngamma\n");
+
+        // A word motion really does cross the break and may still delete it.
+        let mut fixture = Fixture::new("alpha\n\ngamma\n");
+        fixture.feed("jdw");
+        assert_eq!(fixture.text(), "alpha\ngamma\n");
     }
 
     #[test]

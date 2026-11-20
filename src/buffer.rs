@@ -853,6 +853,24 @@ impl Buffer {
         end
     }
 
+    /// Byte of the last character a normal-mode cursor can sit on in `line`.
+    ///
+    /// `line_end` is the byte *after* that character (the line break, when
+    /// there is one). Stopping on the break makes `l` look like it is at the
+    /// end of the line while `x` or `d$` still eat the break and pull the next
+    /// line up. An empty line still has its start as the only resting place.
+    pub fn last_char_of_line(&self, line: usize) -> usize {
+        let start = self.line_start(line);
+        let end = self.line_end(line);
+        if end <= start {
+            return start;
+        }
+        self.char_before(end)
+            .map(|(offset, _)| offset)
+            .filter(|offset| *offset >= start)
+            .unwrap_or(start)
+    }
+
     /// Byte range of the whole line including its line ending.
     pub fn line_range_with_ending(&self, line: usize) -> Span {
         let line = line.min(self.line_count().saturating_sub(1));
@@ -1975,6 +1993,19 @@ mod tests {
         assert_eq!(buffer.line_end(0), 3);
         assert_eq!(buffer.line_start(1), 4);
         assert_eq!(buffer.line_end(1), 7);
+    }
+
+    #[test]
+    fn last_char_of_line_stops_before_the_break() {
+        let buffer = buffer_with("one\n\ntwo\r\n");
+        assert_eq!(buffer.last_char_of_line(0), 2, "'e'");
+        assert_eq!(
+            buffer.last_char_of_line(1),
+            4,
+            "an empty line has only its start"
+        );
+        assert_eq!(buffer.last_char_of_line(2), 7, "'o', before \\r\\n");
+        assert_eq!(buffer_with("").last_char_of_line(0), 0);
     }
 
     // ------------------------------------------------------------ change signs
