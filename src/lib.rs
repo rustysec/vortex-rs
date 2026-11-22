@@ -1,6 +1,6 @@
 //! vortex — a modal, async, grammar-aware terminal code editor.
 //!
-//! See `plan/init.md` for the product spec. The crate is organised as:
+//! The crate is organised as:
 //!
 //! * [`crate::app`] — event loop and top level state
 //! * [`crate::buffer`] — rope backed text buffers with undo history
@@ -13,7 +13,7 @@
 //! * [`crate::git`] — git branch probe for the status row (async)
 //! * [`crate::format`] — async language formatters
 //! * [`crate::markdown`] — in-buffer decoration for markdown buffers
-//! * [`crate::lsp`] — scaffolding for a language server client
+//! * [`crate::lsp`] — working language server client (diagnostics, completion, hover, code actions, formatting, navigation, rename)
 
 pub mod action;
 pub mod app;

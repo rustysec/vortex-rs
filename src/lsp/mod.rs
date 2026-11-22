@@ -1,4 +1,4 @@
-//! Language server protocol support — a working scaffold, not a full client.
+//! Language server protocol support — a working client.
 //!
 //! What works today:
 //! * one server process per project root, started on demand from `[lsp.servers]`;
@@ -10,10 +10,11 @@
 //!   sends `workspace/diagnostic/refresh`.  rust-analyzer pushes only the
 //!   compiler's view of the *saved* file, so without the pull an unsaved error
 //!   never shows a diagnostic;
-//! * hover, completion, code actions and formatting, and navigation —
-//!   `textDocument/definition` and `textDocument/references`.
+//! * hover, completion, code actions, formatting, navigation —
+//!   `textDocument/definition` and `textDocument/references` — and rename
+//!   (`textDocument/rename`), whose workspace edit the editor applies itself.
 //!
-//! What is deliberately not implemented: renames, `codeAction/resolve` and
+//! What is deliberately not implemented: `codeAction/resolve` and
 //! workspace-symbol lookup.
 //!
 //! [lsp] `enable` defaults to `false`: with no server configured nothing here

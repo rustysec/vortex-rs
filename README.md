@@ -59,9 +59,9 @@ words, sentences and paragraphs. When a tree-sitter grammar exists for the
 file you also get grammar objects: `af`/`if` function, `ac`/`ic` class,
 `ab`/`ib` block, `as`/`is` string, `aC`/`iC` comment.
 
-These are the keys the shipped starter binds — `vortex --write-config` writes the
-list out as `[keymap.*]` lines you can cut down or replace, and a key with no
-line does nothing:
+These are the keys the shipped starter binds — a selection, not the whole
+list: `vortex --write-config` writes out every `[keymap.*]` line you can cut
+down or replace, and a key with no line does nothing:
 
 | Keys | Action |
 | --- | --- |
@@ -72,7 +72,9 @@ line does nothing:
 | `Space b` | buffer picker (`:bn`/`:bp` cycle, `:ls` lists) |
 | `Space w` or `Ctrl-S` | save; `Space q` quits |
 | `Space F` | run the language formatter |
-| `Space d` | diagnostics at the cursor |
+| `Space d` | diagnostics at the cursor; `]d` / `[d` jump to the next/previous one |
+| `K` | hover over the symbol under the cursor (language server) |
+| `Space a` | quick fixes for the caret's line (language server) |
 | `gd` | jump to the definition of the symbol under the cursor |
 | `Space r` | list every reference to it, picker like the grep results |
 | `Space m` | rename the symbol everywhere — buffers and plain files alike |
@@ -337,8 +339,11 @@ line) at the working directory.
   ripgrep regex, taken literally while it is still too half-typed to compile
   (`look(` searches for `look(`), and the list is always the hits for the
   pattern in the prompt rather than the union of everything typed so far.
-* **Formatting.** External formatters (`rustfmt`, `prettier`, `gofmt`,
-  `clang-format`, `taplo`, `ruff` …), triggered by `:format`, `space F`,
+* **Formatting.** When a language server is attached for the buffer, its own
+  formatter is asked first — it knows the language's real formatting rules and
+  can format a range. The external formatters (`rustfmt`, `prettier`, `gofmt`,
+  `clang-format`, `taplo`, `ruff` …) are the fallback for languages with no
+  server, and for a server that refuses. Triggered by `:format`, `space F`,
   `[format] on-save` or `on-idle`. Only the changed middle of the file is
   rewritten, so undo stays granular and the cursor keeps its place. An automatic
   run never lands while a gesture is open in its buffer — typing, an armed `d`
@@ -351,7 +356,7 @@ line) at the working directory.
   `u` walks back your edits and takes the formatting that followed each one with
   it. `:format` is an edit you asked for, so it undoes on its own.
 * **Spelling.** A self-contained English checker for comments and string
-  values, with suggestions (`z=`, `space E`). Identifiers, mapping keys in
+  values, with suggestions (`z=`, `Space e`). Identifiers, mapping keys in
   JSON/YAML/TOML, `camelCase`, paths and numbers are skipped, so it stays quiet
   on code.
 * **LSP.** Off by default — `[lsp] enable = true` turns it on, which also
@@ -367,7 +372,9 @@ line) at the working directory.
   accept, the arrows move, `Esc` closes it, and typing narrows the list with a
   fuzzy filter. A slow answer for a caret that has since moved is dropped, and
   `[lsp] completion = false` turns the popup off while keeping diagnostics.
-  Hover and rename are not wired up yet, which is why formatting is external.
+  The server also answers hover (`K`), quick fixes (`Space a`), go-to-definition
+  (`gd`), find-references (`Space r`) and rename across the workspace
+  (`Space m`).
 
 ## Architecture
 
@@ -378,20 +385,31 @@ src/
   editor.rs       editing state: modes, operators, registers, jumplist, panes
   buffer.rs       rope, undo history, file I/O, dirty/mtime tracking
   selection.rs    multi-span selections, mapping across edits
-  input/          keys, keymap trie, motions, text objects, operators
+  input/          modal key handling: key notation, keymap trie, motions,
+                  operators, text objects
+  command.rs      the `:` command line: parsing, the command table, completion, `:set`
+  action.rs       the action vocabulary: one name per binding and per command
   layout.rs       pane tree, equal/golden sizing
   ui.rs           pure renderer over a ratatui Buffer
   status.rs       the one-row status area (transient text is a card in ui.rs)
   prompt.rs       command line, search, fuzzy pickers
+  completion.rs   the completion popup's candidates and prefix filtering
   syntax.rs       tree-sitter parsing and highlight spans
   indent.rs       syntax-aware indentation while typing
-  completion.rs   the completion popup's candidates and prefix filtering
+  markdown.rs     in-buffer markdown decoration
   search.rs       ripgrep driver plus ignore-crate fallback
   format.rs       formatter discovery, diffing, cursor restoration
   spell.rs        dictionary, tokenizer, suggestions
-  lsp/            JSON-RPC framing, the client and completion requests
+  fuzzy.rs        path-aware fuzzy matcher for the pickers
+  git.rs          git branch probe for the status row
+  lang.rs         language registry: detection, tree-sitter grammars, comment tokens
+  diagnostic.rs   diagnostics: errors, warnings and hints, decorating text
+  lsp/            JSON-RPC framing, the client and its requests
   config.rs       TOML config, defaults, `:set` plumbing
   theme.rs        style parsing and defaults
+  term.rs         terminal setup and teardown
+  event.rs        terminal input plus background-job results, one channel
+  error.rs        error and result types
 ```
 
 `Editor` never touches the terminal or the filesystem. It takes key events and
@@ -415,6 +433,7 @@ cargo build --release
 python3 scripts/smoke.py target/release/vortex       # modes, editing, search, panes, prompts
 python3 scripts/smoke_code.py target/release/vortex  # highlighting, spell, format, reload
 python3 scripts/smoke_theme.py target/release/vortex # colour detection: light, dark, silent
+python3 scripts/smoke_markdown.py target/release/vortex # in-buffer markdown decoration
 ```
 
 Rendering is tested against `ratatui::buffer::Buffer`, editing against

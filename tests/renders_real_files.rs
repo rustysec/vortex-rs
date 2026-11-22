@@ -18,12 +18,7 @@ use vortex::ui::{self, Screen};
 
 fn repo_files() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = vec![
-        root.join("README.md"),
-        root.join("config.example.toml"),
-        root.join("plan/knits.md"),
-        root.join("plan/init.md"),
-    ];
+    let mut files = vec![root.join("README.md"), root.join("config.example.toml")];
     for dir in ["src", "src/input", "src/lsp", "scripts"] {
         let entries = std::fs::read_dir(root.join(dir)).expect("source dir");
         for entry in entries.flatten() {
@@ -41,12 +36,7 @@ fn repo_files() -> Vec<PathBuf> {
 #[test]
 fn spell_checking_survives_real_text() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for name in [
-        "README.md",
-        "plan/init.md",
-        "src/editor.rs",
-        "config.example.toml",
-    ] {
+    for name in ["README.md", "src/editor.rs", "config.example.toml"] {
         let text = std::fs::read_to_string(root.join(name)).expect("readable");
         let found = vortex::spell::check(&text, &SpellConfig::default());
         for diagnostic in &found {
