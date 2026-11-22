@@ -315,6 +315,7 @@ fn descend(
 ) {
     let node = cursor.node();
     let node_range = Span::new(node.start_byte(), node.end_byte());
+    let field = cursor.field_name();
 
     // Whole subtree outside the visible window: stop walking.
     if node_range.end <= range.start || node_range.start >= range.end {
@@ -329,8 +330,17 @@ fn descend(
     // `string` wraps its quotes and content as children): descending would
     // paint the quotes as punctuation and leave the content unstyled, so style
     // the whole node instead.
-    if node.child_count() == 0 || node.kind().contains("comment") || node.kind() == "string" {
-        let hl = highlight_of(buffer, node, lang_id, cursor.field_name());
+    //
+    // YAML needs the same treatment: its quoted scalars have no content child,
+    // a block scalar's body lives outside the tree, and every mapping key is a
+    // `flow_node` with a `key` field wrapped around an ordinary scalar.  Styling
+    // those nodes whole is the only way to tell a key from its value.
+    if node.child_count() == 0
+        || node.kind().contains("comment")
+        || node.kind() == "string"
+        || (lang_id == "yaml" && yaml_atom(node, field))
+    {
+        let hl = highlight_of(buffer, node, lang_id, field);
         if hl != Hl::None {
             let start = node_range.start.max(range.start);
             let end = node_range.end.min(range.end);
@@ -393,9 +403,65 @@ fn role_highlight(node: Node<'_>, field: Option<&str>) -> Option<Hl> {
     }
 }
 
+/// YAML nodes that must be styled as one token.
+///
+/// The grammar wraps every scalar in a `plain_scalar`/`*_quote_scalar` node and
+/// leaves the interesting text out of the tree entirely: a quoted scalar's body
+/// is not a child, and a block scalar's indented lines are not children either.
+/// Descending would paint just the quotes and markers.  Keys are wrapped in a
+/// `flow_node` carrying the `key` field, so they need the same whole-node
+/// treatment to differ from the string that follows the colon.
+fn yaml_atom(node: Node<'_>, field: Option<&str>) -> bool {
+    if node.kind() == "flow_node" {
+        return field == Some("key");
+    }
+    matches!(
+        node.kind(),
+        "plain_scalar"
+            | "double_quote_scalar"
+            | "single_quote_scalar"
+            | "block_scalar"
+            | "alias"
+            | "anchor"
+            | "tag"
+            | "yaml_directive"
+            | "tag_directive"
+            | "reserved_directive"
+            | "---"
+            | "..."
+    )
+}
+
+/// Highlight group for a whole YAML token.
+fn yaml_highlight(node: Node<'_>, field: Option<&str>) -> Option<Hl> {
+    if node.kind() == "flow_node" && field == Some("key") {
+        return Some(Hl::Property);
+    }
+    let hl = match node.kind() {
+        "plain_scalar" => match node.named_child(0).map(|child| child.kind()) {
+            Some("integer_scalar" | "float_scalar") => Hl::Number,
+            // A timestamp is a typed value, like `true` and `null`, not a word.
+            Some("boolean_scalar" | "null_scalar" | "timestamp_scalar") => Hl::Constant,
+            _ => Hl::String,
+        },
+        "double_quote_scalar" | "single_quote_scalar" | "block_scalar" => Hl::String,
+        "anchor" | "alias" => Hl::Constant,
+        "tag" => Hl::Type,
+        "yaml_directive" | "tag_directive" | "reserved_directive" | "---" | "..." => Hl::Preproc,
+        _ => return None,
+    };
+    Some(hl)
+}
+
 /// Decide the highlight group of a leaf token.
 fn highlight_of(buffer: &Buffer, node: Node<'_>, lang_id: &str, field: Option<&str>) -> Hl {
     let kind = node.kind();
+
+    if lang_id == "yaml"
+        && let Some(hl) = yaml_highlight(node, field)
+    {
+        return hl;
+    }
 
     // The role the parent gave this token is a better clue than the token's own
     // kind: an `identifier` is a function name, a parameter or a plain variable,
@@ -1125,6 +1191,28 @@ mod tests {
         buffer
     }
 
+    fn yaml(text: &str) -> Buffer {
+        let mut buffer = Buffer::new(
+            BufferId(1),
+            Some(std::path::PathBuf::from("sample.yaml")),
+            text.to_string(),
+            &EditorConfig::default(),
+        );
+        assert!(buffer.reparse_now(), "the YAML grammar should parse");
+        buffer
+    }
+
+    const YAML_SAMPLE: &str = concat!(
+        "%YAML 1.2\n---\n",
+        "name: vortex\ncount: 12\nratio: 1.5\n",
+        "enabled: true\nnothing: null\nwhen: 2024-01-02\n",
+        "note: \"hello world\"\nsingle: 'it''s'\n",
+        "block: |\n  line one\n  line two\n",
+        "base: &base value\ncopy: *base\ntagged: !!str text\n",
+        "flow: {a: 1, b: [2, 3]}\n",
+        "# a note\n",
+    );
+
     fn groups(buffer: &Buffer) -> Vec<(Hl, String)> {
         let end = buffer.len_bytes();
         highlights(buffer, Span::new(0, end), buffer.language.id)
@@ -1323,6 +1411,94 @@ mod tests {
         assert!(
             groups.iter().any(|(hl, _)| *hl == Hl::Comment),
             "{groups:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_keys_are_properties_not_strings() {
+        // A YAML key is a `string_scalar` wrapped in a `flow_node` with a `key`
+        // field.  Without that field every key came out green like its value,
+        // so a whole config file read as one colour.
+        let groups = groups(&yaml(YAML_SAMPLE));
+
+        for key in [
+            "name", "count", "ratio", "enabled", "nothing", "when", "note", "single", "block",
+            "base", "copy", "tagged", "flow", "a", "b",
+        ] {
+            assert!(
+                groups
+                    .iter()
+                    .any(|(hl, text)| *hl == Hl::Property && text == key),
+                "key {key:?} should be a property in {groups:?}"
+            );
+        }
+        assert!(
+            groups
+                .iter()
+                .any(|(hl, text)| *hl == Hl::String && text == "vortex"),
+            "a value is still a string in {groups:?}"
+        );
+        assert!(
+            !groups
+                .iter()
+                .any(|(hl, text)| *hl == Hl::String && text == "name"),
+            "a key must not be painted like its value: {groups:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_scalars_and_directives_are_whole_tokens() {
+        // Quoted and block scalars have no content child in the grammar, and
+        // directives have no token for the `%YAML` prefix.  Styling each leaf
+        // left just quotes, escapes and the `|` marker coloured.
+        let groups = groups(&yaml(YAML_SAMPLE));
+
+        for text in ["\"hello world\"", "'it''s'"] {
+            assert!(
+                groups
+                    .iter()
+                    .any(|(hl, got)| *hl == Hl::String && got == text),
+                "quoted scalar {text:?} should be one string run in {groups:?}"
+            );
+        }
+        assert!(
+            groups
+                .iter()
+                .any(|(hl, text)| *hl == Hl::String && text.contains("line one")),
+            "the block scalar body should be a string in {groups:?}"
+        );
+        for number in ["12", "1.5", "1", "2", "3"] {
+            assert!(
+                groups
+                    .iter()
+                    .any(|(hl, text)| *hl == Hl::Number && text == number),
+                "{number:?} should be a number in {groups:?}"
+            );
+        }
+        for literal in ["true", "null", "&base", "*base"] {
+            assert!(
+                groups
+                    .iter()
+                    .any(|(hl, text)| *hl == Hl::Constant && text == literal),
+                "{literal:?} should be a constant in {groups:?}"
+            );
+        }
+        for (hl, text) in [
+            (Hl::Type, "!!str"),
+            (Hl::Preproc, "%YAML 1.2"),
+            (Hl::Preproc, "---"),
+            (Hl::Comment, "# a note"),
+        ] {
+            assert!(
+                groups
+                    .iter()
+                    .any(|(got_hl, got)| *got_hl == hl && got == text),
+                "{text:?} should be {hl:?} in {groups:?}"
+            );
+        }
+        assert!(
+            !groups.iter().any(|(_, text)| text == "\"" || text == "'"),
+            "quotes must not be their own punctuation runs: {groups:?}"
         );
     }
 }
