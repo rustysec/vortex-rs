@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use tree_sitter::{Language, Node, Parser, Tree};
+use tree_sitter::{Language, Node, Parser, Tree, TreeCursor};
 
 use crate::buffer::Buffer;
 use crate::event::{AsyncEvent, EventTx};
@@ -1123,6 +1123,11 @@ fn inner_span(node: Node<'_>) -> Option<Span> {
 }
 
 /// Comment and string nodes overlapping `[range]` — the spell checker's input.
+///
+/// Mapping keys are left out: in JSON, YAML and TOML they are strings as far as
+/// the grammar is concerned, but they name fields rather than carry prose.  A
+/// config file full of `"description"` and `enabled:` keys was otherwise a
+/// steady stream of false positives.
 pub fn comment_and_string_spans(buffer: &Buffer, range: Span) -> Vec<Span> {
     let mut out = Vec::new();
     let Some(root) = buffer.syntax.root() else {
@@ -1160,8 +1165,21 @@ pub fn in_string_or_comment(buffer: &Buffer, at: usize) -> bool {
 }
 
 fn collect_spans(node: Node<'_>, range: Span, out: &mut Vec<Span>) {
+    let mut cursor = node.walk();
+    collect_spans_with_fields(&mut cursor, range, out);
+}
+
+/// Walk with a cursor so each node's field name is available.  JSON's `pair`,
+/// YAML's `block_mapping_pair` and TOML's `pair` all call the left-hand side
+/// `key`; skipping that whole subtree also covers YAML's `flow_node` →
+/// `plain_scalar` → `string_scalar` wrapper chain.
+fn collect_spans_with_fields(cursor: &mut TreeCursor<'_>, range: Span, out: &mut Vec<Span>) {
+    let node = cursor.node();
     let node_range = Span::new(node.start_byte(), node.end_byte());
     if node_range.end <= range.start || node_range.start >= range.end {
+        return;
+    }
+    if cursor.field_name() == Some("key") {
         return;
     }
     let kind = node.kind();
@@ -1169,8 +1187,14 @@ fn collect_spans(node: Node<'_>, range: Span, out: &mut Vec<Span>) {
         out.push(node_range);
         return; // no need to descend
     }
-    for child in node.children(&mut node.walk()) {
-        collect_spans(child, range, out);
+    if cursor.goto_first_child() {
+        loop {
+            collect_spans_with_fields(cursor, range, out);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        cursor.goto_parent();
     }
 }
 
@@ -1200,6 +1224,36 @@ mod tests {
         );
         assert!(buffer.reparse_now(), "the YAML grammar should parse");
         buffer
+    }
+
+    fn json(text: &str) -> Buffer {
+        let mut buffer = Buffer::new(
+            BufferId(1),
+            Some(std::path::PathBuf::from("sample.json")),
+            text.to_string(),
+            &EditorConfig::default(),
+        );
+        assert!(buffer.reparse_now(), "the JSON grammar should parse");
+        buffer
+    }
+
+    fn toml(text: &str) -> Buffer {
+        let mut buffer = Buffer::new(
+            BufferId(1),
+            Some(std::path::PathBuf::from("sample.toml")),
+            text.to_string(),
+            &EditorConfig::default(),
+        );
+        assert!(buffer.reparse_now(), "the TOML grammar should parse");
+        buffer
+    }
+
+    fn spell_texts(buffer: &Buffer) -> Vec<String> {
+        let text = buffer.text();
+        comment_and_string_spans(buffer, Span::new(0, buffer.len_bytes()))
+            .into_iter()
+            .map(|span| text[span.start..span.end].to_string())
+            .collect()
     }
 
     const YAML_SAMPLE: &str = concat!(
@@ -1500,5 +1554,25 @@ mod tests {
             !groups.iter().any(|(_, text)| text == "\"" || text == "'"),
             "quotes must not be their own punctuation runs: {groups:?}"
         );
+    }
+
+    #[test]
+    fn spell_spans_skip_data_keys_but_keep_values_and_comments() {
+        // JSON keys are `string` nodes and YAML keys are `string_scalar`s, so a
+        // plain "strings and comments" filter used to spell-check every field
+        // name in a config file.  Keys name fields; only values are prose.
+        let found = spell_texts(&json(
+            "{\n  \"description\": \"a coment\",\n  \"nested\": {\"key\": \"value\"}\n}\n",
+        ));
+        assert_eq!(found, ["\"a coment\"", "\"value\""]);
+
+        let found = spell_texts(&yaml(
+            "description: a coment\nflow: {key: value}\n# a coment\n",
+        ));
+        assert_eq!(found, ["a coment", "value", "# a coment"]);
+
+        // Quoted keys are strings too, and are code for the same reason.
+        let found = spell_texts(&toml("\"description\" = \"a coment\"\n# a coment\n"));
+        assert_eq!(found, ["\"a coment\"", "# a coment"]);
     }
 }

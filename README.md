@@ -350,9 +350,10 @@ line) at the working directory.
   is not an undo step of its own either:
   `u` walks back your edits and takes the formatting that followed each one with
   it. `:format` is an edit you asked for, so it undoes on its own.
-* **Spelling.** A self-contained English checker for comments and strings,
-  with suggestions (`z=`, `space E`). Identifiers, `camelCase`, paths and
-  numbers are skipped, so it stays quiet on code.
+* **Spelling.** A self-contained English checker for comments and string
+  values, with suggestions (`z=`, `space E`). Identifiers, mapping keys in
+  JSON/YAML/TOML, `camelCase`, paths and numbers are skipped, so it stays quiet
+  on code.
 * **LSP.** Off by default — `[lsp] enable = true` turns it on, which also
   implies well-known servers (rust-analyzer, pylsp, gopls, clangd) when those
   binaries are installed, or name your own under `[lsp.servers.<language>]`.

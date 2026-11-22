@@ -632,7 +632,8 @@ pub struct SpellConfig {
     /// and lets aspell/hunspell pick their own default; anything else is passed
     /// through (`--lang=` / `-d`).  The embedded list is English either way.
     pub language: String,
-    /// Only check comments and strings (uses the tree-sitter tree).
+    /// Only check comments and string values (uses the tree-sitter tree).
+    /// Mapping keys in JSON, YAML and TOML are identifiers, so they are skipped.
     pub only_comments: bool,
     /// Minimum word length to check.
     pub min_len: usize,
