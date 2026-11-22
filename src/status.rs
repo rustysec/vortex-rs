@@ -271,7 +271,16 @@ fn right_sections<'a>(
         sections.push(Section {
             text: format!("/{term} ({} match)", snapshot.search_hits).into(),
             style: if angled {
-                theme.search_match.patch(theme.status_soft)
+                // The buffer highlight is reversed to stand out over syntax
+                // colours, and the soft chips have their own ink.  Neither
+                // belongs on a filled chip: keep the search colour as the ink
+                // and borrow only the fill, so the angled separators — which
+                // carry the fills — match the block they join.
+                let mut chip = theme.search_match.remove_modifier(Modifier::REVERSED);
+                if let Some(bg) = theme.status_soft.bg {
+                    chip = chip.bg(bg);
+                }
+                chip
             } else {
                 theme.search_match
             },
@@ -666,6 +675,54 @@ mod tests {
             );
         }
         assert!(seen >= 4, "expected several separators, saw {seen}");
+    }
+
+    #[test]
+    fn search_chip_separators_match_its_fill() {
+        let area = Rect::new(0, 0, 120, 1);
+        let mut snap = snapshot();
+        snap.search = Some("foo".into());
+        snap.search_hits = 1;
+        let theme = Theme::default();
+        let mut buffer = Buffer::empty(area);
+        render(area, &mut buffer, &StatusConfig::default(), &snap, &theme);
+
+        let row: Vec<&ratatui::buffer::Cell> = (0..area.width)
+            .map(|x| buffer.cell((x, 0)).expect("cell inside the area"))
+            .collect();
+        let label = "/foo (1 match)";
+        let width = label.chars().count();
+        let start = row
+            .windows(width)
+            .position(|window| window.iter().map(|cell| cell.symbol()).collect::<String>() == label)
+            .expect("search chip is drawn");
+        let chip = &row[start..start + width];
+        // The buffer highlight is reversed so it stands out over syntax colours;
+        // a filled chip must not be, or its text flips to the fill colour while
+        // the separators still carry the fills.
+        assert!(
+            chip.iter()
+                .all(|cell| !cell.style().has_modifier(Modifier::REVERSED)),
+            "search chip inverts its colours"
+        );
+        assert!(
+            chip.iter()
+                .all(|cell| cell.style().fg == theme.search_match.fg)
+        );
+        let fill = chip[0].style().bg.expect("search chip has a fill");
+        assert_ne!(
+            Some(fill),
+            theme.search_match.fg,
+            "search ink must not be the chip fill"
+        );
+        let separator = row[start + width + 1]; // one trailing space of padding
+        assert_eq!(separator.symbol(), SEPARATOR_LEFT);
+        assert_eq!(
+            separator.style().bg,
+            Some(fill),
+            "separator does not carry the search chip's fill"
+        );
+        assert_ne!(separator.style().fg, separator.style().bg);
     }
 
     #[test]
