@@ -116,7 +116,12 @@ impl Change {
 struct UndoItem {
     group: ChangeGroup,
     at: Instant,
-    changes: Vec<UndoChange>,
+    /// The [`Buffer::apply`] calls coalesced into this step, oldest first.
+    ///
+    /// One entry per call, never flattened: the byte offsets of a call are only
+    /// valid for the text *that* call started from, so replay has to walk the
+    /// calls one at a time (see [`Buffer::undo`]).
+    batches: Vec<Vec<UndoChange>>,
     before: Selection,
     after: Selection,
     /// Redo replays a coalesced step oldest first, so this is set on every item
@@ -529,7 +534,7 @@ impl Buffer {
                 .is_some_and(|item| item.group.groups_with(group));
 
         if merge && let Some(item) = self.history.undo.last_mut() {
-            item.changes.extend(changes);
+            item.batches.push(changes);
             item.after = after;
             item.at = now;
             self.last_group_at = Some(now);
@@ -540,7 +545,7 @@ impl Buffer {
         self.history.undo.push(UndoItem {
             group,
             at: now,
-            changes,
+            batches: vec![changes],
             before,
             after,
             redo_more: false,
@@ -595,23 +600,37 @@ impl Buffer {
         if batch.is_empty() {
             return None;
         }
-        // An item's offsets are only valid for the text its own apply produced,
-        // so the newest has to go back first.
+        // Offsets are only valid for the text the change landed in, so the
+        // newest item goes back first, and inside an item the most recent
+        // `apply` goes back first too.
+        //
+        // Within one apply the walk is *ascending*.  A change's `at` counts from
+        // the beginning of the text it was made in, so putting the earliest
+        // piece back first re-creates exactly the prefix the later offsets were
+        // counted against.  A descending walk reinserts text underneath offsets
+        // that still have a change coming, and everything after the first lands
+        // in the wrong place — and because the stack below is now pointing at
+        // bytes that are no longer there, no amount of further `u` puts the file
+        // back.  Batches are the normal case, not an edge: a language server's
+        // format answer, a `gc` over a paragraph or a `d` on a block selection
+        // are all one step carrying one change per line.
         for item in batch.iter() {
-            for change in item.changes.iter().rev() {
-                let range = Span::new(change.at, change.at + change.inserted.len());
-                let first_line = self.line_of(change.at);
-                let last_line = if !change.inserted.is_empty() {
-                    self.line_of(range.end - 1)
-                } else {
-                    first_line
-                };
-                let line_delta = change.removed.matches('\n').count() as isize
-                    - change.inserted.matches('\n').count() as isize;
-                replace(&mut self.rope, range, &change.removed);
-                self.mark_lines(first_line, last_line, line_delta);
-                // Diagnostics are byte spans too; shift them back with the text.
-                self.map_diagnostics(range, change.removed.len());
+            for changes in item.batches.iter().rev() {
+                for change in changes.iter() {
+                    let range = Span::new(change.at, change.at + change.inserted.len());
+                    let first_line = self.line_of(change.at);
+                    let last_line = if !change.inserted.is_empty() {
+                        self.line_of(range.end - 1)
+                    } else {
+                        first_line
+                    };
+                    let line_delta = change.removed.matches('\n').count() as isize
+                        - change.inserted.matches('\n').count() as isize;
+                    replace(&mut self.rope, range, &change.removed);
+                    self.mark_lines(first_line, last_line, line_delta);
+                    // Diagnostics are byte spans too; shift them back with the text.
+                    self.map_diagnostics(range, change.removed.len());
+                }
             }
         }
         self.invalidate_change_log();
@@ -644,21 +663,27 @@ impl Buffer {
                 None => break,
             }
         }
+        // Forward is the undo walk the other way round: the coalesced `apply`s
+        // come back oldest first, and within one of them the changes land highest
+        // offset first, exactly as they were applied — the offsets ahead of the
+        // walk have not moved yet, so they still point at their own text.
         for item in batch.iter() {
-            for change in item.changes.iter() {
-                let range = Span::new(change.at, change.at + change.removed.len());
-                let first_line = self.line_of(change.at);
-                let last_line = if !change.removed.is_empty() {
-                    self.line_of(range.end - 1)
-                } else {
-                    first_line
-                };
-                let line_delta = change.inserted.matches('\n').count() as isize
-                    - change.removed.matches('\n').count() as isize;
-                replace(&mut self.rope, range, &change.inserted);
-                self.mark_lines(first_line, last_line, line_delta);
-                // Diagnostics are byte spans too; shift them forward with the text.
-                self.map_diagnostics(range, change.inserted.len());
+            for changes in item.batches.iter() {
+                for change in changes.iter().rev() {
+                    let range = Span::new(change.at, change.at + change.removed.len());
+                    let first_line = self.line_of(change.at);
+                    let last_line = if !change.removed.is_empty() {
+                        self.line_of(range.end - 1)
+                    } else {
+                        first_line
+                    };
+                    let line_delta = change.inserted.matches('\n').count() as isize
+                        - change.removed.matches('\n').count() as isize;
+                    replace(&mut self.rope, range, &change.inserted);
+                    self.mark_lines(first_line, last_line, line_delta);
+                    // Diagnostics are byte spans too; shift them forward with the text.
+                    self.map_diagnostics(range, change.inserted.len());
+                }
             }
         }
         self.invalidate_change_log();
@@ -1789,6 +1814,125 @@ mod tests {
         assert_eq!(buffer.undo_depth(), 1, "typing is one undo step");
         buffer.undo();
         assert_eq!(buffer.text(), "");
+    }
+
+    /// One apply carrying a change per line: a `d` over a block selection, a
+    /// `gc` on a paragraph, the edit list a language server answers a format
+    /// request with.  A batch like that has to be walked back from the front —
+    /// a change's offset is counted from the start of the text it was made in,
+    /// so putting the earliest piece back first re-creates exactly the prefix
+    /// the next offset was counted against.  From the back, the text that goes
+    /// in lands underneath offsets that still have a change coming, and
+    /// everything after the first one is restored in the wrong place.
+    #[test]
+    fn undo_walks_a_batch_of_changes_from_the_front() {
+        let original = "l1\nl2\nl3\nl4\nl5\n";
+        let mut buffer = buffer_with(original);
+        let mut selection = Selection::point(0);
+        buffer.apply(
+            vec![
+                Change::delete(12..15),
+                Change::delete(0..3),
+                Change::delete(6..9),
+            ],
+            ChangeGroup::Operator,
+            &mut selection,
+        );
+        assert_eq!(buffer.text(), "l2\nl4\n");
+
+        buffer.undo().expect("undo the batch");
+        assert_eq!(buffer.text(), original, "every line comes back");
+
+        buffer.redo().expect("redo the batch");
+        assert_eq!(buffer.text(), "l2\nl4\n", "redo lands every line again");
+    }
+
+    /// The same batch where each replacement is a different length, which is
+    /// what a reindent looks like: the offsets drift apart as soon as one
+    /// change is walked back in the wrong order.
+    #[test]
+    fn undo_walks_a_batch_that_changes_line_lengths() {
+        let original = "{\n\"a\": 1,\n\"bb\": 2\n}\n";
+        let mut buffer = buffer_with(original);
+        let mut changes = Vec::new();
+        for (line, indent) in [(1, "\t".to_string()), (2, "\t\t".to_string())] {
+            let span = Span::new(buffer.line_start(line), buffer.line_end(line));
+            changes.push(Change::replace(
+                span,
+                format!("{indent}{}", buffer.slice(span)),
+            ));
+        }
+
+        let mut selection = Selection::point(0);
+        buffer.apply(changes, ChangeGroup::Format, &mut selection);
+        assert_eq!(buffer.text(), "{\n\t\"a\": 1,\n\t\t\"bb\": 2\n}\n");
+
+        buffer.undo().expect("undo the reindent");
+        assert_eq!(buffer.text(), original);
+
+        buffer.redo().expect("redo the reindent");
+        assert_eq!(buffer.text(), "{\n\t\"a\": 1,\n\t\t\"bb\": 2\n}\n");
+    }
+
+    /// Coalescing changes into one step keeps the applies apart, and a step is
+    /// walked back one apply at a time: the offsets of a burst are only valid
+    /// for the text that burst started from.
+    #[test]
+    fn undo_walks_a_coalesced_step_burst_by_burst() {
+        let original = "aa\nbb\ncc\ndd\n";
+        let mut buffer = buffer_with(original);
+        let mut selection = Selection::point(0);
+        // Two bursts of the same group, so `record` folds them into one step.
+        buffer.apply(
+            vec![Change::delete(0..3), Change::delete(6..9)],
+            ChangeGroup::Insert,
+            &mut selection,
+        );
+        buffer.apply(
+            vec![Change::delete(0..3)],
+            ChangeGroup::Insert,
+            &mut selection,
+        );
+        assert_eq!(buffer.text(), "dd\n");
+
+        buffer.undo().expect("one step takes both bursts back");
+        assert_eq!(buffer.text(), original);
+    }
+
+    /// Every way of deleting two or more lines in a single apply, walked back
+    /// again.  Exhaustive rather than random: five lines give twenty-six
+    /// batches, and one of them replayed in the wrong order is a scrambled file
+    /// that no further `u` can repair — the offsets of everything below it are
+    /// stale from then on.
+    #[test]
+    fn every_batch_of_line_deletes_round_trips() {
+        let original = "l1\nl2\nl3\nl4\nl5\n";
+        for mask in 1u32..1 << 5 {
+            let mut buffer = buffer_with(original);
+            let mut changes = Vec::new();
+            let mut kept = String::new();
+            for line in 0..5 {
+                let span = Span::new(buffer.line_start(line), buffer.line_end(line) + 1);
+                if mask >> line & 1 == 1 {
+                    changes.push(Change::delete(span));
+                } else {
+                    kept.push_str(&buffer.slice(span));
+                }
+            }
+            if changes.len() < 2 {
+                continue;
+            }
+
+            let mut selection = Selection::point(0);
+            buffer.apply(changes, ChangeGroup::Operator, &mut selection);
+            assert_eq!(buffer.text(), kept, "mask {mask:b} deletes its lines");
+
+            buffer.undo().expect("undo the batch");
+            assert_eq!(buffer.text(), original, "mask {mask:b} comes back whole");
+
+            buffer.redo().expect("redo the batch");
+            assert_eq!(buffer.text(), kept, "mask {mask:b} goes away again");
+        }
     }
 
     /// The idle formatter rewriting the whole buffer, the way

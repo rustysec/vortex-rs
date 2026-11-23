@@ -4338,6 +4338,56 @@ mod tests {
     }
 
     #[test]
+    fn undo_walks_a_deleted_line_back_through_a_format_answer() {
+        // The gesture from the report: `dd` in a JSON file, then one `u`.  The
+        // delete itself is a single change, but the reindent the server answers
+        // with is a batch of edits landed as one step, and a batch walked back
+        // from the wrong end puts text under offsets that still have a change
+        // coming.  Nothing below it survives either: the whole stack points at
+        // bytes that are no longer there, which is why the file could not be
+        // restored by pressing `u` again.
+        let original = "{\n\"a\": 1,\n\"bb\": 2,\n\"ccc\": 3\n}\n";
+        let mut fixture = Fixture::new(original);
+        fixture.feed("jjdd");
+        let deleted = "{\n\"a\": 1,\n\"ccc\": 3\n}\n";
+        assert_eq!(fixture.text(), deleted);
+
+        let id = fixture.editor.current_buffer_id().expect("a buffer");
+        let mut edits = Vec::new();
+        for line in 1..3 {
+            let span = {
+                let buffer = fixture.editor.buffer(id).expect("a buffer");
+                Span::new(buffer.line_start(line), buffer.line_end(line))
+            };
+            let text = fixture.editor.buffer(id).expect("a buffer").slice(span);
+            edits.push(crate::lsp::TextEdit {
+                range: span,
+                new_text: format!("    {text}"),
+            });
+        }
+        fixture.editor.apply_edits(id, &edits, ChangeGroup::Format);
+        fixture
+            .editor
+            .buffer_mut(id)
+            .expect("a buffer")
+            .break_undo_group();
+        let formatted = fixture.text();
+        assert!(
+            formatted.contains("    \"a\""),
+            "the reindent should land: {formatted}"
+        );
+
+        fixture.feed("u");
+        assert_eq!(
+            fixture.text(),
+            original,
+            "one `u` walks the format run and the delete behind it back"
+        );
+        fixture.feed("ctrl-r");
+        assert_eq!(fixture.text(), formatted, "redo lands both again");
+    }
+
+    #[test]
     fn dollar_stays_on_the_last_character() {
         let mut fixture = Fixture::new("abc\nde\n");
         fixture.feed("g");
