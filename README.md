@@ -219,7 +219,10 @@ borders. The focused pane's border and label get the accent colour.
 
 The question is asked while vortex still owns the keyboard, and it is skipped
 entirely if you are already typing, so it never eats a keystroke; a terminal
-that does not answer costs 120 ms once and keeps the dark palette. If the guess
+that does not answer costs 120 ms once and keeps the dark palette.  A reply
+that takes longer than that is still recognised as a reply and dropped rather
+than handed to the editor as typing — otherwise the `:` of `rgb:` would open
+the command line and the colour channels would be typed into it.  If the guess
 is wrong, pin it:
 
 ```toml

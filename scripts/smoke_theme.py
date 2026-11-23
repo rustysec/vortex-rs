@@ -137,6 +137,74 @@ def run_late_answer(binary):
         shutil.rmtree(project, ignore_errors=True)
 
 
+class VeryLatePty(Pty):
+    """A terminal that answers only long after vortex stopped listening."""
+
+    def __init__(self, *args, delay=0.6, **kwargs):
+        self.delay = delay
+        self._scheduled = set()
+        super().__init__(*args, **kwargs)
+
+    def _answer_queries(self, chunk):
+        for index, rgb in self.answer_colors.items():
+            if index in self._scheduled:
+                continue
+            if ("\x1b]%s;?" % index).encode() in chunk:
+                self._scheduled.add(index)
+                threading.Timer(
+                    self.delay,
+                    lambda fd=self.fd, index=index, rgb=rgb: os.write(
+                        fd, color_report(index, rgb).encode()
+                    ),
+                ).start()
+
+
+def run_very_late_answer(binary):
+    """A reply that lands after the query gave up must be swallowed, not typed.
+
+    This is what a slow terminal (tmux, ssh) does.  crossterm has no OSC
+    parsing, so `ESC ] 11 ;` comes back as `Alt-]` and every byte of
+    `rgb:f8f8/f8f8/f2f2` as a keystroke: in normal mode the `:` opens the
+    command line and the channels are typed into it, and the `r` before it
+    replaces the character under the caret.
+    """
+    project = tempfile.mkdtemp(prefix="vortex-theme-")
+    try:
+        target = os.path.join(project, "notes.txt")
+        with open(target, "w") as handle:
+            handle.write("hello\n")
+        app = VeryLatePty(
+            binary,
+            project,
+            target,
+            extra_args=starter_config(project, binary),
+            answer_colors={"11": (248, 248, 242), "10": (24, 24, 24)},
+            delay=0.6,
+        )
+        # Let the late reply land before doing anything with the keyboard.
+        app.keys(b"", 1.2)
+        app.keys(b"i", 0.3)
+        app.keys(b"world ", 0.4)
+        app.keys(b"\x1b", 0.3)
+        app.keys(b":w\r", 0.8)
+        written = open(target).read()
+        check(
+            "a reply later than the query is not typed either",
+            written == "world hello\n",
+            repr(written),
+        )
+        check(
+            "no colour-report bytes reach the screen",
+            b"rgb:" not in app.raw and b"f8f8" not in app.raw,
+            repr(app.raw[-200:]),
+        )
+        for _ in range(3):
+            app.keys(b":q!\r", 0.2)
+        app.close()
+    finally:
+        shutil.rmtree(project, ignore_errors=True)
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: smoke_theme.py BINARY", file=sys.stderr)
@@ -146,6 +214,7 @@ def main():
     run(binary, "dark terminal", {"11": (24, 24, 30), "10": (220, 220, 220)})
     run(binary, "silent terminal", {})
     run_late_answer(binary)
+    run_very_late_answer(binary)
     if failures:
         print("\n%d theme checks failed: %s" % (len(failures), failures))
         return 1

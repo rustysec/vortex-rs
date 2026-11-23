@@ -107,6 +107,13 @@ pub fn terminal() -> Result<Terminal> {
 /// never answers does not make startup feel slow.
 pub const COLOR_QUERY_TIMEOUT: Duration = Duration::from_millis(120);
 
+/// A gap this long in arriving bytes means the terminal is done answering.
+const REPLY_QUIET: Duration = Duration::from_millis(30);
+
+/// How long to keep swallowing bytes that are still on their way, so a reply
+/// the query gave up on cannot stall startup.
+const SWALLOW_LIMIT: Duration = Duration::from_millis(300);
+
 /// Ask the terminal for its own background and foreground colours (OSC 11/10).
 ///
 /// This reads raw bytes from stdin, so it has to run while vortex still owns
@@ -156,7 +163,7 @@ pub fn query_colors(timeout: Duration) -> Observed {
         // short idle gap only applies once there is nothing left to wait for.
         let owed = observed.background.is_none() || observed.foreground.is_none();
         let wait = if any_reply && !owed {
-            Duration::from_millis(30).min(remaining)
+            REPLY_QUIET.min(remaining)
         } else {
             remaining
         };
@@ -186,8 +193,30 @@ pub fn query_colors(timeout: Duration) -> Observed {
             break;
         }
     }
+    // Bytes we walked away from are still on their way.  This is the only place
+    // they can be caught: the tail of a report carries no `ESC ]`, so once the
+    // input reader turns it into keys nothing downstream can tell it from
+    // typing — and in normal mode `rgb:` opens the command line and paints the
+    // channels in it.
+    if any_reply && (observed.background.is_none() || observed.foreground.is_none()) {
+        swallow_leftovers();
+    }
     observed
 }
+
+/// Read and throw away whatever is still arriving, until the tty goes quiet.
+#[cfg(unix)]
+fn swallow_leftovers() {
+    let deadline = Instant::now() + SWALLOW_LIMIT;
+    while Instant::now() < deadline && stdin_readable(REPLY_QUIET) {
+        if read_byte().is_none() {
+            break;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn swallow_leftovers() {}
 
 /// Parse `ESC ] <index> ; <colour> BEL|ST`, the reply to a colour query.
 pub fn parse_report(bytes: &[u8]) -> Option<(u16, Rgb)> {
@@ -243,15 +272,31 @@ fn scale_channel(hex: &str) -> Option<u8> {
 fn read_byte() -> Option<u8> {
     use std::os::fd::AsRawFd;
     let mut byte = [0u8; 1];
-    // SAFETY: writing one byte into `byte`, on a descriptor we own.
-    let read = unsafe {
-        libc::read(
-            io::stdin().as_raw_fd(),
-            byte.as_mut_ptr().cast::<libc::c_void>(),
-            1,
-        )
-    };
-    if read == 1 { Some(byte[0]) } else { None }
+    loop {
+        // SAFETY: writing one byte into `byte`, on a descriptor we own.
+        let read = unsafe {
+            libc::read(
+                io::stdin().as_raw_fd(),
+                byte.as_mut_ptr().cast::<libc::c_void>(),
+                1,
+            )
+        };
+        if read == 1 {
+            return Some(byte[0]);
+        }
+        if read < 0 && interrupted() {
+            // A resize lands here as a signal; giving up now would leave half a
+            // report in the tty buffer for the input reader to hand back.
+            continue;
+        }
+        return None;
+    }
+}
+
+/// Did the last call fail only because a signal arrived?
+#[cfg(unix)]
+fn interrupted() -> bool {
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
 }
 
 #[cfg(not(unix))]
@@ -263,16 +308,30 @@ fn read_byte() -> Option<u8> {
 #[cfg(unix)]
 fn stdin_readable(timeout: Duration) -> bool {
     use std::os::fd::AsRawFd;
-    let mut descriptor = libc::pollfd {
-        fd: io::stdin().as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: polling one descriptor that we do not read unless poll says it is
-    // ready.  `stdin` is valid for the whole call.
-    let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
-    ready > 0 && descriptor.revents & libc::POLLIN != 0
+    // A signal makes `poll` come back early, which is not the same answer as
+    // "nothing is waiting".  A resize right after entering the alternate screen
+    // is the usual candidate, and treating it as a timeout abandons a reply
+    // half-read.
+    let until = Instant::now() + timeout;
+    loop {
+        let remaining = until.saturating_duration_since(Instant::now());
+        let mut descriptor = libc::pollfd {
+            fd: io::stdin().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: polling one descriptor that we do not read unless poll says it
+        // is ready.  `stdin` is valid for the whole call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if ready < 0 {
+            if interrupted() && remaining > Duration::ZERO {
+                continue;
+            }
+            return false;
+        }
+        return ready > 0 && descriptor.revents & libc::POLLIN != 0;
+    }
 }
 
 /// Without `poll` there is no way to ask without blocking, so do not try.
