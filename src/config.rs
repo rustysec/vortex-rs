@@ -756,6 +756,29 @@ pub struct Config {
     pub keymap: BTreeMap<String, BTreeMap<String, String>>,
 }
 
+/// The directory holding `vortex/config.toml`.
+///
+/// Deliberately not [`dirs::config_dir`]: that returns a platform-specific
+/// location (e.g. `~/Library/Application Support` on macOS) the documented
+/// lookup never mentions.  The config lives in `$XDG_CONFIG_HOME` or, failing
+/// that, `~/.config` on every platform, matching the module docs and README.
+fn config_dir() -> Option<PathBuf> {
+    config_dir_from(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir())
+}
+
+/// Pure logic behind [`config_dir`], kept separate so tests can drive it
+/// without touching the environment.  A relative `$XDG_CONFIG_HOME` is ignored
+/// as the XDG spec requires.
+fn config_dir_from(xdg: Option<std::ffi::OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = xdg {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    home.map(|home| home.join(".config"))
+}
+
 impl Config {
     /// A documented starter configuration, written by `vortex --write-config`.
     pub fn default_config_text() -> &'static str {
@@ -770,7 +793,7 @@ impl Config {
                 return Some(path);
             }
         }
-        dirs::config_dir().map(|dir| dir.join("vortex").join("config.toml"))
+        config_dir().map(|dir| dir.join("vortex").join("config.toml"))
     }
 
     /// Load configuration from disk, falling back to defaults.
@@ -1517,5 +1540,66 @@ mod tests {
         assert!(config.set_value("lsp.sync", "sometimes").is_err());
         config.set_value("lsp.sync", "full").expect("sets");
         assert_eq!(config.value_of("lsp.sync").as_deref(), Some("full"));
+    }
+
+    #[test]
+    fn config_dir_prefers_absolute_xdg_config_home() {
+        let home = PathBuf::from("/home/someone");
+        let xdg = Some(std::ffi::OsString::from("/etc/xdg-config"));
+        assert_eq!(
+            config_dir_from(xdg, Some(home)),
+            Some(PathBuf::from("/etc/xdg-config"))
+        );
+    }
+
+    #[test]
+    fn config_dir_falls_back_to_dot_config_when_xdg_is_unset_or_relative() {
+        let home = PathBuf::from("/home/someone");
+        assert_eq!(
+            config_dir_from(None, Some(home.clone())),
+            Some(home.join(".config"))
+        );
+        // A relative $XDG_CONFIG_HOME is ignored, per the XDG spec.
+        assert_eq!(
+            config_dir_from(
+                Some(std::ffi::OsString::from("relative/config")),
+                Some(home)
+            ),
+            Some(PathBuf::from("/home/someone/.config"))
+        );
+    }
+
+    #[test]
+    fn config_dir_is_none_without_home() {
+        assert_eq!(config_dir_from(None, None), None);
+        // Even a relative xdg with no home left holds nothing.
+        assert_eq!(
+            config_dir_from(Some(std::ffi::OsString::from("rel")), None),
+            None
+        );
+    }
+
+    #[test]
+    fn default_path_is_the_documented_location() {
+        // When VORTEX_CONFIG points at a real file it wins, and nothing
+        // else in this test is meaningful.
+        let env_var = std::env::var_os("VORTEX_CONFIG").map(PathBuf::from);
+        if env_var.as_ref().is_some_and(|path| path.exists()) {
+            return;
+        }
+        let expected_marker = Path::new("vortex").join("config.toml");
+        let home = dirs::home_dir();
+        let path = Config::default_path();
+        match std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+            Some(xdg) if xdg.is_absolute() => {
+                assert_eq!(path, Some(xdg.join(expected_marker)));
+            }
+            _ => match home {
+                Some(home) => {
+                    assert_eq!(path, Some(home.join(".config").join(expected_marker)));
+                }
+                None => assert_eq!(path, None),
+            },
+        }
     }
 }
