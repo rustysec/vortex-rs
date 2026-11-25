@@ -217,6 +217,14 @@ parts of the UI be measured blends of your own colours instead of invented
 ones — the cursor line, selection, line-number gutter and unfocused pane
 borders. The focused pane's border and label get the accent colour.
 
+Cards — pickers, the `:` popup, completion, the diagnostic float — follow the
+same accent: the outline is the one a focused pane wears, and the title is a
+filled chip in the hue of whatever the card lists (files cyan, grep yellow, a
+language server's locations blue).  The highlighted row gets a bar one step
+stronger than the buffer's selection plus a rail against the border, so it reads
+as chosen even with the palette switched off.  `[theme] overlay-*` and
+`[theme] picker-*` restyle any of it.
+
 The question is asked while vortex still owns the keyboard, and it is skipped
 entirely if you are already typing, so it never eats a keystroke; a terminal
 that does not answer costs 120 ms once and keeps the dark palette.  A reply
@@ -287,10 +295,12 @@ case-sensitive = false        # check "Hello" as typed rather than as "hello"
 
 [theme]
 background = "auto"           # ask the terminal; or "dark" / "light"
-accent = ""                   # focused pane border and label
+accent = ""                   # focused pane border, modal outline, picker rail
 # "colour", "bold", "italic", "underline", "dim", "on <colour>", "#rrggbb", "color13"
 keyword = "magenta bold"
 search-match = "black on yellow"
+overlay-title = ""            # set it and every card title takes this one colour
+picker-selected = "black on bright-cyan"
 
 [keymap.normal]
 space d = "show-diagnostics"

@@ -26,12 +26,19 @@ use crate::prompt;
 use crate::selection::{Selection, Span};
 use crate::status::{self, Snapshot};
 use crate::syntax;
-use crate::theme::Theme;
+use crate::theme::{Theme, Tone};
 
 /// Most rows a picker preview may take.  A preview is a glance at the selected
 /// row, not a document viewer: past a few lines it would crowd out the list it
 /// is meant to explain.
 const MAX_PREVIEW_ROWS: usize = 6;
+
+/// The rail in a highlighted row, against the card's left border.
+///
+/// A half block rather than an arrow: every font a terminal ships has it, and
+/// flush against the border it reads as part of the card rather than as a glyph
+/// the file happened to contain.
+const SELECT_MARKER: &str = "\u{258c}";
 
 /// Transient text drawn on a card over the panes: an open prompt, a message or
 /// the echo of a partial key sequence.
@@ -82,6 +89,8 @@ pub struct Picker<'a> {
     /// half of the card.  Only the search pickers populate it; a plain list
     /// keeps the full-width layout.
     pub preview: Option<FilePreview<'a>>,
+    /// What the card is listing, for the hue of its title chip.
+    pub tone: Tone,
 }
 
 /// A file preview drawn beside the search pickers' candidate list.
@@ -1724,27 +1733,20 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
             paint_cell(buf, x, y, " ", theme.overlay);
         }
     }
-    for x in area.left()..area.right() {
-        buf[(x, area.y)].set_symbol(set.horizontal_top);
-        buf[(x, area.bottom() - 1)].set_symbol(set.horizontal_bottom);
-    }
-    for y in area.top()..area.bottom() {
-        buf[(area.x, y)].set_symbol(set.vertical_left);
-        buf[(area.right() - 1, y)].set_symbol(set.vertical_right);
-    }
-    buf[(area.x, area.y)].set_symbol(set.top_left);
-    buf[(area.right() - 1, area.y)].set_symbol(set.top_right);
-    buf[(area.x, area.bottom() - 1)].set_symbol(set.bottom_left);
-    buf[(area.right() - 1, area.bottom() - 1)].set_symbol(set.bottom_right);
     for row in area.rows() {
         buf.set_style(row, style);
     }
+    // The outline wears the accent: a modal is the focused thing on screen, which
+    // is precisely what the focused pane's border already means.
+    draw_card_frame(buf, area, set, theme.overlay_border);
+    // The title is a filled chip — the status row's accent chip, in a new place —
+    // tinted with the hue of whatever the card happens to be listing.
     buf.set_stringn(
         area.x + 2,
         area.y,
         format!(" {} ", picker.title),
         area.width.saturating_sub(2) as usize,
-        theme.label_focused,
+        theme.title_style(picker.tone),
     );
 
     // A file preview turns the card into two columns: candidates on the left,
@@ -1807,15 +1809,29 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
             continue;
         };
         let selected = first_row + row == picker.selected;
-        let base = if selected {
-            theme
-                .selection
-                .patch(Style::default().add_modifier(Modifier::BOLD))
-        } else {
-            theme.text
+        // The highlighted row is a bar across the column, one step stronger than
+        // the buffer's selection: inside a card nothing else is competing with it.
+        let base = {
+            let mut style = theme.text.patch(theme.tone(item.tone));
+            if selected {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            style
         };
-        for column in (area.x + 2)..split_x.min(area.right().saturating_sub(1)) {
-            buf[(column, y)].set_style(if selected { theme.selection } else { style });
+        if selected {
+            for column in (area.x + 1)..split_x.min(area.right().saturating_sub(1)) {
+                paint_cell(buf, column, y, " ", theme.picker_selected);
+            }
+            // The marker says which row Enter takes even where the bar's colour
+            // does not survive: a terminal with the palette switched off, or a
+            // reader who finds shapes faster than shades.
+            paint_cell(
+                buf,
+                area.x + 1,
+                y,
+                SELECT_MARKER,
+                theme.picker_selected.patch(theme.picker_cursor),
+            );
         }
         let label_limit = split_x.saturating_sub(area.x + 3) as usize;
         emit(buf, area.x + 3, y, &item.label, base, 0, label_limit);
@@ -1827,7 +1843,7 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
                     area.x + 3,
                     y,
                     &format!("{}{}", " ".repeat(2), detail),
-                    theme.status_inactive,
+                    theme.picker_detail,
                     used,
                     label_limit,
                 );
@@ -1854,7 +1870,7 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
                 area.x + 2,
                 y,
                 line,
-                theme.status_inactive,
+                theme.picker_detail,
                 0,
                 preview_limit,
             );
@@ -1866,9 +1882,9 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
     // this only windows and colours the runs it is given.
     if let Some(preview) = picker.preview.as_ref().filter(|_| show_preview) {
         for y in list_top..count_y {
-            buf[(split_x, y)]
-                .set_symbol(set.vertical_left)
-                .set_style(style);
+            // The rule is the quiet border rather than the accent frame: it
+            // divides two halves of one card, it is not another card.
+            paint_cell(buf, split_x, y, set.vertical_left, theme.border);
         }
         draw_file_preview(buf, area, split_x, list_top, count_y, preview, theme);
     }
@@ -1879,7 +1895,7 @@ fn draw_picker(buf: &mut Buffer, screen: Rect, picker: &Picker, theme: &Theme) -
         area.x + 2,
         area.bottom().saturating_sub(1),
         &format!(" {}/{} match", picker.selected + 1, picker.visible.len()),
-        theme.status_inactive,
+        theme.picker_detail,
         0,
         area.width.saturating_sub(2) as usize,
     );
@@ -1911,13 +1927,13 @@ fn draw_file_preview(
     if right <= x || top >= bottom || preview.lines.is_empty() {
         return;
     }
-    // Header: the file's path, dimmed, on the pane's first row.
+    // Header: the file's path, in the card's quiet text, on the pane's first row.
     emit(
         buf,
         x,
         top,
         preview.path,
-        theme.status_inactive,
+        theme.picker_detail,
         0,
         (right - x) as usize,
     );
@@ -1953,7 +1969,7 @@ fn draw_file_preview(
             if focused {
                 theme.label_focused
             } else {
-                theme.status_inactive
+                theme.picker_detail
             },
             0,
             (gutter + 1) as usize,
@@ -1989,11 +2005,11 @@ fn digit_width(n: usize) -> usize {
     width
 }
 
-/// Paint a solid bordered card and return the area inside it.
+/// Paint a solid bordered card: the same surface and outline a picker gets, so
+/// no two overlays can drift apart.
 ///
 /// The card is opaque on purpose: text bleeding through an overlay is
-/// unreadable.  Shared by the completion popup and the diagnostic float so the
-/// two cannot drift apart.
+/// unreadable.
 fn draw_card(buf: &mut Buffer, area: Rect, theme: &Theme) {
     // `paint_cell` clears stale styles: an underline on the buffer underneath
     // (spellcheck, markdown decoration) must not bleed through the card.
@@ -2002,19 +2018,46 @@ fn draw_card(buf: &mut Buffer, area: Rect, theme: &Theme) {
             paint_cell(buf, column, row, " ", theme.overlay);
         }
     }
-    let set = border::ROUNDED;
+    draw_card_frame(buf, area, border::ROUNDED, theme.overlay_border);
+}
+
+/// A card's outline, drawn over a fill [`paint_cell`] has already squared off.
+fn draw_card_frame(buf: &mut Buffer, area: Rect, set: border::Set, style: Style) {
+    let bottom = area.bottom() - 1;
+    let right = area.right() - 1;
     for column in area.left()..area.right() {
-        buf[(column, area.y)].set_symbol(set.horizontal_top);
-        buf[(column, area.bottom() - 1)].set_symbol(set.horizontal_bottom);
+        paint_cell(buf, column, area.y, set.horizontal_top, style);
+        paint_cell(buf, column, bottom, set.horizontal_bottom, style);
     }
     for row in area.top()..area.bottom() {
-        buf[(area.x, row)].set_symbol(set.vertical_left);
-        buf[(area.right() - 1, row)].set_symbol(set.vertical_right);
+        paint_cell(buf, area.x, row, set.vertical_left, style);
+        paint_cell(buf, right, row, set.vertical_right, style);
     }
-    buf[(area.x, area.y)].set_symbol(set.top_left);
-    buf[(area.right() - 1, area.y)].set_symbol(set.top_right);
-    buf[(area.x, area.bottom() - 1)].set_symbol(set.bottom_left);
-    buf[(area.right() - 1, area.bottom() - 1)].set_symbol(set.bottom_right);
+    paint_cell(buf, area.x, area.y, set.top_left, style);
+    paint_cell(buf, right, area.y, set.top_right, style);
+    paint_cell(buf, area.x, bottom, set.bottom_left, style);
+    paint_cell(buf, right, bottom, set.bottom_right, style);
+}
+
+/// The colour of a completion item's kind label, in the hue its kind of thing
+/// gets in the buffer: a function reads as a function, a field as a field.
+///
+/// Kinds with no counterpart in the highlight groups — a snippet, a folder —
+/// keep the plain detail colour rather than being forced into one.
+fn completion_kind_style(kind: Option<u64>, theme: &Theme) -> Style {
+    let detail = theme.picker_detail;
+    let hl = match kind {
+        Some(2) | Some(3) => syntax::Hl::Function,
+        Some(4) | Some(7) | Some(8) | Some(13) | Some(22) | Some(23) | Some(25) => syntax::Hl::Type,
+        Some(5) | Some(6) | Some(10) | Some(20) => syntax::Hl::Property,
+        Some(21) => syntax::Hl::Constant,
+        Some(9) => syntax::Hl::Constant,
+        Some(14) => syntax::Hl::Keyword,
+        Some(15) => syntax::Hl::String,
+        Some(24) => syntax::Hl::Operator,
+        _ => return detail,
+    };
+    detail.patch(theme.highlight(hl))
 }
 
 /// Draw the completion popup hanging off the caret.
@@ -2081,43 +2124,50 @@ fn draw_completion(
     for (row, item) in items.iter().enumerate().skip(first).take(visible_rows) {
         let y = area.y + 1 + (row - first) as u16;
         let selected = row == completion.selected;
-        let base = if selected {
-            theme
-                .selection
-                .patch(Style::default().add_modifier(Modifier::BOLD))
-        } else {
-            theme.text
-        };
+        let mut base = theme.text;
         if selected {
+            base = base.add_modifier(Modifier::BOLD);
             for column in (area.x + 1)..area.right().saturating_sub(1) {
-                buf[(column, y)].set_style(theme.selection);
+                paint_cell(buf, column, y, " ", theme.picker_selected);
             }
+            // The rail notches the frame rather than taking a column of its own:
+            // this popup is only as wide as the labels it holds.
+            paint_cell(
+                buf,
+                area.x,
+                y,
+                SELECT_MARKER,
+                theme.picker_selected.patch(theme.picker_cursor),
+            );
         }
         let limit = area.width.saturating_sub(2) as usize;
-        emit(buf, area.x + 1, y, &item.label, base, 0, limit);
-        let mut detail = String::new();
+        let mut column = emit(buf, area.x + 1, y, &item.label, base, 0, limit);
+        // The kind the server named, in the hue that kind of thing is written in
+        // inside a buffer.
         let kind = item.kind_label();
         if !kind.is_empty() {
-            detail.push(' ');
-            detail.push_str(kind);
+            column += 1;
+            column += emit(
+                buf,
+                area.x + 1,
+                y,
+                kind,
+                completion_kind_style(item.kind, theme),
+                column,
+                limit,
+            );
         }
         if let Some(extra) = &item.detail {
-            detail.push(' ');
-            detail.push_str(extra);
-        }
-        if !detail.is_empty() {
-            let used = item.label.chars().count() + 1;
-            if used + 2 < limit {
-                emit(
-                    buf,
-                    area.x + 1,
-                    y,
-                    &detail,
-                    theme.status_inactive,
-                    used,
-                    limit,
-                );
-            }
+            column += 1;
+            emit(
+                buf,
+                area.x + 1,
+                y,
+                extra,
+                theme.picker_detail,
+                column,
+                limit,
+            );
         }
     }
 }
@@ -2314,8 +2364,17 @@ mod tests {
     use super::*;
     use crate::buffer::{Buffer as TextBuffer, BufferId};
     use crate::config::Config;
+    use crate::config::ThemeConfig;
     use crate::editor::Editor;
     use crate::layout::Pane;
+    use crate::theme::Observed;
+    use ratatui::style::Color;
+
+    /// A terminal that answered the colour query: dark, with a light ink.
+    const MEASURED: Observed = Observed {
+        background: Some((30, 30, 30)),
+        foreground: Some((220, 220, 220)),
+    };
 
     fn editor_with(text: &str) -> Editor {
         let mut editor = Editor::new(Config::default());
@@ -3307,6 +3366,7 @@ mod tests {
             visible: &[0],
             items: &items,
             selected: 0,
+            tone: Tone::Neutral,
             preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3349,6 +3409,7 @@ mod tests {
             visible: &[0],
             items: &items,
             selected: 0,
+            tone: Tone::Neutral,
             preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3386,6 +3447,7 @@ mod tests {
             visible: &[0, 1],
             items: &items,
             selected: 0,
+            tone: Tone::Neutral,
             preview: None,
         };
         let cursor = draw_picker(&mut buffer, area, &picker, &theme).expect("a cursor");
@@ -3415,6 +3477,7 @@ mod tests {
             visible: &[0, 1],
             items: &items,
             selected: 0,
+            tone: Tone::Neutral,
             preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3443,6 +3506,7 @@ mod tests {
             visible: &[0, 1],
             items: &items,
             selected: 1,
+            tone: Tone::Neutral,
             preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3469,6 +3533,7 @@ mod tests {
             visible: &visible,
             items: &items,
             selected: 0,
+            tone: Tone::Neutral,
             preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3503,6 +3568,7 @@ mod tests {
             visible: &[0, 1],
             items: &items,
             selected: 0,
+            tone: Tone::Neutral,
             preview: Some(preview),
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3541,6 +3607,7 @@ mod tests {
             visible: &[0],
             items: &items,
             selected: 0,
+            tone: Tone::Neutral,
             preview: Some(preview),
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3600,6 +3667,7 @@ mod tests {
             visible: &visible,
             items: &items,
             selected: 499,
+            tone: Tone::Neutral,
             preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3640,6 +3708,7 @@ mod tests {
             visible: &[0],
             items: &items,
             selected: 0,
+            tone: Tone::Neutral,
             preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3826,6 +3895,7 @@ mod tests {
             visible: &[0],
             items: &items,
             selected: 0,
+            tone: Tone::Neutral,
             preview: None,
         };
         draw_picker(&mut buffer, area, &picker, &Theme::default());
@@ -3859,5 +3929,180 @@ mod tests {
         assert_eq!(rows[2].line, Some(2));
         assert_eq!(rows[3].line, None, "the empty line after the final newline");
         let _ = Pane::new(crate::layout::PaneId(0), BufferId(1));
+    }
+
+    /// The top-left corner of a drawn card.
+    fn card_corner(buffer: &Buffer, area: Rect) -> (u16, u16) {
+        let (top, _) = card_rows(buffer, area);
+        let left = (0..area.width)
+            .find(|&column| buffer[(column, top)].symbol() == "\u{256d}")
+            .expect("the card has a top-left corner");
+        (left, top)
+    }
+
+    /// A find picker over `items` with every row visible.
+    fn picker_over<'a>(
+        items: &'a [prompt::Item],
+        visible: &'a [usize],
+        selected: usize,
+    ) -> Picker<'a> {
+        Picker {
+            prompt: "> ",
+            title: "find",
+            input: "",
+            caret: 0,
+            suffix: "",
+            visible,
+            items,
+            selected,
+            tone: Tone::File,
+            preview: None,
+        }
+    }
+
+    #[test]
+    fn a_card_frames_itself_in_the_accent_and_fills_its_title() {
+        // A modal is the focused thing on screen, so its outline is the accent the
+        // focused pane's border already means; the title is a chip, not a word
+        // floating across the border.
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::default();
+        let items = vec![prompt::Item::new("src/main.rs")];
+        let picker = picker_over(&items, &[0], 0);
+        draw_picker(&mut buffer, area, &picker, &theme);
+
+        let (left, top) = card_corner(&buffer, area);
+        assert_eq!(buffer[(left, top)].style().fg, Some(theme.accent));
+        assert_eq!(
+            buffer[(left + 3, top)].style().fg,
+            theme.title_style(Tone::File).fg,
+            "the title is tinted with the family's hue"
+        );
+        assert!(
+            buffer[(left + 3, top)].style().bg.is_some(),
+            "the title needs a fill of its own to read as a chip"
+        );
+    }
+
+    #[test]
+    fn a_card_covers_the_buffer_rather_than_tinting_it() {
+        // The card is opaque and nothing more: one row below its bottom border is
+        // still the buffer's own, which is what keeps a tall card from hiding the
+        // word the caret is on.  A card that shaded its surroundings cost a row of
+        // text on every side for a decoration.
+        let area = Rect::new(0, 0, 60, 12);
+        let items = vec![prompt::Item::new("src/main.rs")];
+        let picker = picker_over(&items, &[0], 0);
+        let theme = Theme::with_observed(&ThemeConfig::default(), MEASURED);
+        let mut buffer = Buffer::empty(area);
+        draw_picker(&mut buffer, area, &picker, &theme);
+
+        let (left, top) = card_corner(&buffer, area);
+        let (_, bottom) = card_rows(&buffer, area);
+        assert_eq!(
+            buffer[(left + 2, bottom + 1)].style().bg,
+            Some(Color::Reset)
+        );
+        let right = (0..area.width)
+            .rev()
+            .find(|&column| buffer[(column, top)].symbol() == "\u{256e}")
+            .expect("the card has a top-right corner");
+        assert_eq!(buffer[(right + 1, top + 1)].style().bg, Some(Color::Reset));
+        // Inside the border, the card's own surface.
+        assert_eq!(buffer[(left + 2, top + 1)].style().bg, theme.overlay.bg);
+    }
+
+    #[test]
+    fn the_highlighted_row_gets_a_rail_and_a_bar() {
+        // The bar is colour, which a switched palette loses; the rail is a shape,
+        // which it cannot.
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::with_observed(&ThemeConfig::default(), MEASURED);
+        let items = vec![
+            prompt::Item::new("src/main.rs"),
+            prompt::Item::new("src/ui.rs"),
+            prompt::Item::new("src/app.rs"),
+        ];
+        let picker = picker_over(&items, &[0, 1, 2], 1);
+        draw_picker(&mut buffer, area, &picker, &theme);
+
+        let (left, top) = card_corner(&buffer, area);
+        let chosen = top + 3; // input row, then the list from top + 2
+        assert_eq!(buffer[(left + 1, chosen)].symbol(), SELECT_MARKER);
+        assert_eq!(
+            buffer[(left + 4, chosen)].style().bg,
+            theme.picker_selected.bg,
+            "the row is a bar across the column"
+        );
+        for row in [top + 2, top + 4] {
+            assert_eq!(buffer[(left + 1, row)].symbol(), " ");
+            assert_ne!(buffer[(left + 4, row)].style().bg, theme.picker_selected.bg);
+        }
+    }
+
+    #[test]
+    fn a_row_wears_the_tone_of_what_it_reports() {
+        let area = Rect::new(0, 0, 60, 12);
+        let theme = Theme::default();
+        let items = vec![
+            prompt::Item::new("12:4").tone(Tone::Error),
+            prompt::Item::new("18:2").tone(Tone::Warning),
+            prompt::Item::new("3:1"),
+        ];
+        let mut buffer = Buffer::empty(area);
+        let picker = picker_over(&items, &[0, 1, 2], 0);
+        draw_picker(&mut buffer, area, &picker, &theme);
+
+        let (left, top) = card_corner(&buffer, area);
+        assert_eq!(
+            buffer[(left + 3, top + 2)].style().fg,
+            theme.tone(Tone::Error).fg
+        );
+        assert_eq!(
+            buffer[(left + 3, top + 3)].style().fg,
+            theme.tone(Tone::Warning).fg
+        );
+        // Unclassified rows stay plain text — the terminal's own colour, which
+        // ratatui spells `Reset` — or nothing would read as classified.
+        assert_eq!(buffer[(left + 3, top + 4)].style().fg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn a_completion_kind_wears_the_hue_of_that_kind_of_thing() {
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::default();
+        let items = vec![crate::lsp::CompletionItem {
+            label: "width".into(),
+            insert_text: "width".into(),
+            snippet: false,
+            kind: Some(5),
+            detail: Some("usize".into()),
+            documentation: None,
+            replace: None,
+        }];
+        let completion =
+            crate::completion::Completion::new(crate::buffer::BufferId(1), 1, 0, items);
+        draw_completion(
+            &mut buffer,
+            area,
+            Position { x: 4, y: 3 },
+            &CompletionView {
+                completion: &completion,
+            },
+            &theme,
+        );
+
+        // A field is coloured as a field is coloured in the buffer, and the label
+        // next to it is left alone.
+        let hue = theme.highlight(syntax::Hl::Property).fg;
+        let painted = (0..area.height).any(|row| {
+            (0..area.width).any(|column| {
+                buffer[(column, row)].symbol() == "f" && buffer[(column, row)].style().fg == hue
+            })
+        });
+        assert!(painted, "the `field` column should wear the property hue");
     }
 }

@@ -14,6 +14,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::config::{Background, ThemeConfig};
+use crate::diagnostic::Severity;
 use crate::syntax::Hl;
 
 /// An RGB triple, as the terminal reports it.
@@ -225,11 +226,65 @@ pub fn parse_style(text: &str) -> Style {
     style
 }
 
+/// What a card, or a row in one, *is* — expressed in the palette's hues.
+///
+/// Nothing here is a literal colour: a search picker is the terminal's yellow,
+/// whatever that terminal happens to call yellow.  That is the whole point of
+/// the enum — the app names the kind of thing, the theme decides the shade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tone {
+    /// No opinion.  A card title takes the accent, a row stays plain text.
+    #[default]
+    Neutral,
+    /// Files, buffers and paths.
+    File,
+    /// Search patterns and their hits.
+    Search,
+    /// Locations a language server named — definitions, references.
+    Location,
+    /// Commands and the parameters they ask for.
+    Command,
+    /// Literal text: a spelling fix, a replacement string.
+    Literal,
+    /// A problem, graded.
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+impl From<Severity> for Tone {
+    fn from(severity: Severity) -> Self {
+        match severity {
+            Severity::Error => Self::Error,
+            Severity::Warning => Self::Warning,
+            Severity::Info => Self::Info,
+            Severity::Hint => Self::Hint,
+        }
+    }
+}
+
+/// The scheme's six working hues, kept around so the quiet chrome can borrow
+/// them; [`Theme::default_for`] builds them once per scheme.
+#[derive(Debug, Clone, Copy)]
+struct Hues {
+    red: Color,
+    green: Color,
+    yellow: Color,
+    blue: Color,
+    magenta: Color,
+    cyan: Color,
+    grey: Color,
+}
+
 /// Every style vortex draws with.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     /// Which darkness this palette was built for.
     pub scheme: Scheme,
+    /// The accent colour: the focused pane's border, a card's outline, the
+    /// marker in a picker's selected row.
+    pub accent: Color,
     pub text: Style,
     pub mode_normal: Style,
     pub mode_insert: Style,
@@ -253,6 +308,20 @@ pub struct Theme {
     /// The card a picker or palette sits on.  Deliberately a solid background:
     /// an overlay that lets the text behind it show through is unreadable.
     pub overlay: Style,
+    /// A card's outline.  A modal is the focused thing on screen, so it takes
+    /// the accent the focused pane's border takes.
+    pub overlay_border: Style,
+    /// A card's title, filled the way the status row fills its accent chip.
+    pub overlay_title: Style,
+    /// The highlighted row of a picker or completion list.  A step stronger than
+    /// the buffer's selection, which shares its space with syntax colours; this
+    /// one does not.
+    pub picker_selected: Style,
+    /// The marker in the highlighted row's gutter, so the row reads as chosen by
+    /// shape as well as by colour.
+    pub picker_cursor: Style,
+    /// A picker's secondary text: the detail column, the preview, the count line.
+    pub picker_detail: Style,
     pub status: Style,
     pub status_inactive: Style,
     /// Base fill of the angled status row: the bar behind the segments.
@@ -277,6 +346,11 @@ pub struct Theme {
     tag: Style,
     preproc: Style,
     parse_error: Style,
+    /// The scheme's hues, for the family and severity tints a picker uses.
+    hues: Hues,
+    /// `[theme] overlay-title` was set by hand, so it wins over a card's family
+    /// hue rather than being tinted by it.
+    title_hue_locked: bool,
 }
 
 impl Default for Theme {
@@ -314,8 +388,18 @@ impl Theme {
         if dark {
             comment = comment.add_modifier(Modifier::DIM);
         }
+        let hues = Hues {
+            red,
+            green,
+            yellow,
+            blue,
+            magenta,
+            cyan,
+            grey,
+        };
         Self {
             scheme,
+            accent: scheme.accent(),
             text: Style::default(),
             mode_normal: Style::default()
                 .add_modifier(Modifier::REVERSED)
@@ -349,6 +433,17 @@ impl Theme {
             // A solid surface, so the overlay reads as a card laid over the
             // buffer rather than as text written on top of other text.
             overlay: Style::default().bg(hue(Color::Black, Color::White)),
+            // With nothing measured the chrome is 16-colour only: the outline in
+            // the accent, the title on the same fill the status chips use, and no
+            // shadow at all rather than a guess at one.
+            overlay_border: bold(scheme.accent()),
+            overlay_title: Style::default()
+                .fg(scheme.accent())
+                .bg(hue(Color::DarkGray, Color::Gray))
+                .add_modifier(Modifier::BOLD),
+            picker_selected: Style::default().add_modifier(Modifier::REVERSED),
+            picker_cursor: bold(scheme.accent()),
+            picker_detail: Style::default().add_modifier(Modifier::DIM),
             status: Style::default().add_modifier(Modifier::BOLD),
             status_inactive: Style::default().add_modifier(Modifier::DIM),
             // The angled bar: a dark/light strip the segments sit on.  Primary
@@ -390,6 +485,8 @@ impl Theme {
             tag: bold(green),
             preproc: Style::default().fg(cyan),
             parse_error: underlined(red),
+            hues,
+            title_hue_locked: false,
         }
     }
 
@@ -402,6 +499,11 @@ impl Theme {
         let scheme = Scheme::resolve(config.background, observed);
         let mut theme = Self::default_for(scheme);
         let unset = |value: &str| value.trim().is_empty();
+        // Read once here because the card chrome below wants it, and it has to
+        // mean the same thing as the focused pane's border.
+        let accent = parse_color(&config.accent).unwrap_or_else(|| scheme.accent());
+        theme.accent = accent;
+        theme.title_hue_locked = !unset(&config.overlay_title);
 
         if let Some(background) = observed.background {
             let ink = observed.foreground.unwrap_or_else(|| scheme.ink());
@@ -419,6 +521,21 @@ impl Theme {
                 theme.overlay = Style::default()
                     .bg(to_color(mix(background, foreground, 0.06)))
                     .fg(to_color(foreground));
+            }
+            // The card's own chrome, mixed from the terminal's colours: the title
+            // on the same fill the status row's primary chips use.
+            if unset(&config.overlay_title) {
+                theme.overlay_title = theme.overlay_title.bg(to_color(mix(background, ink, 0.18)));
+            }
+            // One step past the buffer's selection: inside a card nothing else is
+            // competing for the row, so it can be the loudest thing on it.
+            if unset(&config.picker_selected) {
+                theme.picker_selected = Style::default()
+                    .bg(to_color(mix(background, ink, 0.34)))
+                    .fg(to_color(ink));
+            }
+            if unset(&config.picker_detail) {
+                theme.picker_detail = Style::default().fg(to_color(mix(ink, background, 0.42)));
             }
             if unset(&config.gutter) {
                 theme.gutter = Style::default().fg(to_color(mix(ink, background, 0.45)));
@@ -460,12 +577,22 @@ impl Theme {
         }
         // The focused pane gets the accent colour, unless the user styled the
         // border or the label themselves.
-        let accent = parse_color(&config.accent).unwrap_or_else(|| scheme.accent());
         if unset(&config.border_focused) {
             theme.border_focused = bold(accent);
         }
         if unset(&config.label_focused) {
             theme.label_focused = bold(accent);
+        }
+        // A card is focused too, so its outline, its title and the rail in its
+        // highlighted row follow the same accent — measured terminal or not.
+        if unset(&config.overlay_border) {
+            theme.overlay_border = bold(accent);
+        }
+        if unset(&config.overlay_title) {
+            theme.overlay_title = theme.overlay_title.fg(accent);
+        }
+        if unset(&config.picker_cursor) {
+            theme.picker_cursor = bold(accent);
         }
         // The branch/LSP chips follow the accent colour too.
         if unset(&config.status_mark) {
@@ -479,7 +606,6 @@ impl Theme {
 
 impl Theme {
     /// Built-in palette with `[theme]` overrides applied on top.
-    /// The theme for the `[theme]` entries alone, with nothing measured.
     pub fn from_config(config: &ThemeConfig) -> Self {
         Self::with_observed(config, Observed::UNKNOWN)
     }
@@ -522,10 +648,68 @@ impl Theme {
         override_style(&mut theme.diagnostic_hint, &config.diagnostic_hint);
         override_style(&mut theme.search_match, &config.search_match);
         override_style(&mut theme.prompt, &config.prompt);
+        override_style(&mut theme.overlay, &config.overlay);
+        override_style(&mut theme.overlay_border, &config.overlay_border);
+        override_style(&mut theme.overlay_title, &config.overlay_title);
+        override_style(&mut theme.picker_selected, &config.picker_selected);
+        override_style(&mut theme.picker_cursor, &config.picker_cursor);
+        override_style(&mut theme.picker_detail, &config.picker_detail);
+        override_style(&mut theme.text, &config.text);
+        override_style(&mut theme.status_inactive, &config.status_inactive);
         override_style(&mut theme.status_bar, &config.status_bar);
         override_style(&mut theme.status_segment, &config.status_segment);
         override_style(&mut theme.status_soft, &config.status_soft);
         override_style(&mut theme.status_mark, &config.status_mark);
+    }
+
+    /// The hue a card's title belongs to.
+    ///
+    /// [`Tone::Neutral`] resolves to the accent, so a picker nobody gave a family
+    /// still wears whatever `[theme] accent` says.
+    pub fn card_hue(&self, tone: Tone) -> Color {
+        match tone {
+            Tone::Neutral => self.accent,
+            Tone::File | Tone::Info => self.hues.cyan,
+            Tone::Search | Tone::Warning => self.hues.yellow,
+            Tone::Location => self.hues.blue,
+            Tone::Command => self.hues.magenta,
+            Tone::Literal => self.hues.green,
+            Tone::Error => self.hues.red,
+            // A hint is the palette's quietest voice, and wants to stay that way.
+            Tone::Hint => self.hues.grey,
+        }
+    }
+
+    /// The colour of a row's label, for what the row *is*.
+    ///
+    /// Deliberately narrower than [`Self::card_hue`]: a list in which every row
+    /// is coloured is a list in which nothing reads as highlighted, so anything
+    /// the app did not classify stays plain text.
+    pub fn tone(&self, tone: Tone) -> Style {
+        match tone {
+            Tone::Neutral => Style::default(),
+            Tone::File => Style::default().fg(self.hues.cyan),
+            Tone::Search => Style::default().fg(self.hues.yellow),
+            Tone::Location => Style::default().fg(self.hues.blue),
+            Tone::Command => Style::default().fg(self.hues.magenta),
+            Tone::Literal => Style::default().fg(self.hues.green),
+            Tone::Error => Style::default().fg(self.hues.red),
+            Tone::Warning => Style::default().fg(self.hues.yellow),
+            Tone::Info => Style::default().fg(self.hues.cyan),
+            Tone::Hint => Style::default().add_modifier(Modifier::DIM),
+        }
+    }
+
+    /// A card's title chip: the family's hue over the chip's fill.
+    ///
+    /// A hand-written `[theme] overlay-title` covers every card and wins — it
+    /// asked for one title colour, not six.
+    pub fn title_style(&self, tone: Tone) -> Style {
+        if self.title_hue_locked {
+            return self.overlay_title;
+        }
+        self.overlay_title
+            .patch(Style::default().fg(self.card_hue(tone)))
     }
 
     /// Style for a syntax highlight group.
@@ -690,5 +874,83 @@ mod tests {
         assert_eq!(theme.cursor_line.bg, None);
         assert_eq!(theme.cursor_line.fg, Some(Color::Green));
         assert_eq!(theme.border_focused.fg, Some(Color::Rgb(255, 136, 0)));
+    }
+
+    #[test]
+    fn a_card_is_chromed_in_the_accent() {
+        // A modal is the focused thing on screen, so its outline and title chip
+        // mean what the focused pane's border means, and `[theme] accent` moves
+        // all three at once.
+        let dark = Theme::default_for(Scheme::Dark);
+        assert_eq!(dark.overlay_border.fg, Some(dark.accent));
+        assert_eq!(dark.overlay_title.fg, Some(dark.accent));
+        assert!(dark.overlay_title.bg.is_some(), "the title sits on a chip");
+
+        let configured = Theme::from_config(&ThemeConfig {
+            accent: "#ff8800".into(),
+            ..ThemeConfig::default()
+        });
+        assert_eq!(configured.overlay_border.fg, Some(Color::Rgb(255, 136, 0)));
+        assert_eq!(configured.picker_cursor.fg, Some(Color::Rgb(255, 136, 0)));
+    }
+
+    #[test]
+    fn each_picker_family_wears_its_own_hue() {
+        let dark = Theme::default_for(Scheme::Dark);
+        let hue = |tone| dark.title_style(tone).fg;
+        assert_eq!(hue(Tone::Neutral), Some(dark.accent));
+        assert_ne!(hue(Tone::File), hue(Tone::Search));
+        assert_ne!(hue(Tone::Search), hue(Tone::Location));
+        assert_ne!(hue(Tone::Command), hue(Tone::File));
+        // A light terminal gets the darker half of the palette, as everywhere.
+        let light = Theme::default_for(Scheme::Light);
+        assert_ne!(
+            light.title_style(Tone::File).fg,
+            dark.title_style(Tone::File).fg
+        );
+        // A hand-written title is one colour for every card, so it is not tinted.
+        let locked = Theme::from_config(&ThemeConfig {
+            overlay_title: "bold green".into(),
+            ..ThemeConfig::default()
+        });
+        assert_eq!(locked.title_style(Tone::File).fg, Some(Color::Green));
+        assert_eq!(locked.title_style(Tone::Search).fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn a_row_is_coloured_only_when_it_has_something_to_say() {
+        let dark = Theme::default_for(Scheme::Dark);
+        assert_eq!(dark.tone(Tone::Neutral).fg, None);
+        assert_eq!(dark.tone(Tone::Error).fg, Some(Color::Red));
+        assert_eq!(dark.tone(Tone::Literal).fg, Some(Color::Green));
+        // A severity names its own tone, so the list and the underline it came
+        // from say the same thing.
+        assert_eq!(Tone::from(Severity::Warning), Tone::Warning);
+        assert_eq!(dark.tone(Tone::from(Severity::Hint)).fg, None);
+        assert!(
+            dark.tone(Tone::Hint).add_modifier.contains(Modifier::DIM),
+            "a hint stays the quietest voice on the row"
+        );
+    }
+
+    #[test]
+    fn a_measured_terminal_blends_the_card_and_its_rows() {
+        let observed = Observed {
+            background: Some((30, 30, 30)),
+            foreground: Some((220, 220, 220)),
+        };
+        let theme = Theme::with_observed(&ThemeConfig::default(), observed);
+        let shade = |style: Style| match style.bg {
+            Some(Color::Rgb(value, _, _)) => value,
+            other => panic!("expected a blended background, got {other:?}"),
+        };
+        // The card and its title chip are shades off the terminal's own
+        // background rather than colours invented for it…
+        assert!(shade(theme.overlay) > 30);
+        assert!(shade(theme.overlay_title) > shade(theme.overlay));
+        // …and the highlighted row is stronger than the buffer's selection, which
+        // it must beat without competing with syntax colours.
+        assert!(shade(theme.picker_selected) > shade(theme.selection));
+        assert!(theme.picker_detail.fg.is_some());
     }
 }

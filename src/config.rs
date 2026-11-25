@@ -725,6 +725,32 @@ pub struct ThemeConfig {
     pub diagnostic_info: String,
     pub search_match: String,
     pub prompt: String,
+    /// The surface a picker, palette or popup is drawn on.
+    #[serde(default)]
+    pub overlay: String,
+    /// A card's outline (`""` = the accent, as for the focused pane).
+    #[serde(default)]
+    pub overlay_border: String,
+    /// A card's title chip.  Set it and every card gets that one colour instead
+    /// of the hue of the kind of thing the card is listing.
+    #[serde(default)]
+    pub overlay_title: String,
+    /// The highlighted row of a picker or completion list.
+    #[serde(default)]
+    pub picker_selected: String,
+    /// The marker in that row's gutter (`""` = the accent).
+    #[serde(default)]
+    pub picker_cursor: String,
+    /// A picker's secondary text: the detail column, the preview, the count line.
+    #[serde(default)]
+    pub picker_detail: String,
+    /// The default text colour, buffer included.  Most of the screen is drawn
+    /// with this, so restyle it knowing what that means.
+    #[serde(default)]
+    pub text: String,
+    /// Quieter status text: the segments of the bar the accent is not on.
+    #[serde(default)]
+    pub status_inactive: String,
     /// Base fill of the status row in angled mode (`""` = chosen per scheme).
     #[serde(default)]
     pub status_bar: String,

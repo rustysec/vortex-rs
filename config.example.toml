@@ -249,6 +249,25 @@ diagnostic-hint = ""
 diagnostic-info = ""
 search-match = ""
 prompt = ""
+# Modals: the card a picker, palette, completion popup or diagnostic float sits
+# on.  `overlay` is its surface, `overlay-border` its outline (the accent by
+# default, since a modal is what the keyboard is pointed at) and `overlay-title`
+# its title chip.
+overlay = ""
+overlay-border = ""
+overlay-title = ""
+# A picker's rows: the highlighted row's bar, the rail in its gutter, and the
+# quiet text (the detail column, the preview, the "N/M match" line).  A card's
+# title takes the hue of what it lists — files cyan, grep yellow, a language
+# server's locations blue — unless overlay-title above is set, which makes every
+# title that one colour.
+picker-selected = ""
+picker-cursor = ""
+picker-detail = ""
+# The default text colour, buffer included: most of the screen is drawn with it.
+text = ""
+# The quieter status segments, the ones the accent is not on.
+status-inactive = ""
 
 # ---------------------------------------------------------------------------
 # keymap

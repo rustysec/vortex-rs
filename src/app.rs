@@ -35,7 +35,7 @@ use crate::spell::{self, SpellResult};
 use crate::status::Snapshot;
 use crate::syntax::{self, TreeSlot};
 use crate::term::{self, Terminal, TerminalGuard};
-use crate::theme::{Observed, Theme};
+use crate::theme::{Observed, Theme, Tone};
 use crate::ui::{self, Notice, NoticeTone, Picker, Screen};
 
 /// Idle time before a buffer is re-parsed.
@@ -149,6 +149,9 @@ fn append_buffer_diagnostics(
             prompt::Item::new(label)
                 .detail(diagnostic.headline())
                 .preview(preview)
+                // The row wears the severity the buffer's underline wears, so the
+                // list and the text it came from say the same thing.
+                .tone(diagnostic.severity.into())
                 .payload(DiagnosticPayload {
                     buffer: Some(buffer.id),
                     path: buffer.path().map(Path::to_path_buf).unwrap_or_default(),
@@ -1113,7 +1116,11 @@ impl App {
                 let items: Vec<prompt::Item> = suggestions
                     .into_iter()
                     .map(|suggestion| {
-                        prompt::Item::new(suggestion.clone()).payload(WordPayload(suggestion))
+                        prompt::Item::new(suggestion.clone())
+                            // Suggestions are literal text to put in the buffer,
+                            // so they wear the string colour.
+                            .tone(Tone::Literal)
+                            .payload(WordPayload(suggestion))
                     })
                     .collect();
                 let mut picker = Prompt::picker(format!("fix \"{word}\""), items);
@@ -3857,6 +3864,27 @@ impl App {
                 input: &prompt.text,
                 caret: prompt.caret(),
                 suffix: &prompt.completion_suffix,
+                // The card wears the hue of what it lists: paths are the file
+                // cyan, grep hits the match yellow, a server's locations blue.
+                // A card whose rows carry their own meaning — diagnostics by
+                // severity, a spelling fix by being literal — keeps the accent and
+                // lets the rows do the talking.
+                tone: match kind {
+                    PromptKind::FindFiles | PromptKind::SwitchBuffer | PromptKind::Path => {
+                        Tone::File
+                    }
+                    PromptKind::Grep => Tone::Search,
+                    PromptKind::References => Tone::Location,
+                    PromptKind::Command | PromptKind::Palette | PromptKind::Param { .. } => {
+                        Tone::Command
+                    }
+                    PromptKind::Spell { .. } => Tone::Literal,
+                    PromptKind::Search { .. }
+                    | PromptKind::GotoLine
+                    | PromptKind::Diagnostics
+                    | PromptKind::Rename
+                    | PromptKind::CodeActions => Tone::Neutral,
+                },
                 visible: prompt.visible(),
                 items: &prompt.items,
                 selected: prompt.selected,
@@ -4026,6 +4054,7 @@ impl App {
                             prompt::Item::new(label)
                                 .detail(entry.diagnostic.headline())
                                 .preview(entry.diagnostic.headline())
+                                .tone(entry.diagnostic.severity.into())
                                 .payload(DiagnosticPayload {
                                     buffer: None,
                                     path: entry.path.clone(),

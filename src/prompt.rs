@@ -11,14 +11,19 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::fuzzy;
 use crate::input::keys;
+use crate::theme::Tone;
 
 /// One candidate in a picker.
 pub struct Item {
     pub label: String,
-    /// Secondary text shown dimmed after the label (path, language, …).
+    /// Secondary text after the label (path, language …), in `picker_detail`.
     pub detail: Option<String>,
     /// Multi-line preview shown under the list.
     pub preview: Option<String>,
+    /// What the row *is*, for the colour its label is drawn in: a diagnostic
+    /// takes its severity, a spelling fix the literal hue.  Plain text otherwise
+    /// — see [`Theme::tone`](crate::theme::Theme::tone).
+    pub tone: Tone,
     /// Whatever the app needs to act on the selection.
     pub payload: Option<Box<dyn Any>>,
 }
@@ -29,6 +34,7 @@ impl Item {
             label: label.into(),
             detail: None,
             preview: None,
+            tone: Tone::default(),
             payload: None,
         }
     }
@@ -40,6 +46,11 @@ impl Item {
 
     pub fn preview(mut self, preview: impl Into<String>) -> Self {
         self.preview = Some(preview.into());
+        self
+    }
+
+    pub fn tone(mut self, tone: Tone) -> Self {
+        self.tone = tone;
         self
     }
 
