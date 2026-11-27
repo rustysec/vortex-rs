@@ -1287,7 +1287,11 @@ impl Editor {
                 let cursor = if region.linewise {
                     self.indent_of_line_at(start)
                 } else {
-                    start
+                    // The region can reach the line's break, which is not a
+                    // place the caret belongs: keep it on a character.
+                    self.current_buffer()
+                        .map(|buffer| clamp_cursor(buffer, start))
+                        .unwrap_or(0)
                 };
                 self.set_cursor(cursor);
             }
@@ -1511,7 +1515,7 @@ impl Editor {
                     let end = next_boundary(buffer, cursor);
                     return (end != cursor).then(|| Region::char(Span::new(cursor, end)));
                 }
-                Some(region)
+                Some(clamp_word_region_to_line(buffer, region, cursor, *motion))
             }
         }
     }
@@ -3636,6 +3640,44 @@ fn clamp_cursor(buffer: &Buffer, position: usize) -> usize {
     position.min(buffer.last_char_of_line(buffer.line_of(position)))
 }
 
+/// `dw` on the last word of a line must not eat the break that follows it:
+/// the motion itself still jumps to the next line (so `w` keeps working in
+/// normal mode), but the region the operator edits ends on the caret's line.
+/// Word motions only — a multi-line `dj` or `d}` stays as it is.
+fn clamp_word_region_to_line(
+    buffer: &Buffer,
+    region: Region,
+    cursor: usize,
+    motion: Motion,
+) -> Region {
+    let is_word_motion = matches!(
+        motion,
+        Motion::WordStart
+            | Motion::WordEnd
+            | Motion::WordBack
+            | Motion::WordEndBack
+            | Motion::BigWordStart
+            | Motion::BigWordEnd
+            | Motion::BigWordBack
+            | Motion::BigWordEndBack
+    );
+    if !is_word_motion {
+        return region;
+    }
+    // A caret on an empty line sits on its break, and a word motion from there
+    // really does cross the break and delete it: `dw` on an empty line removes
+    // the empty line.
+    if on_empty_line(buffer, cursor) {
+        return region;
+    }
+    let line_end = buffer.line_end(buffer.line_of(cursor));
+    let extent = region.extent();
+    if extent.end <= line_end {
+        return region;
+    }
+    Region::char(Span::new(extent.start, line_end))
+}
+
 /// Insert mode may sit past the last character of a line, on the line break
 /// itself, so typing appends at the line's end instead of a notch earlier.
 /// The caret must still stay on a real line — it may not land on the phantom
@@ -4418,6 +4460,46 @@ mod tests {
         assert_eq!(fixture.editor.mode, Mode::Normal);
         // The cursor sits on the last character typed, vim-style.
         assert_eq!(fixture.cursor(), 2);
+    }
+
+    #[test]
+    fn de_the_last_word_of_a_line_does_not_eat_the_break() {
+        let mut fixture = Fixture::new("alpha beta\ngamma\n");
+        fixture.feed("wde");
+        assert_eq!(fixture.text(), "alpha \ngamma\n");
+    }
+
+    #[test]
+    fn dw_the_last_word_of_a_line_does_not_eat_the_break() {
+        let mut fixture = Fixture::new("alpha beta\ngamma\n");
+        fixture.feed("wdw");
+        assert_eq!(fixture.text(), "alpha \ngamma\n");
+        // Pasting the deleted word restores the line without replaying a
+        // phantom new line.
+        fixture.feed("p");
+        assert_eq!(fixture.text(), "alpha beta\ngamma\n");
+    }
+
+    #[test]
+    fn cw_on_the_last_word_of_a_line_leaves_the_break_alone() {
+        let mut fixture = Fixture::new("alpha beta\ngamma\n");
+        fixture.feed("wcwri");
+        fixture.feed("esc");
+        assert_eq!(fixture.text(), "alpha ri\ngamma\n");
+    }
+
+    #[test]
+    fn dw_the_last_word_of_the_buffer_deletes_the_word_only() {
+        let mut fixture = Fixture::new("alpha beta\n");
+        fixture.feed("wdw");
+        assert_eq!(fixture.text(), "alpha \n");
+    }
+
+    #[test]
+    fn dw_count_to_end_of_line_deletes_to_the_line_break() {
+        let mut fixture = Fixture::new("alpha beta gamma\ndelta\n");
+        fixture.feed("w2dw");
+        assert_eq!(fixture.text(), "alpha \ndelta\n");
     }
 
     #[test]
