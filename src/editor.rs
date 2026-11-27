@@ -1064,6 +1064,11 @@ impl Editor {
             self.pending.awaiting = Some(Awaiting::TextObject { inside });
             return Vec::new();
         }
+        // In insert mode the caret may sit past the last character of a line:
+        // `$`/`end`/Right land on the line break itself, where typing appends
+        // at the line's end.  Normal mode clamps to the last character, where
+        // operators can never eat the break.
+        let insert_mode = self.mode == Mode::Insert;
         let (cursor, dest, before_line) = {
             let Some(buffer) = self.current_buffer() else {
                 return Vec::new();
@@ -1071,7 +1076,23 @@ impl Editor {
             let cursor = self.cursor();
             let env = self.motion_env(area);
             match motions::apply(motion, count, cursor, buffer, &env) {
-                Some(dest) => (cursor, dest, buffer.line_of(cursor)),
+                Some(mut dest) => {
+                    let start_line = buffer.line_of(cursor);
+                    if insert_mode {
+                        if matches!(motion, Motion::LineEnd | Motion::TillLineEnd) {
+                            // `$`/`end`: past the last character of the target
+                            // line, on the break itself.
+                            let line =
+                                (start_line + count.saturating_sub(1)).min(buffer.last_line());
+                            dest.cursor = buffer.line_end(line);
+                        } else if matches!(motion, Motion::Right) {
+                            // The arrow sticks to the end of its own line: it
+                            // does not walk past the break onto the next line.
+                            dest.cursor = dest.cursor.min(buffer.line_end(start_line));
+                        }
+                    }
+                    (cursor, dest, start_line)
+                }
                 None => return Vec::new(),
             }
         };
@@ -1082,7 +1103,13 @@ impl Editor {
         }
         let clamped = self
             .current_buffer()
-            .map(|buffer| clamp_cursor(buffer, dest.cursor))
+            .map(|buffer| {
+                if insert_mode {
+                    clamp_cursor_insert(buffer, dest.cursor)
+                } else {
+                    clamp_cursor(buffer, dest.cursor)
+                }
+            })
             .unwrap_or(0);
         self.set_cursor(clamped);
         if let Some(column) = dest.wanted_col {
@@ -3609,6 +3636,16 @@ fn clamp_cursor(buffer: &Buffer, position: usize) -> usize {
     position.min(buffer.last_char_of_line(buffer.line_of(position)))
 }
 
+/// Insert mode may sit past the last character of a line, on the line break
+/// itself, so typing appends at the line's end instead of a notch earlier.
+/// The caret must still stay on a real line — it may not land on the phantom
+/// line past a trailing break.
+fn clamp_cursor_insert(buffer: &Buffer, position: usize) -> usize {
+    let position = buffer.clamp_byte(position);
+    let line = buffer.line_of(position).min(buffer.last_line());
+    position.clamp(buffer.line_start(line), buffer.line_end(line))
+}
+
 /// Whether the caret is sitting on the break of an empty line. That byte is a
 /// line ending, not a character for characterwise operators to consume.
 fn on_empty_line(buffer: &Buffer, position: usize) -> bool {
@@ -4282,6 +4319,94 @@ mod tests {
         let mut fixture = Fixture::with_config("\n", config);
         fixture.feed("i(");
         assert_eq!(fixture.text(), "(\n");
+    }
+
+    #[test]
+    fn insert_mode_end_key_moves_the_caret_past_the_last_char() {
+        let mut fixture = Fixture::new("hello\n");
+        fixture.feed("i");
+        fixture.feed("end");
+        assert_eq!(
+            fixture.cursor(),
+            5,
+            "caret past the last character, not on it"
+        );
+        fixture.feed("!");
+        assert_eq!(fixture.text(), "hello!\n");
+    }
+
+    #[test]
+    fn insert_mode_right_arrow_walks_past_the_last_char() {
+        let mut fixture = Fixture::new("hello world\n");
+        fixture.feed("i");
+        for _ in 0..12 {
+            fixture.feed("right");
+        }
+        assert_eq!(fixture.cursor(), 11, "end of the line, past 'd'");
+        fixture.feed("!");
+        assert_eq!(fixture.text(), "hello world!\n");
+    }
+
+    #[test]
+    fn insert_mode_end_on_a_later_line_appends_there() {
+        let mut fixture = Fixture::new("first line\nsecond line\n");
+        fixture.feed("i");
+        fixture.feed("down");
+        fixture.feed("end");
+        assert_eq!(
+            fixture.cursor(),
+            22,
+            "past the last char of the second line"
+        );
+        fixture.feed("!");
+        assert_eq!(fixture.text(), "first line\nsecond line!\n");
+    }
+
+    #[test]
+    fn insert_mode_right_arrow_does_not_walk_the_break() {
+        let mut fixture = Fixture::new("one\ntwo\n");
+        fixture.feed("i");
+        for _ in 0..10 {
+            fixture.feed("right");
+        }
+        // `one` is byte 0..3, the break is byte 3; the caret stops there and
+        // does not spill onto the next line's first character.
+        assert_eq!(
+            fixture.cursor(),
+            3,
+            "end of the line, not onto the next one"
+        );
+        fixture.feed("!");
+        assert_eq!(fixture.text(), "one!\ntwo\n");
+    }
+
+    #[test]
+    fn insert_mode_end_on_the_last_line_without_a_break() {
+        let mut fixture = Fixture::new("alpha");
+        fixture.feed("i");
+        fixture.feed("end");
+        assert_eq!(fixture.cursor(), 5, "the end of the buffer");
+        fixture.feed("!");
+        assert_eq!(fixture.text(), "alpha!");
+    }
+
+    #[test]
+    fn insert_mode_end_on_an_empty_line_stays_put() {
+        let mut fixture = Fixture::new("one\n\nthree\n");
+        fixture.feed("i");
+        fixture.feed("down");
+        fixture.feed("end");
+        assert_eq!(fixture.cursor(), 4, "the empty line has no last character");
+    }
+
+    #[test]
+    fn insert_mode_enter_at_the_end_of_a_line_splits_it_there() {
+        let mut fixture = Fixture::new("hello\nworld\n");
+        fixture.feed("i");
+        fixture.feed("end");
+        fixture.feed("enter");
+        assert_eq!(fixture.text(), "hello\n\nworld\n");
+        assert_eq!(fixture.cursor(), 6, "on the empty new line");
     }
 
     #[test]
